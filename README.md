@@ -19,12 +19,19 @@ taxonomy level or gene expression (including the imputed gene dataset).
 
 ## Data locations
 
-- **ABC atlas download:** `abc_atlas_cache`, in the folder *containing* this
-  repository (e.g. `D:/repos/JhouLab/abc_atlas_cache` when this repository is
-  `D:/repos/JhouLab/ABC_atlas_browser`). Downloaded on first use if missing.
+- **ABC atlas download:** by default `abc_atlas_cache`, in the folder *containing*
+  this repository (e.g. `D:/repos/JhouLab/abc_atlas_cache` when this repository
+  is `D:/repos/JhouLab/ABC_atlas_browser`). It can reach about 100 GB. If it isn't
+  there at startup, the app lists your local drives and their free space, and
+  asks once where to put it (or where an existing download is), suggesting a
+  drive with enough room. The choice is saved in
+  `cache_local/abc_atlas_cache_location.json`; delete that file to be asked again.
+  Atlas files are downloaded on first use.
 - **Local cache:** `cache_local` inside this repository (git-ignored). Section
   images and processed files are regenerated as needed.
-- **Output folder:** chosen in the startup panel.
+- **Output folder:** `ABC_atlas_browser_output`, next to this repository, on first
+  launch. It can be changed in the startup panel, and the most recently used
+  folder is remembered.
 
-Both locations are relative to the script itself, so the app can be launched
+These locations are relative to the script itself, so the app can be launched
 from any working directory.

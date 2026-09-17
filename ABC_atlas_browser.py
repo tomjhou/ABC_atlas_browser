@@ -45,12 +45,42 @@ import math
 import time
 import socket
 import hashlib
+import shutil
 import warnings
 import platform
 import threading
 import subprocess
 from pathlib import Path
 import importlib.util
+
+
+def _make_windows_dpi_aware():
+    """On Windows, declare this process DPI-aware before any Tk window gets
+    created. Without this, under Windows display scaling (125%/150%/...), Tk
+    reports screen dimensions (winfo_screenheight() etc.) in a different
+    pixel space than what actually ends up on screen, so sizing a window
+    from those numbers (see compute_figsize_for_screen_height) produces a
+    window visibly smaller than intended — the two spaces disagree by
+    roughly the scaling factor. Must run before the first Tk root/figure is
+    created, so this is called at import time, right here."""
+    if sys.platform != 'win32':
+        return
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # PROCESS_SYSTEM_DPI_AWARE
+    except Exception:
+        try:
+            import ctypes
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+# Before check_libraries_or_exit(), which can open a dialog: if any Tk window
+# exists before this call, Tk keeps reporting the scaled screen size for the
+# rest of the process (e.g. 3413x1440 instead of 5120x2160 at 150%), and every
+# window opens that much too large.
+_make_windows_dpi_aware()
 
 
 # Checked before the imports below, at every launch. Import name -> pip
@@ -146,6 +176,12 @@ import scanpy as sc
 import anndata
 from PIL import Image
 import matplotlib
+# Every window in this app is built on Tk: its sizing (compute_figsize_for_
+# screen_height, normalize_tk_scaling), blitting, cursors and dialogs all
+# assume the TkAgg backend. Without this, matplotlib picks whichever backend
+# it finds first, e.g. Qt when PyQt is installed, and Qt's own display
+# scaling then makes every window open too large. Must come before pyplot.
+matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.widgets import Button, TextBox
@@ -160,29 +196,6 @@ from matplotlib.offsetbox import AnchoredOffsetbox, DrawingArea, TextArea, VPack
 from abc_atlas_access.abc_atlas_cache.abc_project_cache import AbcProjectCache
 
 
-def _make_windows_dpi_aware():
-    """On Windows, declare this process DPI-aware before any Tk window gets
-    created. Without this, under Windows display scaling (125%/150%/...), Tk
-    reports screen dimensions (winfo_screenheight() etc.) in a different
-    pixel space than what actually ends up on screen, so sizing a window
-    from those numbers (see compute_figsize_for_screen_height) produces a
-    window visibly smaller than intended — the two spaces disagree by
-    roughly the scaling factor. Must run before the first Tk root/figure is
-    created, so this is called at import time, right here."""
-    if sys.platform != 'win32':
-        return
-    try:
-        import ctypes
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # PROCESS_SYSTEM_DPI_AWARE
-    except Exception:
-        try:
-            import ctypes
-            ctypes.windll.user32.SetProcessDPIAware()
-        except Exception:
-            pass
-
-
-_make_windows_dpi_aware()
 
 # Every interactive window in this file has its own hand-rolled pan/zoom/
 # hover controls (right-mouse-drag panning, scroll-to-zoom, ROI dragging,
@@ -219,10 +232,242 @@ def _has_internet_connection(host='s3.amazonaws.com', port=443, timeout=2.0):
 
 
 # Resolved from this script's own folder, not the working directory, so the app
-# finds the same data wherever it's launched from. The atlas download lives
-# next to this repository, in the parent folder.
+# finds the same data wherever it's launched from.
 SCRIPT_DIR = Path(__file__).resolve().parent
-download_base = SCRIPT_DIR.parent / 'abc_atlas_cache'
+
+# Local cache dir for anything expensive to regenerate but cheap to keep on
+# disk (the section-picker grid image, processed .h5ad files, ...). Defined up
+# here because the atlas location below is remembered in it.
+CACHE_DIR = SCRIPT_DIR / 'cache_local'
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Where the ABC atlas download lives. By default it's next to this repository,
+# in the parent folder. If it isn't there, the user picks a location once (see
+# choose_atlas_cache_location) and the choice is remembered in this file.
+DEFAULT_ATLAS_CACHE_DIR = SCRIPT_DIR.parent / 'abc_atlas_cache'
+ATLAS_CACHE_LOCATION_FILE = CACHE_DIR / 'abc_atlas_cache_location.json'
+# Free space a drive should have to hold the atlas download. A typical cache for
+# this app, including the imputed gene dataset, is around 75 GB.
+ATLAS_CACHE_SPACE_NEEDED_GB = 100
+
+
+def format_gb(n_bytes):
+    return f"{n_bytes / 1e9:,.0f} GB"
+
+
+def list_local_drives():
+    """[(root, free_bytes, total_bytes)] for every local drive, sorted by root.
+    On Windows, fixed and removable drives (network, CD and RAM drives are
+    left out); elsewhere, just the filesystem root. Drives that can't be read,
+    like an empty card reader, are skipped."""
+    roots = []
+    if sys.platform == 'win32':
+        import ctypes
+        import string
+        DRIVE_REMOVABLE, DRIVE_FIXED = 2, 3
+        bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+        for i, letter in enumerate(string.ascii_uppercase):
+            if bitmask & (1 << i):
+                root = f'{letter}:\\'
+                if ctypes.windll.kernel32.GetDriveTypeW(root) in (DRIVE_FIXED, DRIVE_REMOVABLE):
+                    roots.append(root)
+    else:
+        roots.append('/')
+    drives = []
+    for root in sorted(roots):
+        try:
+            usage = shutil.disk_usage(root)
+        except OSError:
+            continue
+        drives.append((root, usage.free, usage.total))
+    return drives
+
+
+def free_bytes_at(path):
+    """Free space on the drive holding `path` (which may not exist yet), or None."""
+    path = Path(path)
+    for candidate in [path, *path.parents]:
+        if candidate.exists():
+            try:
+                return shutil.disk_usage(candidate).free
+            except OSError:
+                return None
+    return None
+
+
+def suggest_atlas_cache_dir(drives):
+    """The default location if its drive has room, otherwise abc_atlas_cache at
+    the root of the local drive with the most free space."""
+    needed = ATLAS_CACHE_SPACE_NEEDED_GB * 1e9
+    free_default = free_bytes_at(DEFAULT_ATLAS_CACHE_DIR)
+    if free_default is not None and free_default >= needed:
+        return DEFAULT_ATLAS_CACHE_DIR
+    if drives:
+        roomiest_root = max(drives, key=lambda d: d[1])[0]
+        return Path(roomiest_root) / 'abc_atlas_cache'
+    return DEFAULT_ATLAS_CACHE_DIR
+
+
+def looks_like_atlas_cache(folder):
+    folder = Path(folder)
+    return (folder / '_downloaded_data.json').exists() or (folder / 'metadata').is_dir()
+
+
+def normalize_chosen_atlas_dir(folder):
+    """A folder picked with Browse is used as-is if it already holds an atlas
+    download or is named abc_atlas_cache; otherwise abc_atlas_cache is created
+    inside it, so picking e.g. E:\\ gives E:\\abc_atlas_cache."""
+    folder = Path(folder)
+    if folder.name.lower() == 'abc_atlas_cache' or looks_like_atlas_cache(folder):
+        return folder
+    return folder / 'abc_atlas_cache'
+
+
+def prompt_atlas_cache_location(suggested, drives):
+    """Small Tk dialog: an editable path pre-filled with `suggested`, a Browse
+    button, and the free space on the chosen path's drive. Not tkinter's own
+    askdirectory, which can't pre-select a folder that doesn't exist yet.
+    Returns the chosen Path, or None if cancelled."""
+    import tkinter as tk
+    from tkinter import filedialog
+
+    needed = ATLAS_CACHE_SPACE_NEEDED_GB * 1e9
+    result = {'path': None}
+    root = tk.Tk()
+    root.title("Choose ABC atlas download location")
+    root.attributes('-topmost', True)
+    root.resizable(False, False)
+    frame = tk.Frame(root, padx=16, pady=12)
+    frame.pack(fill='both', expand=True)
+
+    tk.Label(frame, justify='left', wraplength=620, text=(
+        "No ABC atlas download was found at the default location:\n"
+        f"    {DEFAULT_ATLAS_CACHE_DIR}\n\n"
+        "Choose where it should go. If this is a new location, the atlas files are "
+        f"downloaded there as needed, which can take about {ATLAS_CACHE_SPACE_NEEDED_GB} GB, "
+        "so pick a drive with plenty of free space. If you already have a download "
+        "elsewhere, choose that folder instead. This is asked only once. The local "
+        "drives and their free space are also listed in the console."
+    )).pack(anchor='w')
+
+    path_var = tk.StringVar(value=str(suggested))
+    row = tk.Frame(frame, pady=10)
+    row.pack(fill='x')
+    entry = tk.Entry(row, textvariable=path_var, width=60)
+    entry.pack(side='left', fill='x', expand=True)
+
+    def browse():
+        current = Path(path_var.get().strip() or str(suggested))
+        start = next((str(p) for p in [current, *current.parents] if p.exists()), None)
+        chosen = filedialog.askdirectory(parent=root, initialdir=start,
+                                         title="Choose a folder for the ABC atlas download")
+        if chosen:
+            path_var.set(str(normalize_chosen_atlas_dir(chosen)))
+
+    tk.Button(row, text="Browse...", command=browse).pack(side='left', padx=(8, 0))
+
+    space_label = tk.Label(frame, justify='left', anchor='w')
+    space_label.pack(fill='x')
+
+    def update_space(*_args):
+        text = path_var.get().strip()
+        free = free_bytes_at(text) if text else None
+        if free is None:
+            space_label.config(text="Free space: unknown (drive not found)", fg='firebrick')
+        elif looks_like_atlas_cache(text):
+            space_label.config(text=f"Existing atlas download found here. Free space: {format_gb(free)}", fg='darkgreen')
+        elif free < needed:
+            space_label.config(text=f"Free space: {format_gb(free)} (less than the recommended "
+                                    f"{ATLAS_CACHE_SPACE_NEEDED_GB} GB)", fg='firebrick')
+        else:
+            space_label.config(text=f"Free space: {format_gb(free)}", fg='darkgreen')
+
+    path_var.trace_add('write', update_space)
+    update_space()
+
+    buttons = tk.Frame(frame, pady=(8))
+    buttons.pack(fill='x')
+
+    def ok(_event=None):
+        text = path_var.get().strip()
+        if not text:
+            return
+        if free_bytes_at(text) is None:
+            # Keep the dialog open rather than failing to create the folder.
+            from tkinter import messagebox
+            messagebox.showerror("Drive not found", f"Can't find the drive for:\n{text}", parent=root)
+            return
+        result['path'] = Path(text)
+        root.destroy()
+
+    def cancel(_event=None):
+        root.destroy()
+
+    tk.Button(buttons, text="Cancel", width=10, command=cancel).pack(side='right')
+    tk.Button(buttons, text="OK", width=10, command=ok).pack(side='right', padx=(0, 8))
+    root.bind('<Return>', ok)
+    root.bind('<Escape>', cancel)
+    root.protocol('WM_DELETE_WINDOW', cancel)
+    root.update_idletasks()
+    x = (root.winfo_screenwidth() - root.winfo_width()) // 2
+    y = (root.winfo_screenheight() - root.winfo_height()) // 3
+    root.geometry(f'+{max(x, 0)}+{max(y, 0)}')
+    entry.focus_set()
+    entry.icursor('end')
+    root.mainloop()
+    return result['path']
+
+
+def choose_atlas_cache_location():
+    """Where the ABC atlas download lives, in this order: the location saved by
+    an earlier choice (if that folder still exists), the default location next
+    to this repository (if it exists), or else ask the user once. Asking lists
+    every local drive and its free space on the console, then opens
+    prompt_atlas_cache_location pre-filled with suggest_atlas_cache_dir. The
+    answer is saved to ATLAS_CACHE_LOCATION_FILE. Exits if cancelled."""
+    try:
+        saved = json.loads(ATLAS_CACHE_LOCATION_FILE.read_text(encoding='utf-8')).get('path')
+    except (OSError, ValueError, AttributeError):
+        saved = None
+    if saved:
+        if Path(saved).is_dir():
+            return Path(saved)
+        print(f"The saved ABC atlas location {saved} no longer exists.")
+    if DEFAULT_ATLAS_CACHE_DIR.is_dir():
+        return DEFAULT_ATLAS_CACHE_DIR
+
+    drives = list_local_drives()
+    print(f"No ABC atlas download found at {DEFAULT_ATLAS_CACHE_DIR}.")
+    print(f"It can need about {ATLAS_CACHE_SPACE_NEEDED_GB} GB. Local drives:")
+    for drive_root, free, total in drives:
+        print(f"    {drive_root:6s} {format_gb(free):>10s} free of {format_gb(total)}")
+    suggested = suggest_atlas_cache_dir(drives)
+    print(f"Suggested location: {suggested}")
+
+    try:
+        chosen = prompt_atlas_cache_location(suggested, drives)
+    except Exception as e:
+        print(f"Could not show the location dialog ({e}).")
+        try:
+            typed = input(f"ABC atlas location [{suggested}]: ").strip()
+        except EOFError:
+            typed = ''
+        chosen = Path(typed) if typed else suggested
+    if chosen is None:
+        print("No ABC atlas location chosen; exiting.")
+        sys.exit(0)
+
+    try:
+        chosen.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"Could not create {chosen} ({e}); exiting.")
+        sys.exit(1)
+    ATLAS_CACHE_LOCATION_FILE.write_text(json.dumps({'path': str(chosen)}, indent=2), encoding='utf-8')
+    print(f"Using {chosen} for the ABC atlas download (saved to {ATLAS_CACHE_LOCATION_FILE}).")
+    return chosen
+
+
+download_base = choose_atlas_cache_location()
 if _has_internet_connection():
     abc_cache = AbcProjectCache.from_cache_dir(download_base)
 else:
@@ -445,11 +690,6 @@ HOVER_DEFAULT_MESSAGE = 'Hover over any cell to see its class/subclass/supertype
 # because several of these values contain commas of their own.
 HOVER_FIELD_SEP = ';   '
 # ===========================================================================
-
-# Local cache dir for anything expensive to regenerate but cheap to keep on
-# disk (the section-picker grid image, processed .h5ad files, ...).
-CACHE_DIR = SCRIPT_DIR / 'cache_local'
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Prefixed onto per-section/per-gene cache filenames so they don't collide if
 # another Allen ABC dataset is added alongside this one later.
@@ -1154,7 +1394,9 @@ def make_textbox_blit_fast(textbox, blit_func):
     default, not breaking outright) if a future matplotlib version changes
     that internal implementation; acceptable for a pinned local script."""
     def fast_rendercursor(self):
-        fig = self.ax.get_figure(root=True)
+        # .figure rather than get_figure(root=True), which needs matplotlib 3.10+.
+        # Same result here, since the textbox's axes are never in a subfigure.
+        fig = self.ax.figure
         if fig._get_renderer() is None:
             fig.canvas.draw()
 
@@ -14371,7 +14613,11 @@ session_imputed_state = {'adata': None, 'load_thread': None, 'load_error': None}
 # box is set to (kept in this dict so it persists across sessions — see
 # run_session).
 _recent_folders = load_recent_output_folders()
-_initial_out_folder = resolve_out_folder(_recent_folders[0] if _recent_folders else "M:/ABC_analysis/Scanpy")
+# First launch: a folder next to this repository (so, next to the default atlas
+# location), which needs no drive letter or user name and isn't cloud-synced
+# the way Documents often is. After that, the most recently used folder.
+DEFAULT_OUTPUT_FOLDER = SCRIPT_DIR.parent / 'ABC_atlas_browser_output'
+_initial_out_folder = resolve_out_folder(_recent_folders[0] if _recent_folders else str(DEFAULT_OUTPUT_FOLDER))
 session_state = {'out_folder': _initial_out_folder}
 while True:
     run_session(abc_cache, session_state, raw_backed_cache, session_imputed_state)
