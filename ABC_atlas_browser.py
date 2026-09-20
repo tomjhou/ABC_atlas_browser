@@ -2073,12 +2073,30 @@ def show_processing_dialog(message):
     itself only updates the bar's geometry (via draw_idle()) rather than
     forcing a repaint. set_progress(None) resets the bar to empty, for
     work whose progress isn't (yet) known."""
-    fig, ax = plt.subplots(figsize=(5, 2.2))
-    ax.axis('off')
-    ax.text(0.5, 0.8, message, ha='center', va='center', wrap=True, fontsize=UI_BUTTON_FONTSIZE,
-            transform=ax.transAxes)
+    # Sized to the message: wrapped here (by an estimate of how many characters
+    # fit per line) and the window made tall enough for the resulting lines,
+    # instead of a fixed size that let longer messages spill over the top edge
+    # and into the progress bar. Everything is laid out in inches from the
+    # bottom up: Cancel button, progress bar, then the text.
+    import textwrap
+    fig_w_in = 6.5
+    line_h_in = UI_BUTTON_FONTSIZE * 1.35 / 72
+    chars_per_line = max(20, int(fig_w_in * 0.9 * 72 / (UI_BUTTON_FONTSIZE * 0.55)))
+    lines = [wrapped for paragraph in message.split('\n')
+             for wrapped in (textwrap.wrap(paragraph, chars_per_line) or [''])]
+    button_bottom_in, button_h_in = 0.15, 0.45
+    bar_bottom_in, bar_h_in = button_bottom_in + button_h_in + 0.3, 0.26
+    text_bottom_in = bar_bottom_in + bar_h_in + 0.2
+    fig_h_in = text_bottom_in + len(lines) * line_h_in + 0.25
 
-    progress_ax = fig.add_axes([0.1, 0.4, 0.8, 0.12])
+    fig, ax = plt.subplots(figsize=(fig_w_in, fig_h_in))
+    ax.set_position([0, 0, 1, 1])
+    ax.axis('off')
+    ax.text(0.5, (text_bottom_in + len(lines) * line_h_in / 2) / fig_h_in, '\n'.join(lines),
+            ha='center', va='center', fontsize=UI_BUTTON_FONTSIZE, linespacing=1.2,
+            transform=fig.transFigure)
+
+    progress_ax = fig.add_axes([0.1, bar_bottom_in / fig_h_in, 0.8, bar_h_in / fig_h_in])
     progress_ax.set_xlim(0, 1)
     progress_ax.set_ylim(0, 1)
     progress_ax.axis('off')
@@ -2095,8 +2113,7 @@ def show_processing_dialog(message):
     def on_cancel(event):
         cancel_flag['cancelled'] = True
 
-    fig.subplots_adjust(bottom=0.25)
-    cancel_ax = fig.add_axes([0.35, 0.05, 0.3, 0.18])
+    cancel_ax = fig.add_axes([0.35, button_bottom_in / fig_h_in, 0.3, button_h_in / fig_h_in])
     cancel_button = Button(cancel_ax, 'Cancel')
     cancel_button.label.set_fontsize(UI_BUTTON_FONTSIZE)
     cancel_button.on_clicked(on_cancel)
@@ -3720,7 +3737,8 @@ def prompt_section_selection_gui(adata, abc_cache, section_series, out_folder=No
                  f"{sanitize_section_token(section)}...\nThis can take a few seconds. Click Cancel to stop.")
                 if take_fast_path else
                 (f"Generating view for section {sanitize_section_token(section)}...\n"
-                 "This can take a few seconds. Click Cancel to stop.")
+                 "This can take a few seconds; image will be cached to speed up subsequent loads. "
+                 "Click Cancel to stop.")
             )
 
             if spatial_cache['df'] is None:
