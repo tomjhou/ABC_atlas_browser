@@ -661,6 +661,19 @@ SECTION_PANEL_FACECOLOR = 'black'
 VIEWER_SPAN_PERCENTILE = 90          # percentile of section extents setting the shared panel scale
 PANEL_PROGRESS_INTERVAL = 10         # log a progress line every N panels while building the grid
 
+# --- Section-panel scale bar (first panel only; see build_section_scalebar) ---
+SCALEBAR_TARGET_FRACTION = 0.22      # of the panel's current view width
+SCALEBAR_MARGIN_FRACTION = 0.06      # inset from the panel's own edges, as a fraction of its view
+SCALEBAR_TEXT_GAP_FRACTION = 0.02    # extra gap above the bar, for its length label
+# A 1-2-5 sequence in micrometers, the ABC atlas's own native unit divided by
+# 1000 (see HOVER_CELL_RADIUS_DATA_UNITS's comment on why the atlas's 'x'/'y'
+# columns are actually millimeters). Covers a single MERFISH cell's own
+# width (~10 um) up to several whole sections (~50 mm) side by side.
+SCALEBAR_NICE_LENGTHS_UM = (
+    1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000,
+)
+SECTION_MAPS_SAVE_DPI = 200           # matches save_roi_map/save_group_spatial_maps's own PNGs
+
 # --- Interaction timing (milliseconds unless noted) ---
 # How long a scroll burst must go quiet before the cheap stand-in bitmaps are
 # swapped back for a real, full-quality redraw. Longer = fewer expensive
@@ -2232,6 +2245,148 @@ class _RenderCancelled(Exception):
     """Raised by handle_double_click's progress_callback (from inside
     generate_and_cache_section_image, between rendering stages) to unwind
     out early once the user clicks Cancel."""
+
+
+def format_scalebar_length(length_um):
+    """'500 \u00b5m' below 1 mm, otherwise 'N mm' (e.g. '2 mm', '1.5 mm')."""
+    if length_um < 1000:
+        return f'{length_um:g} \u00b5m'
+    return f'{length_um / 1000:g} mm'
+
+
+def nice_scalebar_length_um(view_width_mm, target_fraction=SCALEBAR_TARGET_FRACTION,
+                             nice_lengths_um=SCALEBAR_NICE_LENGTHS_UM):
+    """The largest length (in micrometers, from `nice_lengths_um`) that's no
+    more than `target_fraction` of a view this wide (in millimeters — the
+    ABC atlas's own native data units; see HOVER_CELL_RADIUS_DATA_UNITS's
+    comment elsewhere in this file). Used for a scale bar that reads a
+    clean, round physical length at any zoom level: it shrinks as the view
+    narrows and grows as it widens, always snapping to one of these fixed
+    lengths, so it can never overflow the view or shrink away to nothing."""
+    target_um = view_width_mm * 1000 * target_fraction
+    candidates = [um for um in nice_lengths_um if um <= target_um]
+    return candidates[-1] if candidates else nice_lengths_um[0]
+
+
+def compute_scalebar_geometry(ax, margin_fraction=SCALEBAR_MARGIN_FRACTION,
+                               text_gap_fraction=SCALEBAR_TEXT_GAP_FRACTION):
+    """Where a scale bar belongs in `ax`'s lower-left corner right now: a
+    dict with the bar's two endpoints, the label's position, and its text —
+    all in `ax`'s own data coordinates, so the result is a real vector
+    object under savefig too, not a fixed-pixel overlay drawn after the
+    fact. Positioned via transAxes -> transData (screen-relative margins,
+    not a data-space offset) rather than assuming which data direction is
+    'right'/'up' on screen, so this works whether or not the axes' y-axis
+    is inverted — e.g. every section panel's tissue-orientation flip (see
+    invert_yaxis() elsewhere in this file). Returns None if the axes has no
+    usable width yet (e.g. mid-setup, before its limits are set)."""
+    x0, x1 = ax.get_xlim()
+    view_width_mm = abs(x1 - x0)
+    if not np.isfinite(view_width_mm) or view_width_mm <= 0:
+        return None
+    length_um = nice_scalebar_length_um(view_width_mm)
+    length_mm = length_um / 1000
+    inv = ax.transData.inverted()
+    corner_x, corner_y = inv.transform(ax.transAxes.transform((margin_fraction, margin_fraction)))
+    # A second point just to the right of the corner in axes-fraction terms
+    # (screen-right, always) — comparing its data-x against corner_x gives
+    # the sign that means 'rightward' in *this* axes' own data coordinates,
+    # without assuming x is never inverted.
+    probe_x, _probe_y = inv.transform(ax.transAxes.transform((margin_fraction + 0.01, margin_fraction)))
+    x_sign = 1 if probe_x >= corner_x else -1
+    end_x = corner_x + x_sign * length_mm
+    text_y = inv.transform(ax.transAxes.transform((margin_fraction, margin_fraction + text_gap_fraction)))[1]
+    return {
+        'bar_x': (corner_x, end_x), 'bar_y': (corner_y, corner_y),
+        'text_xy': (corner_x + x_sign * length_mm / 2, text_y),
+        'label': format_scalebar_length(length_um),
+    }
+
+
+def apply_scalebar_geometry(line, text, geometry):
+    """Push `geometry` (see compute_scalebar_geometry; None hides the bar)
+    onto an existing scale bar's Line2D/Text — the update half of
+    build_section_scalebar, for a bar that has to keep tracking a live,
+    still-changing view rather than being drawn once for a static export."""
+    if geometry is None:
+        line.set_visible(False)
+        text.set_visible(False)
+        return
+    line.set_visible(True)
+    text.set_visible(True)
+    line.set_data(geometry['bar_x'], geometry['bar_y'])
+    text.set_position(geometry['text_xy'])
+    text.set_text(geometry['label'])
+
+
+def build_section_scalebar(ax, color='white', fontsize=8, geometry=None):
+    """Add a scale bar (a Line2D + Text, both real vector artists in `ax`'s
+    own data coordinates — not a fixed-pixel overlay) to `ax`, sized and
+    positioned from `geometry` (see compute_scalebar_geometry), or freshly
+    computed from `ax`'s current view if omitted. Returns (line, text): a
+    caller that will keep tracking a live, changing view hangs onto them
+    and re-applies new geometry via apply_scalebar_geometry; a one-off
+    static export can just discard the return value."""
+    if geometry is None:
+        geometry = compute_scalebar_geometry(ax)
+    line = Line2D([0, 0], [0, 0], color=color, linewidth=2.5, solid_capstyle='butt', zorder=6)
+    ax.add_line(line)
+    text = ax.text(0, 0, '', color=color, ha='center', va='bottom', fontsize=fontsize, zorder=6)
+    apply_scalebar_geometry(line, text, geometry)
+    return line, text
+
+
+def visible_points_only(offsets, facecolors, sizes, xlim, ylim):
+    """`(offsets, facecolors, sizes)` filtered down to just the points inside
+    `xlim`/`ylim` (each may be given in either order — a decreasing ylim,
+    e.g. every section panel's own inverted y-axis, is handled the same as
+    an increasing one). `facecolors`/`sizes` are matplotlib scatter's own
+    get_facecolors()/get_sizes() — each is either one row that broadcasts to
+    every point (left untouched) or one row per point (filtered the same as
+    `offsets`).
+
+    Exists for render_section_maps_export_figure: a background_artist
+    always holds a *whole section's* points — many more than are inside the
+    current, possibly zoomed-in view — and relying on the new axes' own
+    clip-path to hide the rest at render/save time turned out not to be
+    enough. It works in every renderer this was actually drawn in (Agg for
+    the PNG, a browser for the SVG), but at least one common SVG viewer the
+    result also gets opened in doesn't apply a matplotlib clip-path to a
+    large scatter's individual points, which showed as this panel's own
+    off-screen cells bleeding into whatever sits next to it in the grid.
+    Filtering the *data* here removes the dependence on any renderer
+    honoring the clip at all, and, incidentally, makes for a much smaller
+    file than shipping a whole section's worth of points."""
+    x0, x1 = sorted(xlim)
+    y0, y1 = sorted(ylim)
+    visible = ((offsets[:, 0] >= x0) & (offsets[:, 0] <= x1)
+               & (offsets[:, 1] >= y0) & (offsets[:, 1] <= y1))
+    facecolors = facecolors if len(facecolors) == 1 else facecolors[visible]
+    sizes = sizes if len(sizes) == 1 else sizes[visible]
+    return offsets[visible], facecolors, sizes
+
+
+def unique_export_paths(target_dir, stem, extensions):
+    """{ext: path} for a new export named `stem` (no leading '.' on the
+    extensions), without overwriting an earlier one: the first save uses
+    `stem` bare; every save after that appends the lowest unused '_N'
+    suffix, checked across every extension in `extensions` together so a
+    PNG and SVG saved in the same call always share one suffix. A suffix
+    the user appended themselves after the number (e.g. renaming a copy to
+    '..._2_final.png') doesn't confuse the numbering — only the digits
+    immediately after '_N' are read; anything past that is ignored."""
+    base_exists = any((target_dir / f'{stem}{ext}').exists() for ext in extensions)
+    if not base_exists:
+        return {ext: target_dir / f'{stem}{ext}' for ext in extensions}
+    pattern = re.compile(rf'^{re.escape(stem)}_(\d+)(?:_.*)?$')
+    highest = 0
+    for ext in extensions:
+        for existing in target_dir.glob(f'{stem}_*{ext}'):
+            m = pattern.match(existing.stem)
+            if m:
+                highest = max(highest, int(m.group(1)))
+    n = highest + 1
+    return {ext: target_dir / f'{stem}_{n}{ext}' for ext in extensions}
 
 
 def generate_and_cache_section_image(adata, abc_cache, section_series, section_label, spatial,
@@ -9117,6 +9272,10 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     SECTION_HIGHLIGHT_BASE_SIZE = UMAP_POINT_SIZE * 3 * 2.25
     SECTION_GROUP_BASE_SIZE = UMAP_POINT_SIZE * 2.5
     section_panels = {}
+    # Set inside the panel-build loop below, on whichever panel is actually
+    # built first (see its own comment) — None if there turn out to be no
+    # panels at all (e.g. no spatial data for this run).
+    section_scalebar = None
     if sections_present and has_spatial:
         n_sections = len(sections_present)
         fig_width_in, fig_height_in = fig.get_size_inches()
@@ -9356,6 +9515,18 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             dim_veil.set_visible(False)
             dim_veil.set_animated(True)
             sec_ax.add_patch(dim_veil)
+            # One scale bar total, on the first panel actually built (not
+            # necessarily sections_present[0] — a section can be skipped
+            # above for missing centroid data). The other panels all share
+            # this one's physical scale (see section_zoom_ratio), so one bar
+            # already describes every one of them; kept in the enclosing
+            # scope (section_scalebar, just below the panel loop) rather
+            # than in this panel's own dict, since nothing else about it is
+            # per-panel.
+            if section_scalebar is None:
+                scalebar_line, scalebar_text = build_section_scalebar(
+                    sec_ax, geometry=compute_scalebar_geometry(sec_ax))
+                section_scalebar = {'ax': sec_ax, 'line': scalebar_line, 'text': scalebar_text}
             section_panels[sec] = {
                 'ax': sec_ax, 'highlight': highlight, 'group_highlight': None,
                 'dim_veil': dim_veil,
@@ -9378,6 +9549,17 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         empty_grid_ax.axis('off')
         empty_grid_ax.text(0.5, 0.5, 'No section/spatial data available', ha='center', va='center',
                             fontsize=SIDEBAR_FONTSIZE, wrap=True)
+
+    def update_section_scalebar():
+        """Recompute the live scale bar's length/position from its panel's
+        *current* view (zoom and/or pan) — a no-op if there are no section
+        panels at all. Called after anything that changes that view."""
+        if section_scalebar is None:
+            return
+        apply_scalebar_geometry(
+            section_scalebar['line'], section_scalebar['text'],
+            compute_scalebar_geometry(section_scalebar['ax']),
+        )
 
     # --- Generic scroll-to-zoom / drag-to-pan ---------------------------
     # The UMAP scatter zooms independently, cursor-anchored, same as
@@ -9509,6 +9691,10 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             sec_ax_.set_xlim(cx - x_dir * new_half_w, cx + x_dir * new_half_w)
             sec_ax_.set_ylim(cy - y_dir * new_half_h, cy + y_dir * new_half_h)
         update_section_dot_size()
+        # Same shared zoom ratio drove every panel's view above, so the one
+        # scale bar (see build_section_scalebar) only ever needs recomputing
+        # once here, not per panel.
+        update_section_scalebar()
 
     def suspend_hover_during_zoom():
         """Cancels any pending hover/family-highlight timer and hides
@@ -10059,6 +10245,12 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             new_y0, new_y1 = cy - y_dir * half_h, cy + y_dir * half_h
         ax_obj.set_xlim(new_x0, new_x1)
         ax_obj.set_ylim(new_y0, new_y1)
+        # Panning doesn't change the zoom (so not a job for update_section_
+        # scalebar's *other* caller, apply_section_zoom_ratio) but it does
+        # move this panel's own corner, which is where the bar is anchored —
+        # only relevant if the panel being dragged is the one carrying it.
+        if section_scalebar is not None and ax_obj is section_scalebar['ax']:
+            update_section_scalebar()
         pan_state['last_pixel'] = (event.x, event.y)
         if preview_just_started:
             # One full draw to get the newly-created stand-ins (and the
@@ -13085,27 +13277,95 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # message on screen — no full redraw needed just to report this.
         blit_hover_overlays()
 
-    def save_section_maps(event=None):
-        """Screenshot of the entire section-panel grid, exactly as
-        currently displayed — each panel's own zoom/pan position, current
-        coloring, ROI rectangles included. Unlike save_current_umap (which
-        re-renders a fresh, independent export figure via render_export_
-        figure), this captures the *live* canvas directly: the section
-        grid has no single clean "current view" to rebuild from scratch the
-        way one UMAP scatter does — every panel can be independently
-        panned/zoomed — so a pixel screenshot of what's actually on screen
-        is both the simplest and the most faithful representation of "the
-        section maps" as the user currently sees them.
+    def render_section_maps_export_figure():
+        """A brand-new, off-screen Figure reproducing the section-panel grid
+        exactly as currently displayed — each panel's own pan/zoom, current
+        coloring, and ROI rectangles, but not the hover ring/family
+        highlight/dimming veil, same exclusions save_current_umap's own
+        render_export_figure makes for the UMAP (a hover artifact isn't
+        part of "the section maps" as a deliverable). Unlike that function,
+        this deliberately *keeps* the live window's own current physical
+        size and shape in the result — every panel comes out at exactly the
+        size it currently has on screen, in inches — rather than a fixed,
+        screen-independent size: since every panel can be independently
+        panned/zoomed, there's no single "current view" to define a
+        canonical size from the way the one UMAP scatter has, so matching
+        what's actually on screen right now (still true to a real,
+        physical scale via the scale bar) is the closest thing to a
+        faithful "as the user currently sees it" export — the same goal
+        the screenshot this replaces was already going for.
 
-        Cropped to the grid's own column (GRID_LEFT..GRID_RIGHT) rather
-        than the whole figure, but the *top* of that crop is the figure's
-        own top edge (1.0), not AREA_TOP — AREA_TOP is where each panel's
-        own axes box starts, and every panel's title text sits just above
-        that, so cropping tight to AREA_TOP would clip the top row's
-        titles. Nothing else occupies this column above the grid (the
-        sidebar/UMAP live to its right), so extending all the way to 1.0
-        costs nothing.
-        """
+        Built via Figure()+FigureCanvasAgg (same headless pattern as
+        render_export_figure — see its own docstring), so this never
+        touches Tk and is never shown."""
+        crop_x0, crop_y0, crop_x1, crop_y1 = GRID_LEFT, AREA_BOTTOM, GRID_RIGHT, 1.0
+        crop_w_frac, crop_h_frac = crop_x1 - crop_x0, crop_y1 - crop_y0
+        live_w_in, live_h_in = fig.get_size_inches()
+        export_fig = Figure(figsize=(crop_w_frac * live_w_in, crop_h_frac * live_h_in))
+        FigureCanvasAgg(export_fig)  # attaches itself as export_fig.canvas; never touches Tk
+
+        for panel in section_panels.values():
+            live_ax = panel['ax']
+            pos = live_ax.get_position()
+            # This panel's live box, remapped from whole-figure fractions
+            # into fractions of just the crop region — since export_fig's
+            # own size *is* that crop region's own physical size (above),
+            # this reproduces the panel at the exact same absolute size (in
+            # inches) it currently has on screen, not merely the same
+            # proportions.
+            new_ax = export_fig.add_axes([
+                (pos.x0 - crop_x0) / crop_w_frac, (pos.y0 - crop_y0) / crop_h_frac,
+                pos.width / crop_w_frac, pos.height / crop_h_frac,
+            ])
+            new_ax.set_facecolor(live_ax.get_facecolor())
+            new_ax.set_aspect('equal', adjustable='box')
+            new_ax.set_xlim(live_ax.get_xlim())
+            new_ax.set_ylim(live_ax.get_ylim())
+            new_ax.set_xticks([])
+            new_ax.set_yticks([])
+            for live_spine, new_spine in zip(live_ax.spines.values(), new_ax.spines.values()):
+                new_spine.set_linewidth(live_spine.get_linewidth())
+            new_ax.set_title(live_ax.get_title(), fontsize=live_ax.title.get_fontsize())
+
+            bg = panel['background_artist']
+            offsets, facecolors, sizes = visible_points_only(
+                bg.get_offsets(), bg.get_facecolors(), bg.get_sizes(),
+                live_ax.get_xlim(), live_ax.get_ylim(),
+            )
+            new_ax.scatter(offsets[:, 0], offsets[:, 1], c=facecolors, s=sizes, linewidths=0)
+
+            # ROI rectangles only — panel['ax'].patches also holds dim_veil
+            # (the hover-dimming overlay), deliberately excluded here along
+            # with the highlight/group_highlight scatters (never copied at
+            # all, since nothing above reads them).
+            for roi_patch in live_ax.patches:
+                if roi_patch is panel['dim_veil']:
+                    continue
+                new_ax.add_patch(Rectangle(
+                    roi_patch.get_xy(), roi_patch.get_width(), roi_patch.get_height(),
+                    edgecolor=roi_patch.get_edgecolor(), facecolor=roi_patch.get_facecolor(),
+                    linestyle=roi_patch.get_linestyle(), linewidth=roi_patch.get_linewidth(),
+                ))
+
+            # One scale bar total (see build_section_scalebar) — added here,
+            # not copied, since a static export never needs the live one's
+            # ability to track a still-changing view.
+            if section_scalebar is not None and live_ax is section_scalebar['ax']:
+                build_section_scalebar(new_ax, fontsize=section_scalebar['text'].get_fontsize())
+        return export_fig
+
+    def save_section_maps(event=None):
+        """Write the section-panel grid to PNG and SVG in this run's own
+        folder, named after whatever it's currently showing (see
+        sanitized_view_token) — rendered via render_section_maps_export_
+        figure (above), so both are real vector files (a scale bar included
+        as one, not a rasterized overlay), not a screenshot.
+
+        Since every panel's pan/zoom is independent and there's no
+        canonical "reset" view to fall back on, re-saving after changing
+        the view doesn't overwrite the previous save — see
+        unique_export_paths — so a set of earlier views already saved this
+        session stays on disk alongside the new one."""
         if not section_panels:
             status_text.set_text("No section panels to save.")
             blit_hover_overlays()
@@ -13114,42 +13374,19 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         show_working_indicator('Saving…')
         try:
             target_dir.mkdir(parents=True, exist_ok=True)
-            # A hover ring/family highlight active wherever the mouse
-            # happened to be sitting isn't part of "the section maps" as a
-            # deliverable, any more than it's part of what save_current_
-            # umap's own from-scratch re-render produces — hidden here
-            # (blit=False: no point pushing that to screen, the real draw
-            # right below makes it moot) so the saved image is just the
-            # data.
-            hide_all_highlights(blit=False)
-            fig.canvas.draw()  # real, synchronous — the capture below reads straight from this buffer
-            renderer = fig.canvas.get_renderer()
-            buf = np.asarray(renderer.buffer_rgba())
-            h = buf.shape[0]
-            (px0, py0) = fig.transFigure.transform((GRID_LEFT, AREA_BOTTOM))
-            (px1, py1) = fig.transFigure.transform((GRID_RIGHT, 1.0))
-            x0, x1 = sorted((int(round(px0)), int(round(px1))))
-            y0, y1 = sorted((int(round(py0)), int(round(py1))))
-            x0, x1 = max(0, x0), min(buf.shape[1], x1)
-            y0, y1 = max(0, y0), min(h, y1)
-            # Row 0 of buffer_rgba() is the *top* of the canvas; matplotlib's
-            # own y-pixel coordinates increase upward — same flip
-            # snapshot_axes_region uses for exactly this reason.
-            crop = buf[h - y1:h - y0, x0:x1, :]
-            # Same token save_current_umap names its own file after — the
-            # level and ID(s)/gene currently shown, since the section
-            # panels are colored/highlighted to match that exact selection.
-            path = target_dir / f'{sanitized_view_token()}_section_maps.png'
-            Image.fromarray(crop, mode='RGBA').save(path)
-            status_text.set_text(f"Saved {path.name} to {target_dir}.")
-            print(f"Saved section maps to {path}.")
+            export_fig = render_section_maps_export_figure()
+            paths = unique_export_paths(target_dir, f'{sanitized_view_token()}_section_maps', ('.png', '.svg'))
+            export_fig.savefig(paths['.png'], dpi=SECTION_MAPS_SAVE_DPI)
+            export_fig.savefig(paths['.svg'])
+            names = ', '.join(path.name for path in paths.values())
+            status_text.set_text(f"Saved {names} to {target_dir}.")
+            print(f"Saved section maps to {', '.join(str(path) for path in paths.values())}.")
         except Exception as e:
             status_text.set_text(f"Could not save section maps: {e}")
             print(f"Could not save section maps: {e}")
         hide_working_indicator()
-        # Restores the highlight state hide_all_highlights above cleared —
-        # same "just blit, no full redraw needed" reasoning as save_
-        # current_umap's own trailing call.
+        # status_text is animated, so a blit is what actually puts the
+        # message on screen — no full redraw needed just to report this.
         blit_hover_overlays()
 
     def export_de_genes(event=None):
