@@ -679,33 +679,42 @@ PANEL_PROGRESS_INTERVAL = 10         # log a progress line every N panels while 
 # extent, persisted into the run's own folder (see show_interactive_umap_
 # window's own run_folder) so re-showing it — even in a brand new session,
 # on a different machine sharing that folder — is instant instead of a
-# real ~80-panel vector re-render (which is what was taking ~30s). Screen-
-# size independent by construction: rendered off-screen at this fixed
-# size/DPI (render_section_home_view_png), never tied to whatever window
-# happened to generate it, then displayed via imshow — which resamples to
-# fit whatever panel size actually needs it, the same way the live zoom-
-# preview bitmaps already work — regardless of which machine's screen
-# first produced the cached file.
+# real ~80-panel vector re-render (which is what was taking ~30s).
 SECTION_HOME_CACHE_DPI = 150
-# Long edge of the cached bitmap, in inches at SECTION_HOME_CACHE_DPI — a
-# fixed size regardless of the live window's own panel count/size (see the
-# comment above), which means it has to be generous enough to still look
-# sharp for the *largest* a panel ever gets: a run with few sections (each
-# panel then gets a much bigger on-screen box than one of 60+ sections
-# sharing the same grid area) rather than tuned for the common many-
-# sections case. 3.0in (450px) was tuned for the latter and visibly
-# pixelated once blown up to fill a large panel in a small-section-count
-# run — bumped to 8.0in (1200px) to stay sharp across that whole range.
-SECTION_HOME_CACHE_LONG_EDGE_IN = 8.0
+# Rendered at whatever size *this* panel's own current on-screen box
+# actually needs (see show_section_home_cache_or_scatter), not a fixed
+# constant — a run with few sections (each panel then gets a much bigger
+# box than one of 60+ sections sharing the same grid area) needs a much
+# larger cache than a many-sections run to look sharp, and a fixed size
+# tuned for one case was either blurry (too small) or needlessly slow to
+# render/load/zoom (too big) for the other.
+#
+# The size safety margin used when computing that target (see show_
+# section_home_cache_or_scatter) is deliberately ZOOM_BITMAP_ONLY_MAX_
+# MULTIPLIER itself (defined below), not an independently-tuned constant:
+# the cached bitmap is what the zoom-preview system shows, magnified, for
+# every ratio between 1.0x (home) and that threshold before switching to a
+# real per-cell redraw — so it already has to survive being shown at up to
+# that multiplier's own on-screen size just to do its existing job,
+# regardless of any cross-machine concern. Reusing that same constant
+# (rather than a separate one that happens to start at the same value)
+# keeps that relationship explicit and keeps them in sync automatically if
+# the zoom threshold ever changes.
+# Not screen-size independent by construction any more (the cache used to
+# be rendered at one fixed size regardless of what asked for it) — instead
+# self-healing: show_section_home_cache_or_scatter compares an existing
+# cache's own pixel dimensions against what the *current* panel/window
+# actually needs on every load (a cheap PNG header read, not a real
+# decode) and regenerates it if it falls short. A smaller window/screen
+# than whatever generated the cache gets a fast hit (the cache already
+# exceeds its need); one needing more resolution pays the render cost
+# once, and every later load — on any machine sharing the run folder —
+# benefits from the now-larger cache.
 # Bump this whenever render_section_home_view_png's own output would
 # change (colors, dot size/style, point selection, ...) in a way that
 # makes an already-cached PNG show something subtly wrong — there's no
 # way to detect that automatically, so a stale cache would otherwise just
-# keep being served as if still valid. Bumped 1 -> 2 alongside the
-# LONG_EDGE_IN increase above, so existing low-resolution caches on disk
-# are treated as a different (missing) cache key and regenerated at the
-# new size automatically, rather than requiring every run folder's
-# section_home_cache to be deleted by hand.
+# keep being served as if still valid.
 SECTION_HOME_CACHE_VERSION = 2
 
 # --- Section-panel scale bar (first panel only; see build_section_scalebar) ---
@@ -2805,7 +2814,7 @@ def section_home_cache_path(run_folder, section_label, level):
             f'{DATASET_NAME}_v{SECTION_HOME_CACHE_VERSION}_{section_token}_{level}.png')
 
 
-def render_section_home_view_png(xs, ys, colors, is_gray, home_xlim, home_ylim):
+def render_section_home_view_png(xs, ys, colors, is_gray, home_xlim, home_ylim, long_edge_in):
     """Off-screen render of one section panel's *complete* (unfiltered)
     background point set at its home extent, colored per `colors` (gray
     cells drawn first/underneath, same convention as apply_panel_colors_
@@ -2823,21 +2832,24 @@ def render_section_home_view_png(xs, ys, colors, is_gray, home_xlim, home_ylim):
     inverted live axes, which is exactly what happened before this
     comment existed.
 
-    Uses a fresh, throwaway Figure+FigureCanvasAgg at a fixed size/DPI
-    (SECTION_HOME_CACHE_DPI/_LONG_EDGE_IN) — entirely independent of the
-    live interactive window, so the result looks identical regardless of
+    Uses a fresh, throwaway Figure+FigureCanvasAgg at a fixed DPI
+    (SECTION_HOME_CACHE_DPI) and a `long_edge_in` the *caller* computes
+    from this panel's own current on-screen size (see show_section_home_
+    cache_or_scatter) — entirely independent of the live interactive
+    window's own rendering, so the result looks identical regardless of
     which machine's screen happened to generate it (see section_home_
-    cache_path's own docstring). Returns an RGBA uint8 array, ready for
-    Image.fromarray(...).save(...) or direct imshow use."""
+    cache_path's own docstring), while still being sized appropriately for
+    however large this panel actually needs to be. Returns an RGBA uint8
+    array, ready for Image.fromarray(...).save(...) or direct imshow use."""
     x0, x1 = home_xlim
     y0, y1 = home_ylim
     width_data, height_data = abs(x1 - x0), abs(y1 - y0)
     if width_data <= 0 or height_data <= 0:
-        figsize = (SECTION_HOME_CACHE_LONG_EDGE_IN, SECTION_HOME_CACHE_LONG_EDGE_IN)
+        figsize = (long_edge_in, long_edge_in)
     elif width_data >= height_data:
-        figsize = (SECTION_HOME_CACHE_LONG_EDGE_IN, SECTION_HOME_CACHE_LONG_EDGE_IN * height_data / width_data)
+        figsize = (long_edge_in, long_edge_in * height_data / width_data)
     else:
-        figsize = (SECTION_HOME_CACHE_LONG_EDGE_IN * width_data / height_data, SECTION_HOME_CACHE_LONG_EDGE_IN)
+        figsize = (long_edge_in * width_data / height_data, long_edge_in)
     fig = Figure(figsize=figsize, dpi=SECTION_HOME_CACHE_DPI)
     FigureCanvasAgg(fig)
     fig.patch.set_facecolor(SECTION_PANEL_FACECOLOR)
@@ -13115,13 +13127,43 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         if not at_home:
             use_real_scatter()
             return 'skipped'
+        # This panel's own current on-screen box (its live axes' position,
+        # not the panel_w/panel_h closure vars computed at grid-construction
+        # time — reposition_grid's own resize handling only updates panel_h
+        # via nonlocal, never panel_w, so those two can disagree with the
+        # axes' actual current size after a horizontal resize; the axes'
+        # own get_position() is always current regardless) — used to size
+        # the cache appropriately for however large this panel actually
+        # needs to be, rather than one fixed size for every run regardless
+        # of section count (see SECTION_HOME_CACHE_DPI's own comment).
+        fig_w_in, fig_h_in = fig.get_size_inches()
+        box = ax_.get_position()
+        box_w_in, box_h_in = box.width * fig_w_in, box.height * fig_h_in
+        target_long_edge_in = max(box_w_in, box_h_in) * ZOOM_BITMAP_ONLY_MAX_MULTIPLIER
+        target_long_edge_px = target_long_edge_in * SECTION_HOME_CACHE_DPI
+
         cache_path = section_home_cache_path(run_folder, sec, level)
         rgba = None
         outcome = 'rendered'
         if cache_path.exists():
             try:
-                rgba = np.asarray(Image.open(cache_path).convert('RGBA'), dtype=np.uint8)
-                outcome = 'hit'
+                with Image.open(cache_path) as cached_img:
+                    # A cheap header read (no pixel decode) — compares
+                    # against target_long_edge_px with a little slack
+                    # (accept anything at least 90% of the target) so an
+                    # ordinary few-pixel rounding difference between window
+                    # sizes doesn't force a needless re-render; a cache
+                    # that's genuinely too small (a different, smaller
+                    # window generated it, or this run used to have fewer
+                    # sections sharing more room per panel) falls through
+                    # to the render branch below instead, self-healing to
+                    # the larger size — see SECTION_HOME_CACHE_DPI's own
+                    # comment for why this is safe to share across
+                    # machines/sessions rather than versioning by size.
+                    cached_long_edge_px = max(cached_img.size)
+                    if cached_long_edge_px >= target_long_edge_px * 0.9:
+                        rgba = np.asarray(cached_img.convert('RGBA'), dtype=np.uint8)
+                        outcome = 'hit'
             except Exception:
                 rgba = None  # unreadable/corrupt — just re-render below
         if rgba is None:
@@ -13136,7 +13178,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
                 rgba = render_section_home_view_png(
                     full_offsets[:, 0], full_offsets[:, 1], full_colors,
                     np.zeros(len(full_colors), dtype=bool),
-                    home['home_xlim'], home['home_ylim'],
+                    home['home_xlim'], home['home_ylim'], target_long_edge_in,
                 )
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
                 Image.fromarray(rgba, mode='RGBA').save(cache_path)
