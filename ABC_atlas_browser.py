@@ -13080,7 +13080,24 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         extent = (min(home['home_xlim']), max(home['home_xlim']),
                   min(home['home_ylim']), max(home['home_ylim']))
         if image_artist is None:
+            # Axes.imshow(aspect=...), if not None, calls self.ax.set_
+            # aspect(aspect) internally — it resets the *axes'* own aspect
+            # setting, not just how this one image gets drawn. Passing
+            # 'auto' here silently overwrote this panel's 'equal'/'box'
+            # aspect (set once at panel construction) the first time its
+            # cached home-view image was ever shown, and nothing ever set
+            # it back — every subsequent redraw of this axes (this cached
+            # image on later runs, and the real scatter too, once zoomed
+            # in past the bitmap-only threshold) then stretched to fill
+            # whatever box shape the section grid happened to give this
+            # panel, unless that shape already happened to match the data's
+            # own aspect ratio. Same bug, same fix, as begin_zoom_preview's
+            # own imshow calls already have to save/restore around (see its
+            # own comment) — just a separate code path that was missing it.
+            saved_aspect = ax_.get_aspect()
+            saved_adjustable = ax_.get_adjustable()
             image_artist = ax_.imshow(rgba, extent=extent, aspect='auto', origin='upper', zorder=2)
+            ax_.set_aspect(saved_aspect, adjustable=saved_adjustable)
             panel['cached_home_image'] = image_artist
         else:
             image_artist.set_data(rgba)
