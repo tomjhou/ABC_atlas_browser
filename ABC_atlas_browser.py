@@ -261,7 +261,8 @@ SETTINGS_FILE = SCRIPT_DIR / 'viewer_settings.json'
 # interactive viewer), the whole module has already finished loading.
 DEFAULT_VIEWER_SETTINGS = {
     'hover_enabled': True,
-    'gene456_shape': 'circle',
+    'gene456_shape': 'small circle',
+    'umap_circle_size': 'Default',
     # Itself a setting, with a deliberately asymmetric persistence rule —
     # see load_viewer_settings/save_viewer_settings's own docstrings.
     'persist_settings': False,
@@ -270,15 +271,16 @@ DEFAULT_VIEWER_SETTINGS = {
 
 def load_viewer_settings():
     """The interactive UMAP viewer's own settings (hover-highlighting on/
-    off, the multi-gene overlay's genes-4-6 marker shape), starting from
-    DEFAULT_VIEWER_SETTINGS and layering in whatever's on disk.
+    off, the multi-gene overlay's genes-4-6 marker shape, the overall UMAP
+    dot size), starting from DEFAULT_VIEWER_SETTINGS and layering in
+    whatever's on disk.
 
     'persist_settings' itself is the one exception to "nothing persists by
     default": it's always read from the file if present, regardless of its
     own value, so a user who opts into persistence once stays opted in on
     every later launch without the choice to persist needing to itself be
-    persisted through some separate mechanism. The other two settings are
-    only loaded from disk when the file's own 'persist_settings' says to —
+    persisted through some separate mechanism. The other settings are only
+    loaded from disk when the file's own 'persist_settings' says to —
     otherwise they're left at their hardcoded defaults for this session,
     same as if the file didn't exist.
 
@@ -298,13 +300,15 @@ def load_viewer_settings():
             settings['hover_enabled'] = bool(on_disk['hover_enabled'])
         if on_disk.get('gene456_shape') in GENE456_SHAPE_REGISTRY:
             settings['gene456_shape'] = on_disk['gene456_shape']
+        if on_disk.get('umap_circle_size') in UMAP_CIRCLE_SIZE_REGISTRY:
+            settings['umap_circle_size'] = on_disk['umap_circle_size']
     return settings
 
 
 def save_viewer_settings(settings):
     """Writes `settings` to SETTINGS_FILE — mirroring load_viewer_
     settings' own asymmetric rule: 'persist_settings' is always written,
-    but 'hover_enabled'/'gene456_shape' are only included when settings[
+    but the other settings are only included when settings[
     'persist_settings'] is True. Without that second half, turning
     persistence off would still leave whatever was last saved sitting in
     the file, silently reappearing (looking like persistence was somehow
@@ -319,6 +323,7 @@ def save_viewer_settings(settings):
     if to_write['persist_settings']:
         to_write['hover_enabled'] = bool(settings.get('hover_enabled', True))
         to_write['gene456_shape'] = settings.get('gene456_shape', GENE456_SHAPE_DEFAULT)
+        to_write['umap_circle_size'] = settings.get('umap_circle_size', UMAP_CIRCLE_SIZE_DEFAULT)
     try:
         SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
@@ -702,11 +707,44 @@ MULTI_GENE_PLUS_ZORDER = 1.5  # above the circle layer's default zorder (1), bel
 # (prompt_viewer_settings_dialog) and stored in viewer_settings/
 # SETTINGS_FILE as 'gene456_shape' — see load_viewer_settings's own
 # docstring for that setting's persistence rule.
+#
+# Path.wedge(-90, 90)'s own raw vertices span radius 1.0 from the origin —
+# *not* the same scale matplotlib's built-in markers use. 'o' (any single-
+# character marker code) gets normalized by MarkerStyle to a path whose
+# own bounding box is [-0.5, 0.5] on each axis, radius 0.5 — verified
+# directly (MarkerStyle('o').get_path().transformed(...).get_extents())
+# rather than assumed, since scatter's `s` scales a marker by its own raw
+# path coordinates, not by some shape-independent notion of "radius".
+# Passing the wedge unscaled at the same size_multiplier as 'circle' drew
+# it at roughly double the circle's own radius instead of matching it.
+# Pre-scaling the vertices by 0.5 here (once, at import time — not
+# per-draw) brings it onto the same radius-0.5 scale 'o' already uses, so
+# a size_multiplier of 1.0 really does mean "same radius as the base
+# circle" rather than needing its own, separately-tuned fudge factor.
+_HALF_CIRCLE_RAW_PATH = MplPath.wedge(-90, 90)
 GENE456_SHAPE_REGISTRY = {
-    'circle': {'marker': 'o', 'size_multiplier': MULTI_GENE_PLUS_SIZE_DIAMETER_MULTIPLIER},
-    'half-circle': {'marker': MplPath.wedge(-90, 90), 'size_multiplier': 1.0},
+    'small circle': {'marker': 'o', 'size_multiplier': MULTI_GENE_PLUS_SIZE_DIAMETER_MULTIPLIER},
+    'half circle': {
+        'marker': MplPath(_HALF_CIRCLE_RAW_PATH.vertices * 0.5, _HALF_CIRCLE_RAW_PATH.codes),
+        'size_multiplier': 1.0,
+    },
 }
-GENE456_SHAPE_DEFAULT = 'circle'
+GENE456_SHAPE_DEFAULT = 'small circle'
+
+# Selectable overall UMAP dot diameter (a preference, independent of zoom —
+# see update_umap_dot_size, which multiplies this together with the
+# current zoom multiplier for the main scatter, the hover ring, and the
+# group highlight, but deliberately *not* the centroid ID labels' own
+# font size, which stays tied to zoom alone). Handy for a sparse dataset
+# (bump it up so individual cells are easier to see/click) or a very dense
+# one (shrink it so points overlap less).
+UMAP_CIRCLE_SIZE_REGISTRY = {
+    'Small': 0.7,
+    'Default': 1.0,
+    'Large': 1.4,
+    'Extra large': 2.0,
+}
+UMAP_CIRCLE_SIZE_DEFAULT = 'Default'
 # The UMAP axes' own background for every *other* mode (categorical
 # taxonomy levels, single gene) — restored explicitly by clear_colorbar
 # whenever leaving multi-gene mode. Needed because Axes.clear() does *not*
@@ -823,8 +861,13 @@ SECTION_HOME_CACHE_DPI = 150
 # change (colors, dot size/style, point selection, ...) in a way that
 # makes an already-cached PNG show something subtly wrong — there's no
 # way to detect that automatically, so a stale cache would otherwise just
-# keep being served as if still valid.
-SECTION_HOME_CACHE_VERSION = 2
+# keep being served as if still valid. Bumped 2 -> 3 for the dot_size_
+# scale fix (cell dots baked into the cache were rendering undersized by
+# 1/ZOOM_BITMAP_ONLY_MAX_MULTIPLIER^2, making the live, unaffected hover
+# family-highlight '+' markers look disproportionately bigger next to
+# them) — the resolution-based hit-check alone wouldn't have caught this,
+# since it only compares pixel dimensions, not what's drawn inside them.
+SECTION_HOME_CACHE_VERSION = 3
 
 # --- Section-panel scale bar (first panel only; see build_section_scalebar) ---
 SCALEBAR_TARGET_FRACTION = 0.22      # of the panel's current view width
@@ -2923,11 +2966,27 @@ def section_home_cache_path(run_folder, section_label, level):
             f'{DATASET_NAME}_v{SECTION_HOME_CACHE_VERSION}_{section_token}_{level}.png')
 
 
-def render_section_home_view_png(xs, ys, colors, is_gray, home_xlim, home_ylim, long_edge_in):
+def render_section_home_view_png(xs, ys, colors, is_gray, home_xlim, home_ylim, long_edge_in, dot_size_scale=1.0):
     """Off-screen render of one section panel's *complete* (unfiltered)
     background point set at its home extent, colored per `colors` (gray
     cells drawn first/underneath, same convention as apply_panel_colors_
     with_gray_behind — `is_gray` decides that draw order the same way).
+
+    `dot_size_scale` (an AREA multiplier, applied directly to `s`) exists
+    because `long_edge_in` is deliberately bigger than this panel's actual
+    on-screen size (see show_section_home_cache_or_scatter's own comment,
+    ZOOM_BITMAP_ONLY_MAX_MULTIPLIER safety margin) — but matplotlib's `s`
+    is a fixed physical size in points^2, independent of the figure's own
+    size, so a cell dot rendered at the *same* `s` into a bigger-than-
+    needed figure ends up covering a *smaller fraction* of it, and shows
+    up smaller still once that oversized image is shrunk back down via
+    imshow to the panel's real on-screen size. Caught directly (not just
+    suspected) via the physical-unit math: the shrink factor works out to
+    exactly 1/(long_edge_in / this panel's own unscaled on-screen size) —
+    i.e. 1/ZOOM_BITMAP_ONLY_MAX_MULTIPLIER with the current formula — the
+    same relationship the caller uses to compute `dot_size_scale` as that
+    ratio squared, canceling it back out. Left at 1.0 (no correction) by
+    any other caller that renders at a panel's own true size 1:1.
 
     Deliberately does *not* invert the y-axis the way the live section
     panels do (see sec_ax.invert_yaxis()'s own comment on the atlas's y-
@@ -2966,7 +3025,7 @@ def render_section_home_view_png(xs, ys, colors, is_gray, home_xlim, home_ylim, 
     ax.set_facecolor(SECTION_PANEL_FACECOLOR)
     order = np.argsort(~np.asarray(is_gray), kind='stable')
     ax.scatter(xs[order], ys[order], c=np.asarray(colors, dtype=object)[order],
-               s=SECTION_BACKGROUND_BASE_SIZE, alpha=SECTION_POINT_ALPHA, linewidths=0)
+               s=SECTION_BACKGROUND_BASE_SIZE * dot_size_scale, alpha=SECTION_POINT_ALPHA, linewidths=0)
     ax.set_aspect('equal', adjustable='box')
     ax.set_xlim(x0, x1)
     ax.set_ylim(y0, y1)
@@ -3536,13 +3595,13 @@ def prompt_deg_comparison_mode(parent_window, title, level_name):
 def prompt_viewer_settings_dialog(parent_window, current_settings):
     """The interactive UMAP viewer's own Settings dialog: hover-
     highlighting on/off, the multi-gene overlay's genes-4-6 marker shape
-    (GENE456_SHAPE_REGISTRY), and whether these choices persist across
-    sessions (see load_viewer_settings/save_viewer_settings's own
-    docstrings for that setting's own asymmetric persistence rule). Same
-    modal-child pattern as prompt_deg_comparison_mode — see its own
-    docstring for why a real Toplevel rather than tkinter.messagebox, and
-    why transient()/grab_set()/wait_window() rather than a second,
-    competing Tk() root.
+    (GENE456_SHAPE_REGISTRY), the overall UMAP dot size (UMAP_CIRCLE_SIZE_
+    REGISTRY), and whether these choices persist across sessions (see
+    load_viewer_settings/save_viewer_settings's own docstrings for that
+    setting's own asymmetric persistence rule). Same modal-child pattern
+    as prompt_deg_comparison_mode — see its own docstring for why a real
+    Toplevel rather than tkinter.messagebox, and why transient()/
+    grab_set()/wait_window() rather than a second, competing Tk() root.
 
     `current_settings` is read but never mutated — the caller decides what
     to do with the result. Returns an updated settings dict once OK is
@@ -3559,6 +3618,12 @@ def prompt_viewer_settings_dialog(parent_window, current_settings):
     hover_var = tk.BooleanVar(value=current_settings['hover_enabled'])
     tk.Checkbutton(dialog, text="Enable hover highlighting", variable=hover_var, anchor='w').pack(
         fill='x', padx=12, pady=(12, 6))
+
+    size_frame = tk.Frame(dialog)
+    tk.Label(size_frame, text="UMAP circle size:").pack(side='left')
+    size_var = tk.StringVar(value=current_settings.get('umap_circle_size', UMAP_CIRCLE_SIZE_DEFAULT))
+    tk.OptionMenu(size_frame, size_var, *UMAP_CIRCLE_SIZE_REGISTRY.keys()).pack(side='left', padx=(6, 0))
+    size_frame.pack(fill='x', padx=12, pady=(0, 6))
 
     shape_frame = tk.Frame(dialog)
     tk.Label(shape_frame, text="Genes 4-6 shape:").pack(side='left')
@@ -3578,6 +3643,7 @@ def prompt_viewer_settings_dialog(parent_window, current_settings):
         result['value'] = {
             'hover_enabled': hover_var.get(),
             'gene456_shape': shape_var.get(),
+            'umap_circle_size': size_var.get(),
             'persist_settings': persist_var.get(),
         }
         dialog.destroy()
@@ -9834,12 +9900,21 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # artists stay proportionate to the underlying points as you zoom,
         # not left behind at their fully-zoomed-out size.
         multiplier = umap_zoom_diameter_multiplier()
+        # The user's own overall-size preference (Settings dialog) is a
+        # second, independent diameter multiplier layered on top of the
+        # zoom one — folded into `dot_multiplier` for the dots/ring/group
+        # marker below, but deliberately *not* into the centroid ID
+        # labels' own font size further down, which stays tied to zoom
+        # alone: bumping dot size for a sparse dataset (or shrinking it for
+        # a dense one) isn't a reason for the label text to also change.
+        user_scale = UMAP_CIRCLE_SIZE_REGISTRY.get(viewer_settings['umap_circle_size'], 1.0)
+        dot_multiplier = multiplier * user_scale
         for artist, size_mult in zip(main_scatter_state['artists'], main_scatter_state['size_multipliers']):
-            artist.set_sizes([UMAP_POINT_SIZE * size_mult * multiplier ** 2])
+            artist.set_sizes([UMAP_POINT_SIZE * size_mult * dot_multiplier ** 2])
         if umap_highlight_state['artist'] is not None:
-            umap_highlight_state['artist'].set_sizes([UMAP_HIGHLIGHT_BASE_SIZE * multiplier ** 2])
+            umap_highlight_state['artist'].set_sizes([UMAP_HIGHLIGHT_BASE_SIZE * dot_multiplier ** 2])
         if group_highlight_state['artist'] is not None:
-            group_highlight_state['artist'].set_sizes([umap_group_marker_size(multiplier)])
+            group_highlight_state['artist'].set_sizes([umap_group_marker_size(dot_multiplier)])
         # Centroid ID labels track the dots exactly. `multiplier` is a
         # *diameter* ratio (the dot sizes above square it, since matplotlib's
         # `s` is an area), and font size is likewise a linear dimension — so
@@ -12234,10 +12309,12 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         partially. Anything that actually needs to *change on screen*
         right now (clearing an active hover highlight if hover was just
         turned off; re-rendering if the genes-4-6 shape changed while that
-        overlay is currently showing) happens here too, so the effect is
+        overlay is currently showing; rescaling every dot-like artist if
+        the UMAP circle size changed) happens here too, so the effect is
         immediate rather than waiting for the next unrelated redraw."""
         hover_was_enabled = viewer_settings['hover_enabled']
         shape_changed = new_settings['gene456_shape'] != viewer_settings['gene456_shape']
+        size_changed = new_settings['umap_circle_size'] != viewer_settings['umap_circle_size']
         viewer_settings.update(new_settings)
         save_viewer_settings(viewer_settings)
         if hover_was_enabled and not viewer_settings['hover_enabled']:
@@ -12250,6 +12327,16 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             hide_all_highlights()
         if shape_changed and multi_gene_state['active'] and len(multi_gene_state['genes']) > 3:
             redraw()
+        elif size_changed:
+            # No rebuild needed — update_umap_dot_size() rescales the
+            # existing artists (main scatter, hover ring, group highlight)
+            # in place; a real draw just has to actually show the new
+            # sizes. Skipped when the shape branch above already redrew
+            # everything from scratch (which itself calls update_umap_dot_
+            # size as part of building the new scatter), so a size-and-
+            # shape change together doesn't pay for both.
+            update_umap_dot_size()
+            fig.canvas.draw_idle()
 
     def on_settings_button_clicked(event):
         parent_window = tk_widget.winfo_toplevel() if tk_widget is not None else None
@@ -13383,8 +13470,16 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         fig_w_in, fig_h_in = fig.get_size_inches()
         box = ax_.get_position()
         box_w_in, box_h_in = box.width * fig_w_in, box.height * fig_h_in
-        target_long_edge_in = max(box_w_in, box_h_in) * ZOOM_BITMAP_ONLY_MAX_MULTIPLIER
+        panel_long_edge_in = max(box_w_in, box_h_in)
+        target_long_edge_in = panel_long_edge_in * ZOOM_BITMAP_ONLY_MAX_MULTIPLIER
         target_long_edge_px = target_long_edge_in * SECTION_HOME_CACHE_DPI
+        # See render_section_home_view_png's own dot_size_scale docstring:
+        # rendering at target_long_edge_in (bigger than this panel's own
+        # true on-screen size, for zoom-preview headroom) shrinks a fixed-
+        # points-squared cell dot's apparent on-screen size by this same
+        # ratio, squared (s is an area) — this cancels that back out so a
+        # cached cell dot displays at the same size a live one would.
+        dot_size_scale = (target_long_edge_in / panel_long_edge_in) ** 2 if panel_long_edge_in > 0 else 1.0
 
         cache_path = section_home_cache_path(run_folder, sec, level)
         rgba = None
@@ -13422,7 +13517,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
                 rgba = render_section_home_view_png(
                     full_offsets[:, 0], full_offsets[:, 1], full_colors,
                     np.zeros(len(full_colors), dtype=bool),
-                    home['home_xlim'], home['home_ylim'], target_long_edge_in,
+                    home['home_xlim'], home['home_ylim'], target_long_edge_in, dot_size_scale,
                 )
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
                 Image.fromarray(rgba, mode='RGBA').save(cache_path)
@@ -14631,14 +14726,23 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             target_dir.mkdir(parents=True, exist_ok=True)
             export_fig = render_export_figure()
             written = []
+            # Each save is its own synchronous, potentially slow savefig()
+            # call — re-showing the working indicator before each one
+            # (force_repaint()'d, so it actually paints before the next
+            # blocking call starts — see show_working_indicator's own
+            # comment on why that matters) gives a concrete sign of
+            # progress instead of one flat "Saving…" for the whole,
+            # possibly multi-file write.
             for suffix in ('.png', '.svg'):
                 path = target_dir / f'umap_{token}{suffix}'
+                show_working_indicator(f'Saving {suffix.lstrip(".")}…')
                 export_fig.savefig(path, bbox_inches='tight',
                                     dpi=UMAP_SAVE_DPI if suffix == '.png' else None)
                 written.append(path)
             legend_fig = render_export_legend_figure()
             if legend_fig is not None:
                 legend_path = target_dir / f'umap_{token}_legend.png'
+                show_working_indicator('Saving legend…')
                 legend_fig.savefig(legend_path, bbox_inches='tight', dpi=UMAP_SAVE_DPI)
                 written.append(legend_path)
             names = ', '.join(p.name for p in written)
@@ -14751,7 +14855,17 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             target_dir.mkdir(parents=True, exist_ok=True)
             export_fig = render_section_maps_export_figure()
             paths = unique_export_paths(target_dir, f'{sanitized_view_token()}_section_maps', ('.png', '.svg'))
+            # Each save is its own synchronous, potentially slow savefig()
+            # call (a real ~80-panel vector re-render for the SVG in
+            # particular) — re-showing the working indicator between them
+            # (force_repaint()'d, so it actually paints before the next
+            # blocking call starts — see show_working_indicator's own
+            # comment on why that matters) gives a concrete sign of
+            # progress instead of one flat "Saving…" for the whole,
+            # possibly multi-second, two-file write.
+            show_working_indicator('Saving png…')
             export_fig.savefig(paths['.png'], dpi=SECTION_MAPS_SAVE_DPI)
+            show_working_indicator('Saving svg…')
             export_fig.savefig(paths['.svg'])
             names = ', '.join(path.name for path in paths.values())
             status_text.set_text(f"Saved {names} to {target_dir}.")
