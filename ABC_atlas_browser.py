@@ -687,13 +687,26 @@ PANEL_PROGRESS_INTERVAL = 10         # log a progress line every N panels while 
 # preview bitmaps already work — regardless of which machine's screen
 # first produced the cached file.
 SECTION_HOME_CACHE_DPI = 150
-SECTION_HOME_CACHE_LONG_EDGE_IN = 3.0
+# Long edge of the cached bitmap, in inches at SECTION_HOME_CACHE_DPI — a
+# fixed size regardless of the live window's own panel count/size (see the
+# comment above), which means it has to be generous enough to still look
+# sharp for the *largest* a panel ever gets: a run with few sections (each
+# panel then gets a much bigger on-screen box than one of 60+ sections
+# sharing the same grid area) rather than tuned for the common many-
+# sections case. 3.0in (450px) was tuned for the latter and visibly
+# pixelated once blown up to fill a large panel in a small-section-count
+# run — bumped to 8.0in (1200px) to stay sharp across that whole range.
+SECTION_HOME_CACHE_LONG_EDGE_IN = 8.0
 # Bump this whenever render_section_home_view_png's own output would
 # change (colors, dot size/style, point selection, ...) in a way that
 # makes an already-cached PNG show something subtly wrong — there's no
 # way to detect that automatically, so a stale cache would otherwise just
-# keep being served as if still valid.
-SECTION_HOME_CACHE_VERSION = 1
+# keep being served as if still valid. Bumped 1 -> 2 alongside the
+# LONG_EDGE_IN increase above, so existing low-resolution caches on disk
+# are treated as a different (missing) cache key and regenerated at the
+# new size automatically, rather than requiring every run folder's
+# section_home_cache to be deleted by hand.
+SECTION_HOME_CACHE_VERSION = 2
 
 # --- Section-panel scale bar (first panel only; see build_section_scalebar) ---
 SCALEBAR_TARGET_FRACTION = 0.22      # of the panel's current view width
@@ -10637,8 +10650,20 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             # of that one panel's own points), and it's still strictly less
             # work than the full fig.canvas.draw() this replaces, which
             # drew all of them *and* the UMAP.
-            filter_all_section_scatters_to_viewport()
+            # teardown_zoom_previews() *first*, not after: it restores every
+            # artist's pre-burst visibility (see its own state['hidden']),
+            # which for a panel that was showing its cached home-view image
+            # at burst start means re-hiding background_artist and re-
+            # showing cached_home_image — exactly undoing filter_all_
+            # section_scatters_to_viewport()'s own swap to the real,
+            # zoomed-in scatter if that ran first. This ordering bug was
+            # why zooming a section panel in past ZOOM_BITMAP_ONLY_MAX_
+            # MULTIPLIER never actually improved its resolution: the swap
+            # happened, then was immediately clobbered back to the cached
+            # bitmap, every single settle, regardless of how far past the
+            # threshold the zoom went.
             teardown_zoom_previews()
+            filter_all_section_scatters_to_viewport()
             for panel in section_panels.values():
                 fig.draw_artist(panel['ax'])
             fig.canvas.blit(fig.bbox)
