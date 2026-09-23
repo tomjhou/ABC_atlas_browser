@@ -586,6 +586,18 @@ UMAP_POINT_ALPHA = 0.75
 # multi-gene mode).
 MULTI_GENE_LOW_EXPRESSION_COLOR = (0.0, 0.0, 0.0)
 MULTI_GENE_UMAP_FACECOLOR = (0.1, 0.1, 0.1)
+# Genes 4-6 (UMAP only, so far): a second red/green/blue overlay, drawn as
+# small filled circles centered on top of the circle layer above, instead of
+# its own separate plot — see redraw_multi_genes. Opaque (alpha=1) and
+# smaller than the base circle, so the base layer's own color still shows
+# around its edges. Diameter (not area — matplotlib `s` is area, so this
+# gets squared before use) multiplier on the circle layer's own current
+# size.
+MULTI_GENE_PLUS_SIZE_DIAMETER_MULTIPLIER = 0.5
+# Cells with exactly zero expression across all of genes 4-6 simply don't
+# get an overlay dot drawn at all (rather than an opaque black one) — see
+# redraw_multi_genes' own visibility mask.
+MULTI_GENE_PLUS_ZORDER = 1.5  # above the circle layer's default zorder (1), below hover highlights (5.2+)
 # The UMAP axes' own background for every *other* mode (categorical
 # taxonomy levels, single gene) — restored explicitly by clear_colorbar
 # whenever leaving multi-gene mode. Needed because Axes.clear() does *not*
@@ -1563,6 +1575,60 @@ def make_textbox_stop_typing_blit_fast(textbox, blit_func):
             self._observers.process('submit', self.text)
 
     textbox.stop_typing = fast_stop_typing.__get__(textbox, type(textbox))
+
+
+def make_textbox_motion_blit_fast(textbox, blit_func):
+    """Patch `textbox` so its hover-color redraw blits via `blit_func()`
+    instead of a full, synchronous `fig.canvas.draw()`. TextBox._motion is
+    connected to 'motion_notify_event' *globally* on the whole canvas, not
+    scoped to the box's own axes (AxesWidget.ignore() only checks self.
+    active, never whether the event actually landed inside self.ax) — so it
+    runs on *every* mouse move anywhere in the figure, and fires that full
+    draw every time the cursor crosses into or out of the box's own hover
+    region. With dozens of section panels each carrying a real, several-
+    thousand-point scatter (any mode where the query/gene box stays active
+    — Gene, Imputed Gene, Specified IDs — categorical "All <level>s" modes
+    leave it inactive and are unaffected), simply moving the mouse near the
+    box was enough to trigger this repeatedly, each one queued behind the
+    last, reading as the whole UI going unresponsive for as long as the
+    mouse kept moving — with no visible content change to explain it, since
+    the hover-color change itself is barely noticeable next to the redraw
+    it triggers.
+
+    Unlike _rendercursor (called *indirectly*, via self._rendercursor()
+    from within _keypress — see make_textbox_blit_fast, where simply
+    overwriting the instance attribute is enough), _motion is connected
+    *directly* as the event callback itself in TextBox.__init__, so
+    matplotlib's event system already holds a reference to the original
+    bound method; reassigning textbox._motion afterward wouldn't change
+    what that existing connection actually calls. The original connection
+    has to be torn down and replaced with one pointing at the patched
+    version instead.
+
+    Reimplements _motion's logic exactly (matplotlib 3.9's own source) but
+    swaps its final fig.canvas.draw() for blit_func() — same fragility
+    caveat as make_textbox_blit_fast above, and if the disconnect below
+    ever fails (a future matplotlib reordering its own __init__), this
+    simply leaves the original slow _motion in place rather than raising."""
+    def fast_motion(self, event):
+        if self.ignore(event):
+            return
+        c = self.hovercolor if self.ax.contains(event)[0] else self.color
+        if not mcolors.same_color(c, self.ax.get_facecolor()):
+            self.ax.set_facecolor(c)
+            if self.drawon:
+                blit_func()
+
+    try:
+        # Index 2 = 'motion_notify_event', per TextBox.__init__'s own fixed
+        # connect_event() call order: button_press, button_release, motion,
+        # key_press, resize.
+        textbox.canvas.mpl_disconnect(textbox._cids[2])
+        del textbox._cids[2]
+    except Exception:
+        return
+    textbox._motion = fast_motion.__get__(textbox, type(textbox))
+    textbox.connect_event('motion_notify_event', textbox._motion)
 
 
 def enable_textbox_clipboard_shortcuts(textbox):
@@ -4821,9 +4887,13 @@ def find_gene_index(adata, query):
 
 # ==============================================================================
 # Gene entry, shared by the single-section ROI picker and the interactive UMAP
-# viewer. Both have a text box taking 1-3 comma-separated gene names, with
-# autocomplete for the name being typed; everything about *entering* genes
-# lives here so the two behave identically. Rendering stays per-window.
+# viewer. Both have a text box taking comma-separated gene names (1-3 here,
+# via MAX_GENE_NAMES below), with autocomplete for the name being typed;
+# everything about *entering* genes lives here so the two behave identically.
+# Rendering stays per-window — the interactive UMAP viewer's own redraw_gene
+# uses a higher, viewer-local cap (INTERACTIVE_MULTI_GENE_MAX_NAMES, up to 6)
+# instead of MAX_GENE_NAMES, since it's the only renderer that does anything
+# with genes 4-6 (drawn as a '+' overlay — see redraw_multi_genes).
 # ==============================================================================
 
 MAX_GENE_NAMES = 3
@@ -7345,6 +7415,11 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
     # synchronous draw on *any* click that lands outside this box — i.e.
     # nearly every click anywhere in the window.
     make_textbox_stop_typing_blit_fast(gene_textbox, blit_hover_overlays)
+    # See make_textbox_motion_blit_fast's own docstring: TextBox._motion is
+    # connected globally to every mouse move in the figure (not scoped to
+    # this box), and forces the same kind of full, synchronous draw every
+    # time the cursor crosses into or out of the box's own hover region.
+    make_textbox_motion_blit_fast(gene_textbox, blit_hover_overlays)
     enable_textbox_clipboard_shortcuts(gene_textbox)
 
     # Normal text/outline color, restored when leaving the busy state.
@@ -9237,7 +9312,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     # — 'artist' is kept too, as artists[0], for the many callers (hover/
     # export/etc.) that only need *a* representative artist (e.g. for its
     # shared size/alpha), not every one of them.
-    main_scatter_state = {'artist': None, 'artists': []}
+    main_scatter_state = {'artist': None, 'artists': [], 'size_multipliers': []}
     # A short, filename-safe token describing whatever the UMAP is currently
     # showing — the gene name(s) in Gene mode, the taxonomy ID(s) in
     # 'Single <level>' mode. Each redraw_* sets it; 'Save UMAP' turns it into
@@ -9260,9 +9335,19 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     # make the highlight 1.5x wider, the area needs to grow by 1.5**2.
     UMAP_HIGHLIGHT_BASE_SIZE = UMAP_POINT_SIZE * 4 * 2.25
 
-    def set_main_scatter_artists(artists):
+    def set_main_scatter_artists(artists, size_multipliers=None):
+        """`size_multipliers`, if given, is one AREA multiplier per artist
+        (applied to UMAP_POINT_SIZE before the zoom multiplier itself — see
+        update_umap_dot_size) — for the rare case (currently just the
+        multi-gene '+' overlay layer, drawn deliberately larger so its arms
+        extend past the circle layer beneath it) where every artist on this
+        axes shouldn't be the same size. Defaults to 1.0 for every artist,
+        matching every other mode's single uniformly-sized scatter."""
         main_scatter_state['artists'] = artists
         main_scatter_state['artist'] = artists[0] if artists else None
+        main_scatter_state['size_multipliers'] = (
+            list(size_multipliers) if size_multipliers is not None else [1.0] * len(artists)
+        )
         # A snapshot of each artist's own data, taken immediately after
         # redraw_* just built it from the *complete* point set (this is
         # always called right after a fresh ax.scatter(), never after any
@@ -9490,8 +9575,8 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # artists stay proportionate to the underlying points as you zoom,
         # not left behind at their fully-zoomed-out size.
         multiplier = umap_zoom_diameter_multiplier()
-        for artist in main_scatter_state['artists']:
-            artist.set_sizes([UMAP_POINT_SIZE * multiplier ** 2])
+        for artist, size_mult in zip(main_scatter_state['artists'], main_scatter_state['size_multipliers']):
+            artist.set_sizes([UMAP_POINT_SIZE * size_mult * multiplier ** 2])
         if umap_highlight_state['artist'] is not None:
             umap_highlight_state['artist'].set_sizes([UMAP_HIGHLIGHT_BASE_SIZE * multiplier ** 2])
         if group_highlight_state['artist'] is not None:
@@ -10465,7 +10550,11 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     def end_zoom_previews():
         if not active_zoom_previews:
             return
+        _settle_t0 = time.perf_counter()
         umap_settle = zoom_settle_source['ax'] is ax
+        if ZOOM_DEBUG_DIAGNOSTICS:
+            print(f"[zoom-settle] source={zoom_settle_source['ax']!r} "
+                  f"umap_ratio={umap_zoom_ratio():.2f}x panel_ratio={section_zoom_ratio['value']:.2f}x")
         if umap_settle and umap_zoom_ratio() <= ZOOM_BITMAP_ONLY_MAX_MULTIPLIER:
             # Below the threshold, stay on the zoom-preview bitmap already
             # on screen indefinitely rather than paying for a real, full-
@@ -10489,6 +10578,8 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             # never leaves it set.
             blit_bg['data'] = fig.canvas.copy_from_bbox(fig.bbox)
             teardown_zoom_previews()
+            if ZOOM_DEBUG_DIAGNOSTICS:
+                print(f"[zoom-settle] umap<=threshold (bitmap-only) in {time.perf_counter() - _settle_t0:.3f}s")
             return
         if umap_settle and umap_zoom_ratio() > ZOOM_BITMAP_ONLY_MAX_MULTIPLIER:
             # Re-filters from main_scatter_state['full']'s own untouched
@@ -10523,6 +10614,8 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             fig.canvas.blit(fig.bbox)
             force_repaint()
             blit_bg['data'] = fig.canvas.copy_from_bbox(fig.bbox)
+            if ZOOM_DEBUG_DIAGNOSTICS:
+                print(f"[zoom-settle] umap>threshold (filtered real draw) in {time.perf_counter() - _settle_t0:.3f}s")
             return
         panel_settle = zoom_settle_source['ax'] == 'panel'
         if panel_settle and section_zoom_ratio['value'] <= ZOOM_BITMAP_ONLY_MAX_MULTIPLIER:
@@ -10532,6 +10625,8 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             # don't go dead for the whole time zoom stays under threshold).
             blit_bg['data'] = fig.canvas.copy_from_bbox(fig.bbox)
             teardown_zoom_previews()
+            if ZOOM_DEBUG_DIAGNOSTICS:
+                print(f"[zoom-settle] panel<=threshold (bitmap-only) in {time.perf_counter() - _settle_t0:.3f}s")
             return
         if panel_settle and section_zoom_ratio['value'] > ZOOM_BITMAP_ONLY_MAX_MULTIPLIER:
             # Mirror image of the UMAP >threshold branch above: filter
@@ -10549,6 +10644,8 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             fig.canvas.blit(fig.bbox)
             force_repaint()
             blit_bg['data'] = fig.canvas.copy_from_bbox(fig.bbox)
+            if ZOOM_DEBUG_DIAGNOSTICS:
+                print(f"[zoom-settle] panel>threshold (filtered real draw) in {time.perf_counter() - _settle_t0:.3f}s")
             return
         # Re-cache the full-figure background from what's *currently* in the
         # Agg buffer before anything below restores it. Only a burst's first
@@ -10564,6 +10661,9 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # appearing to briefly revert itself. Same stale-blit_bg hazard
         # suspend_hover_during_zoom's own blit=False guards against; one
         # copy per settle is negligible next to the full draw that follows.
+        if ZOOM_DEBUG_DIAGNOSTICS:
+            print(f"[zoom-settle] FALLBACK (neither umap_settle nor panel_settle matched) — "
+                  f"about to do a full fig.canvas.draw()")
         blit_bg['data'] = fig.canvas.copy_from_bbox(fig.bbox)
         # Shown *before* any of the (comparatively cheap) cleanup below,
         # so it's on screen as early as possible ahead of the genuinely
@@ -10601,6 +10701,8 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             fig.canvas.draw()
         finally:
             force_repaint()  # see its own docstring — draw()'s own internal blit needs this too
+            if ZOOM_DEBUG_DIAGNOSTICS:
+                print(f"[zoom-settle] FALLBACK full draw complete in {time.perf_counter() - _settle_t0:.3f}s")
 
     def schedule_zoom_preview_settle(interval_ms):
         if zoom_settle_timer['timer'] is not None:
@@ -11168,9 +11270,18 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # showing at the time (a hover ring, the family '+' markers, or the
         # section panels' dim_veil) got baked into the bitmap and would
         # reappear, frozen, in every later preview that used it.
+        if ZOOM_DEBUG_DIAGNOSTICS:
+            _cbb_t0 = time.perf_counter()
+            _cbb_misses = sum(1 for a in [ax] + [p['ax'] for p in section_panels.values()]
+                               if a not in home_view_cache)
         capture_home_view_if_at_home(ax)
         for panel in section_panels.values():
             capture_home_view_if_at_home(panel['ax'])
+        if ZOOM_DEBUG_DIAGNOSTICS:
+            _cbb_elapsed = time.perf_counter() - _cbb_t0
+            if _cbb_elapsed > 0.05:
+                print(f"[cache-blit] capture_home_view_if_at_home over {1 + len(section_panels)} axes "
+                      f"({_cbb_misses} not yet cached) took {_cbb_elapsed:.3f}s")
         # Stamp the overlays back on immediately — being animated means a
         # normal full draw skips them, so without this they'd flash away
         # (only reappearing on the next hover tick) right after every zoom,
@@ -12136,6 +12247,25 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     # widget internals, invisible to and unpreventable by any of the
     # draw_idle()/blit routing done elsewhere in this window.
     make_textbox_stop_typing_blit_fast(query_textbox, blit_sidebar_overlays)
+    # This is the one that actually explains the "freezes as soon as I
+    # switch to Gene/Imputed Gene/Specified IDs, and it's not about
+    # zooming" report: TextBox._motion is connected globally to every
+    # mouse move in the whole figure (not scoped to this box's own axes —
+    # see make_textbox_motion_blit_fast's own docstring), and forces the
+    # same kind of full, synchronous fig.canvas.draw() every time the
+    # cursor crosses into or out of the box's own hover region — which,
+    # with dozens of real section-panel scatters, is exactly the kind of
+    # per-crossing full render that reads as "the UI goes unresponsive for
+    # 5-10 seconds and there's no 'Working' message and nothing visibly
+    # changed". query_ax.set_visible(False) in every categorical "All
+    # <level>s" mode (below) doesn't disable this widget-internal path —
+    # _motion's own self.ax.contains(event) check doesn't care whether the
+    # axes is visible — it's just that the mouse rarely crosses a hidden
+    # box's own (now visually irrelevant) region during normal use of a
+    # mode that doesn't need it, whereas the box sits front-and-center in
+    # the sidebar, right where the mouse naturally travels, in every mode
+    # that does.
+    make_textbox_motion_blit_fast(query_textbox, blit_sidebar_overlays)
     enable_textbox_clipboard_shortcuts(query_textbox)
 
     def on_gene_dropdown_click(event):
@@ -12394,6 +12524,17 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         set_sidebar_controls_busy(True)
         working_text.set_text(message)
         blit_sidebar_overlays()  # picks up both the message and the now-dimmed buttons
+        # blit_sidebar_overlays' own fig.canvas.blit() only stages pixel
+        # data — actually compositing it to the visible window needs Tk's
+        # idle queue serviced (see force_repaint's own docstring). Without
+        # this, every caller of show_working_indicator() that follows it
+        # with a blocking synchronous call (a real fig.canvas.draw(), a
+        # slow gene/dataset load, ...) never actually got the message onto
+        # screen before freezing the UI — nothing serviced Tk's event loop
+        # in between the blit and the freeze, so the "Working…" text (and
+        # the dimmed/disabled controls) simply never appeared, reading as
+        # the whole window silently hanging with no explanation.
+        force_repaint()
 
     def hide_working_indicator():
         # Text cleared *before* re-enabling controls, not after: re-
@@ -12565,11 +12706,19 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
 
     # Fixed red/green/blue order — matches multi_gene_rgb's own channel
     # order and redraw_multi_genes' own resolved-gene ordering (first gene
-    # typed = red, second = green, third = blue). The 3rd entry is
+    # typed = red, second = green, third = blue; 4th/5th/6th repeat the same
+    # three colors for the '+' overlay layer). The 3rd/6th entries are
     # MULTI_GENE_BRIGHT_BLUE, not the named color 'blue', so the legend
     # swatch/label matches the actual (brighter) blue multi_gene_rgb uses
     # on screen.
-    MULTI_GENE_CHANNEL_COLORS = ('red', 'green', MULTI_GENE_BRIGHT_BLUE)
+    MULTI_GENE_CHANNEL_COLORS = ('red', 'green', MULTI_GENE_BRIGHT_BLUE, 'red', 'green', MULTI_GENE_BRIGHT_BLUE)
+    # Legend swatch size per gene slot — full-size circle for genes 1-3 (the
+    # base layer), a smaller one (matching MULTI_GENE_PLUS_SIZE_DIAMETER_
+    # MULTIPLIER, squared since this scales an area) for genes 4-6 (the
+    # small overlay dot drawn on top of it in redraw_multi_genes) — so the
+    # legend swatch size reads as which layer each gene actually shows up
+    # in on screen.
+    MULTI_GENE_CHANNEL_SWATCH_SCALE = (1.0, 1.0, 1.0) + (MULTI_GENE_PLUS_SIZE_DIAMETER_MULTIPLIER ** 2,) * 3
 
     def draw_multi_gene_legend(genes, vmins, vmaxes):
         """The multi-gene mode's own legend, into the same cbar_ax slot a
@@ -12599,9 +12748,10 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         n = len(genes)
         row_h = 0.14
         top_y = 0.5 + n * row_h / 2  # centers the n-row block in the strip
-        for i, (gene, color, vmin, vmax) in enumerate(zip(genes, MULTI_GENE_CHANNEL_COLORS, vmins, vmaxes)):
+        for i, (gene, color, swatch_scale, vmin, vmax) in enumerate(
+                zip(genes, MULTI_GENE_CHANNEL_COLORS, MULTI_GENE_CHANNEL_SWATCH_SCALE, vmins, vmaxes)):
             y = top_y - (i + 0.5) * row_h
-            cbar_ax.scatter([SWATCH_X], [y], s=legend_fontsize * 4, marker='o', c=color,
+            cbar_ax.scatter([SWATCH_X], [y], s=legend_fontsize * 4 * swatch_scale, marker='o', c=color,
                              linewidths=0, clip_on=False)
             cbar_ax.text(TEXT_X, y, gene, fontsize=legend_fontsize, va='center', ha='left', color=color)
             cbar_ax.text(TEXT_X, y - row_h * 0.42, f'log2: {vmin:.1f}–{vmax:.1f}',
@@ -13296,21 +13446,33 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # same full draw, which excludes animated artists outright.
         hide_working_indicator()
 
+    # This viewer's own gene-count cap, used below instead of the shared
+    # MAX_GENE_NAMES (3) — this is the one window that knows what to do
+    # with 4-6 genes (the '+' overlay layer in redraw_multi_genes); every
+    # other gene-entry box in the app still only renders up to 3 (see
+    # render_multi_gene_expression_array/multi_gene_rgb's own 3-channel
+    # cap), so bumping the *shared* constant would have let those boxes
+    # silently accept and then drop names 4-6 with no indication.
+    INTERACTIVE_MULTI_GENE_MAX_NAMES = 6
+    TOO_MANY_GENES_MESSAGE_INTERACTIVE = (
+        f"Enter at most {INTERACTIVE_MULTI_GENE_MAX_NAMES} gene names, separated by commas."
+    )
+
     def redraw_gene(query, imputed):
         """Dispatches to redraw_single_gene (one gene name) or redraw_
-        multi_genes (2 or 3, comma-separated — 'Gene1, Gene2[, Gene3]'
-        shows them in red/green/blue on both the UMAP and every section
-        panel) based on how many comma-separated names are in `query`. An
-        empty query falls through to redraw_single_gene('', imputed),
-        which already has the right "enter a gene name" messaging for that
-        case."""
+        multi_genes (2-6, comma-separated — 'Gene1, Gene2[, ...Gene6]'; the
+        first up to 3 show as red/green/blue circles, the next up to 3 as a
+        red/green/blue '+' overlay on top — see redraw_multi_genes) based
+        on how many comma-separated names are in `query`. An empty query
+        falls through to redraw_single_gene('', imputed), which already has
+        the right "enter a gene name" messaging for that case."""
         gene_names = parse_gene_names(query)
-        if 2 <= len(gene_names) <= MAX_GENE_NAMES:
+        if 2 <= len(gene_names) <= INTERACTIVE_MULTI_GENE_MAX_NAMES:
             redraw_multi_genes(gene_names, imputed)
             return
-        if len(gene_names) > MAX_GENE_NAMES:
-            status_text.set_text(TOO_MANY_GENES_MESSAGE)
-            working_text.set_text(f"At most {MAX_GENE_NAMES} genes")
+        if len(gene_names) > INTERACTIVE_MULTI_GENE_MAX_NAMES:
+            status_text.set_text(TOO_MANY_GENES_MESSAGE_INTERACTIVE)
+            working_text.set_text(f"At most {INTERACTIVE_MULTI_GENE_MAX_NAMES} genes")
             pending_param_warning['active'] = True
             blit_hover_overlays()
             return
@@ -13523,21 +13685,25 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         return np.zeros_like(values), vmin, vmax
 
     def redraw_multi_genes(gene_queries, imputed):
-        """Multi-gene overlay (2 or 3 genes): `gene_queries[0]` drives the
-        red channel, `gene_queries[1]` green, and (if given) `gene_queries
-        [2]` blue — blended via multi_gene_rgb from MULTI_GENE_LOW_
-        EXPRESSION_COLOR (black, shared by the UMAP and the section panels)
-        toward each channel's own full saturation as that gene's own
-        normalized expression rises. The UMAP's own axes background is set
-        to MULTI_GENE_UMAP_FACECOLOR (dark grey, not black) so a genuinely
-        zero-expression dot still reads as a dot — see that constant's own
-        comment. Mirrors redraw_single_gene's own structure (same early-
-        return messaging conventions, same show_working_indicator timing,
-        same background-extension handling via resolve_gene_expression),
-        but can't reuse its scatter(cmap=...)/set_section_colors_by_value
-        calls — those are built around one scalar value plus a matplotlib
+        """Multi-gene overlay (2-6 genes): `gene_queries[0]` drives the red
+        channel, `gene_queries[1]` green, `gene_queries[2]` blue, all drawn
+        as circles (the base layer) — blended via multi_gene_rgb from
+        MULTI_GENE_LOW_EXPRESSION_COLOR (black, shared by the UMAP and the
+        section panels) toward each channel's own full saturation as that
+        gene's own normalized expression rises. `gene_queries[3:6]`, if
+        given, repeat the same red/green/blue blend as a second '+'-marker
+        layer drawn on top (UMAP only, for now — see the '+' overlay layer's
+        own comment below for why zero-expression cells there simply aren't
+        plotted). The UMAP's own axes background is set to MULTI_GENE_UMAP_
+        FACECOLOR (dark grey, not black) so a genuinely zero-expression
+        circle still reads as a dot — see that constant's own comment.
+        Mirrors redraw_single_gene's own structure (same early-return
+        messaging conventions, same show_working_indicator timing, same
+        background-extension handling via resolve_gene_expression), but
+        can't reuse its scatter(cmap=...)/set_section_colors_by_value calls
+        — those are built around one scalar value plus a matplotlib
         Colormap/Normalize pair, and this has no such single scale (colors
-        are computed directly by multi_gene_rgb from 2 or 3 values apiece)."""
+        are computed directly by multi_gene_rgb from up to 3 values apiece)."""
         if imputed:
             if not ensure_imputed_gene_dataset_loaded(imputed_state, abc_cache):
                 status_text.set_text("Imputed dataset not available.")
@@ -13612,19 +13778,53 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         ax.set_yticks([])
         ax.set_xlabel('UMAP1', fontsize=SIDEBAR_FONTSIZE)
         ax.set_ylabel('UMAP2', fontsize=SIDEBAR_FONTSIZE)
-        # Highest-*combined*-expression drawn last/on top — same "most
-        # interesting cells visible over everything else" convention as
-        # redraw_single_gene's own np.argsort(color_values), generalized to
-        # 2 or 3 channels via whichever gene's own signal is strongest.
-        intensity = np.maximum.reduce([np.nan_to_num(n, nan=0.0) for n in norms])
-        order = np.argsort(intensity)
-        umap_rgb = multi_gene_rgb([n[order] for n in norms], MULTI_GENE_LOW_EXPRESSION_COLOR)
-        scatter = ax.scatter(coords[order, 0], coords[order, 1], c=umap_rgb,
-                              s=UMAP_POINT_SIZE, alpha=UMAP_POINT_ALPHA, linewidths=0)
-        set_main_scatter_artists([scatter])
+        # Circle layer: the first up-to-3 genes (red/green/blue), same as
+        # before genes 4-6 existed. Highest-*combined*-expression drawn
+        # last/on top — same "most interesting cells visible over
+        # everything else" convention as redraw_single_gene's own
+        # np.argsort(color_values), generalized to however many of the
+        # up-to-3 circle genes are actually present.
+        circle_norms = norms[:3]
+        circle_intensity = np.maximum.reduce([np.nan_to_num(n, nan=0.0) for n in circle_norms])
+        circle_order = np.argsort(circle_intensity)
+        umap_rgb = multi_gene_rgb([n[circle_order] for n in circle_norms], MULTI_GENE_LOW_EXPRESSION_COLOR)
+        scatter = ax.scatter(coords[circle_order, 0], coords[circle_order, 1], c=umap_rgb,
+                              s=UMAP_POINT_SIZE, alpha=UMAP_POINT_ALPHA, linewidths=0, zorder=1)
+        main_artists = [scatter]
+        main_size_multipliers = [1.0]
+
+        # '+' overlay layer: genes 4-6 (red/green/blue again), UMAP only for
+        # now — section panels below still only ever see the circle-layer
+        # genes (see the sliced norms[:3]/vmins[:3]/... a few lines down).
+        # Drawn as a second, separate scatter on top of the circle layer
+        # (not blended into umap_rgb above) — a small, opaque (alpha=1),
+        # filled circle centered on each cell, half the base circle's own
+        # diameter, so the base layer's own color still shows around its
+        # edges. A cell with exactly zero expression across all three of
+        # these genes is simply left out of this scatter entirely, rather
+        # than getting an opaque black dot stamped over an otherwise-
+        # untouched circle — see MULTI_GENE_PLUS_ZORDER's own comment for
+        # the zero-expression-baseline reasoning.
+        plus_norms = norms[3:6]
+        if plus_norms:
+            plus_intensity = np.maximum.reduce([np.nan_to_num(n, nan=0.0) for n in plus_norms])
+            visible = plus_intensity > 0
+            plus_order = np.argsort(plus_intensity[visible])
+            visible_idx = np.flatnonzero(visible)[plus_order]
+            plus_rgb = multi_gene_rgb([n[visible_idx] for n in plus_norms], MULTI_GENE_LOW_EXPRESSION_COLOR)
+            plus_scatter = ax.scatter(
+                coords[visible_idx, 0], coords[visible_idx, 1], c=plus_rgb,
+                marker='o', s=UMAP_POINT_SIZE, alpha=1.0,
+                linewidths=0, zorder=MULTI_GENE_PLUS_ZORDER,
+            )
+            main_artists.append(plus_scatter)
+            main_size_multipliers.append(MULTI_GENE_PLUS_SIZE_DIAMETER_MULTIPLIER ** 2)
+
+        set_main_scatter_artists(main_artists, size_multipliers=main_size_multipliers)
         set_section_colors_multi_gene(
-            norms, MULTI_GENE_LOW_EXPRESSION_COLOR, vmins, vmaxes,
-            full_sources=bg_sources, full_gene_cols=bg_cols, full_layers=bg_layers, full_transforms=bg_transforms,
+            norms[:3], MULTI_GENE_LOW_EXPRESSION_COLOR, vmins[:3], vmaxes[:3],
+            full_sources=bg_sources[:3], full_gene_cols=bg_cols[:3],
+            full_layers=bg_layers[:3], full_transforms=bg_transforms[:3],
         )
         update_umap_dot_size()
         # vmins/vmaxes are each in whatever base resolve_gene_expression
