@@ -661,6 +661,28 @@ SECTION_PANEL_FACECOLOR = 'black'
 VIEWER_SPAN_PERCENTILE = 90          # percentile of section extents setting the shared panel scale
 PANEL_PROGRESS_INTERVAL = 10         # log a progress line every N panels while building the grid
 
+# --- Section-panel home-view disk cache (interactive viewer only) ---
+# One rendered PNG per (run, section, level) — the "All <level>s" mode's
+# categorical background coloring at each panel's fully-zoomed-out (home)
+# extent, persisted into the run's own folder (see show_interactive_umap_
+# window's own run_folder) so re-showing it — even in a brand new session,
+# on a different machine sharing that folder — is instant instead of a
+# real ~80-panel vector re-render (which is what was taking ~30s). Screen-
+# size independent by construction: rendered off-screen at this fixed
+# size/DPI (render_section_home_view_png), never tied to whatever window
+# happened to generate it, then displayed via imshow — which resamples to
+# fit whatever panel size actually needs it, the same way the live zoom-
+# preview bitmaps already work — regardless of which machine's screen
+# first produced the cached file.
+SECTION_HOME_CACHE_DPI = 150
+SECTION_HOME_CACHE_LONG_EDGE_IN = 3.0
+# Bump this whenever render_section_home_view_png's own output would
+# change (colors, dot size/style, point selection, ...) in a way that
+# makes an already-cached PNG show something subtly wrong — there's no
+# way to detect that automatically, so a stale cache would otherwise just
+# keep being served as if still valid.
+SECTION_HOME_CACHE_VERSION = 1
+
 # --- Section-panel scale bar (first panel only; see build_section_scalebar) ---
 SCALEBAR_TARGET_FRACTION = 0.22      # of the panel's current view width
 SCALEBAR_MARGIN_FRACTION = 0.06      # inset from the panel's own edges, as a fraction of its view
@@ -680,6 +702,28 @@ SECTION_MAPS_SAVE_DPI = 200           # matches save_roi_map/save_group_spatial_
 # redraws while scrolling, at the cost of the sharp view arriving later.
 ZOOM_PREVIEW_SETTLE_MS_UMAP = 800
 ZOOM_PREVIEW_SETTLE_MS_PANEL = 800
+# Below this zoom ratio (home_span / current_span — 1.0 at fully zoomed
+# out, 3.0 means the current view spans a third of the home extent), the
+# UMAP's own zoom/pan settle (end_zoom_previews) skips its real, full-
+# resolution fig.canvas.draw() entirely and just stays on the cheap
+# zoom-preview bitmap already on screen — a magnified crop, capped at
+# whatever resolution it was captured at, rather than a fresh re-render.
+# At or above it, the settle still does a real draw, but first filters the
+# UMAP scatter down to only the points inside the current view (see
+# filter_main_scatter_to_viewport) — every real draw used to reprocess the
+# *entire* ~200k-cell point set through matplotlib's transform/clip
+# pipeline regardless of zoom level, which is almost certainly why zooming
+# stayed slow even with very little actually visible on screen. Also
+# governs the section panels' own zoom/pan settle the same way, against
+# section_zoom_ratio (the one shared zoom level all ~80 panels zoom
+# together at) instead — see filter_all_section_scatters_to_viewport.
+ZOOM_BITMAP_ONLY_MAX_MULTIPLIER = 2.0
+# Prints a "[zoom-filter] ..." line every time filter_main_scatter_to_
+# viewport (or its section-panel equivalent) runs, showing the cell count
+# before/after filtering — useful while tuning ZOOM_BITMAP_ONLY_MAX_
+# MULTIPLIER itself, noisy otherwise (it fires on every settle past the
+# threshold), so off by default.
+ZOOM_DEBUG_DIAGNOSTICS = True  # TODO: set back to False once the section-cache speed/orientation issue is confirmed fixed
 VIEWER_HOVER_HOLD_MS = 250       # cursor must settle this long before the hovered cell is looked up
 GROUP_HOVER_HOLD_MS = 500        # ...and this long before its whole family is highlighted
 LAYOUT_REDRAW_MIN_INTERVAL = 0.03  # SECONDS; caps redraws while dragging the resize handles
@@ -923,6 +967,18 @@ def prompt_section_selection(section_series):
 
 
 SPATIAL_CSV_CHUNK_SIZE = 200_000  # see the chunked read in load_section_spatial_coords()
+SPATIAL_CSV_CACHE_VERSION = 1
+
+
+def _spatial_csv_cache_path(cell_metadata_path):
+    """Shared (not run-specific) disk-cache path for the full, un-reindexed
+    cell_metadata table read by load_section_spatial_coords(). Keyed on the
+    source CSV's own mtime+size so a re-downloaded/updated atlas file is
+    detected and the cache is rebuilt automatically."""
+    st = os.stat(cell_metadata_path)
+    key = f"{cell_metadata_path}|{st.st_mtime_ns}|{st.st_size}"
+    digest = hashlib.md5(key.encode('utf-8')).hexdigest()[:16]
+    return CACHE_DIR / f"spatial_coords_v{SPATIAL_CSV_CACHE_VERSION}_{digest}.pkl"
 
 
 def load_section_spatial_coords(adata, abc_cache, progress_callback=None):
@@ -949,6 +1005,22 @@ def load_section_spatial_coords(adata, abc_cache, progress_callback=None):
             return None
         index_col_name = header_cols[0]
         wanted_cols = [c for c in ['x', 'y', 'class', 'subclass', 'supertype', 'cluster'] if c in header_cols]
+
+        cache_path = None
+        try:
+            cache_path = _spatial_csv_cache_path(cell_metadata_path)
+            if cache_path.exists():
+                t0 = time.perf_counter()
+                cell_meta = pd.read_pickle(cache_path)
+                if ZOOM_DEBUG_DIAGNOSTICS:
+                    print(f"[spatial-cache] loaded {len(cell_meta)} rows from disk cache in "
+                          f"{time.perf_counter() - t0:.3f}s ({cache_path.name})")
+                if progress_callback is not None:
+                    progress_callback(len(cell_meta), len(cell_meta))
+                return cell_meta.reindex(adata.obs.index)
+        except Exception as e:
+            if ZOOM_DEBUG_DIAGNOSTICS:
+                print(f"[spatial-cache] cache read failed, falling back to CSV ({e})")
 
         total_rows = None
         if progress_callback is not None:
@@ -984,6 +1056,16 @@ def load_section_spatial_coords(adata, abc_cache, progress_callback=None):
             if progress_callback is not None:
                 progress_callback(rows_read, total_rows)
         cell_meta = pd.concat(chunks, copy=False)
+        if cache_path is not None:
+            try:
+                t0 = time.perf_counter()
+                cell_meta.to_pickle(cache_path)
+                if ZOOM_DEBUG_DIAGNOSTICS:
+                    print(f"[spatial-cache] saved {len(cell_meta)} rows to disk cache in "
+                          f"{time.perf_counter() - t0:.3f}s ({cache_path.name})")
+            except Exception as e:
+                if ZOOM_DEBUG_DIAGNOSTICS:
+                    print(f"[spatial-cache] cache save failed ({e})")
         return cell_meta.reindex(adata.obs.index)
     except Exception as e:
         print(f"Warning: could not load spatial coordinates for GUI section picker ({e}).")
@@ -1220,9 +1302,19 @@ def ensure_imputed_gene_dataset_loaded(imputed_state, abc_cache):
 
 def extract_leading_numeric_id(series):
     """Pull the leading integer ID off ABC atlas category strings like
-    '30 Astro-Epen' -> 30. Returns a float Series (NaN where no match)."""
-    ids = series.astype(str).str.strip().str.extract(r'^(\d+)')[0]
-    return pd.to_numeric(ids, errors='coerce')
+    '30 Astro-Epen' -> 30. Returns a float Series (NaN where no match).
+
+    Regex-extracts only the *unique* strings in `series`, then maps that
+    back onto every row via a dict lookup — class/subclass/supertype/
+    cluster/leiden labels each have only a few hundred to a few thousand
+    distinct values even when `series` itself is millions of rows (one row
+    per cell), so this does orders of magnitude less regex work than
+    running str.extract over every row directly."""
+    s = series.astype(str).str.strip()
+    uniques = s.unique()
+    extracted = pd.Series(uniques).str.extract(r'^(\d+)')[0]
+    id_by_value = dict(zip(uniques, pd.to_numeric(extracted, errors='coerce')))
+    return s.map(id_by_value)
 
 
 DEFAULT_GREY_RGBA = (0.8, 0.8, 0.8, 1.0)
@@ -1471,6 +1563,101 @@ def make_textbox_stop_typing_blit_fast(textbox, blit_func):
             self._observers.process('submit', self.text)
 
     textbox.stop_typing = fast_stop_typing.__get__(textbox, type(textbox))
+
+
+def enable_textbox_clipboard_shortcuts(textbox):
+    """Ctrl+A/C/X/V for `textbox` (a matplotlib.widgets.TextBox) -- entirely
+    missing from matplotlib's own _keypress, which only recognizes single
+    characters and a handful of named keys (left/right/home/end/backspace/
+    delete); a modifier combo like 'ctrl+c' matches none of its branches and
+    is silently dropped. There's no selection concept in TextBox at all (no
+    click-drag or shift-arrow range, nothing to highlight), so this doesn't
+    add one -- it treats Ctrl+A as "select the whole field": Ctrl+C/X
+    always act on the *whole* current text (there's nothing else to act
+    on), and Ctrl+A only changes what Ctrl+V
+    (or typing a plain character, handled by TextBox's own _keypress) does
+    next -- replace everything instead of inserting at the cursor -- exactly
+    like a normal OS text field after selecting all then typing over it.
+    That pending replace is cleared by any other key, including a plain
+    character (observed here, not suppressed -- _keypress's own separate
+    handling of it is untouched).
+
+    A real per-character range selection (click-drag, shift-arrows) would
+    need matplotlib to track and render a selection at all, which it simply
+    doesn't; getting that would mean either implementing it from scratch or
+    replacing TextBox with a native Tk Entry/Text widget, which is a
+    separate, larger change.
+
+    Connects to the widget's own figure's 'key_press_event' -- the same
+    event TextBox._keypress is already separately connected to; since
+    Ctrl+A/C/X/V match none of that method's own branches, the two don't
+    need to coordinate. Only acts while `textbox` is the one actually being
+    typed into (capturekeystrokes), so this is safe to enable on more than
+    one textbox in the same figure."""
+    # .figure rather than get_figure(root=True), which needs matplotlib
+    # 3.10+ -- same compatibility reasoning as make_textbox_blit_fast above.
+    fig = textbox.ax.figure
+    pending_replace = {'active': False}
+
+    def get_tk_widget():
+        # The actual Tk widget (not fig.canvas.manager.window, a wrapper)
+        # -- its clipboard_get/clipboard_clear/clipboard_append, inherited
+        # from tkinter.Misc, reach the one process-wide Tk clipboard
+        # regardless of which widget in this interpreter calls them.
+        return fig.canvas.get_tk_widget()
+
+    def replace_text(new_text, cursor_at):
+        # Mirrors TextBox._keypress's own update sequence for a plain
+        # character, so this is indistinguishable from normal typing to
+        # every existing on_text_change observer (autocomplete, clearing a
+        # bad-name mark, ...) -- only 'change' fires, not 'submit', same as
+        # any other keystroke that isn't literally Enter.
+        textbox.text_disp.set_text(new_text)
+        textbox.cursor_index = cursor_at
+        textbox._rendercursor()
+        if textbox.eventson:
+            textbox._observers.process('change', textbox.text)
+
+    def on_key(event):
+        if not textbox.capturekeystrokes:
+            return
+        key = event.key
+        if key == 'ctrl+a':
+            pending_replace['active'] = True
+            return
+        replace_on_next, pending_replace['active'] = pending_replace['active'], False
+        if key == 'ctrl+c':
+            try:
+                widget = get_tk_widget()
+                widget.clipboard_clear()
+                widget.clipboard_append(textbox.text)
+            except Exception:
+                pass  # clipboard unavailable (e.g. headless) -- nothing to copy to
+        elif key == 'ctrl+x':
+            try:
+                widget = get_tk_widget()
+                widget.clipboard_clear()
+                widget.clipboard_append(textbox.text)
+            except Exception:
+                pass
+            replace_text('', 0)
+        elif key == 'ctrl+v':
+            try:
+                pasted = get_tk_widget().clipboard_get()
+            except Exception:
+                return  # nothing text-like on the clipboard (empty, an image, ...)
+            # Collapses a multi-line clipboard source (e.g. a spreadsheet
+            # cell) into this single-line box instead of pasting literal
+            # line breaks into it.
+            pasted = ' '.join(pasted.splitlines())
+            if replace_on_next:
+                replace_text(pasted, len(pasted))
+            else:
+                text = textbox.text
+                idx = textbox.cursor_index
+                replace_text(text[:idx] + pasted + text[idx:], idx + len(pasted))
+
+    fig.canvas.mpl_connect('key_press_event', on_key)
 
 
 # Rough allowance for OS window chrome (title bar + borders) that sits
@@ -2319,19 +2506,35 @@ def apply_scalebar_geometry(line, text, geometry):
     text.set_text(geometry['label'])
 
 
-def build_section_scalebar(ax, color='white', fontsize=8, geometry=None):
+def build_section_scalebar(ax, color='white', fontsize=8, geometry=None, zorder=6, animated=False):
     """Add a scale bar (a Line2D + Text, both real vector artists in `ax`'s
     own data coordinates — not a fixed-pixel overlay) to `ax`, sized and
     positioned from `geometry` (see compute_scalebar_geometry), or freshly
     computed from `ax`'s current view if omitted. Returns (line, text): a
     caller that will keep tracking a live, changing view hangs onto them
     and re-applies new geometry via apply_scalebar_geometry; a one-off
-    static export can just discard the return value."""
+    static export can just discard the return value.
+
+    animated=True (the interactive viewer's own live scale bar; left False
+    — the default — for a one-off static export, which has no zoom-preview
+    bitmaps or cached images to sit on top of) marks both artists animated
+    and gives them a very high zorder, so draw_animated_overlays can
+    re-stamp them on top of *any* current panel content — a live scatter,
+    a zoom-preview bitmap, or a cached home-view PNG — instead of the bar
+    only ever being correct when the panel happens to be showing its real,
+    freshly-drawn scatter. Without this, whatever the bar looked like at
+    the moment a bitmap snapshot was taken got baked into that bitmap's
+    own pixels, stretching/shifting as the bitmap was zoomed, and
+    sometimes doubling up with the live bar (see snapshot_axes_region's
+    own note on why it hides this pair before capturing)."""
     if geometry is None:
         geometry = compute_scalebar_geometry(ax)
-    line = Line2D([0, 0], [0, 0], color=color, linewidth=2.5, solid_capstyle='butt', zorder=6)
+    line = Line2D([0, 0], [0, 0], color=color, linewidth=2.5, solid_capstyle='butt', zorder=zorder)
     ax.add_line(line)
-    text = ax.text(0, 0, '', color=color, ha='center', va='bottom', fontsize=fontsize, zorder=6)
+    text = ax.text(0, 0, '', color=color, ha='center', va='bottom', fontsize=fontsize, zorder=zorder)
+    if animated:
+        line.set_animated(True)
+        text.set_animated(True)
     apply_scalebar_geometry(line, text, geometry)
     return line, text
 
@@ -2505,6 +2708,74 @@ def generate_and_cache_section_image(adata, abc_cache, section_series, section_l
         }, f)
     print(f"Cached section image to {cache_png} for faster reloads.")
     report(1.0)
+
+
+def section_home_cache_path(run_folder, section_label, level):
+    """Cached PNG of one section panel's home-extent categorical coloring
+    for the interactive viewer's own 'All <level>s' mode — see SECTION_
+    HOME_CACHE_VERSION's own comment. Lives inside `run_folder` itself
+    (not the shared CACHE_DIR the picker-stage/gene-expression caches
+    above use) since, unlike those, the color *assignment* here depends
+    on which cells are actually in this run (compute_ranked_category_
+    colors ranks categories by count within the run's own selection) —
+    a different ROI/cell-type selection could color the same section+
+    level differently, so this can't be shared across runs the way a
+    property of the raw dataset (like raw expression) can."""
+    section_token = sanitize_section_token(section_label)
+    return (Path(run_folder) / 'section_home_cache' /
+            f'{DATASET_NAME}_v{SECTION_HOME_CACHE_VERSION}_{section_token}_{level}.png')
+
+
+def render_section_home_view_png(xs, ys, colors, is_gray, home_xlim, home_ylim):
+    """Off-screen render of one section panel's *complete* (unfiltered)
+    background point set at its home extent, colored per `colors` (gray
+    cells drawn first/underneath, same convention as apply_panel_colors_
+    with_gray_behind — `is_gray` decides that draw order the same way).
+
+    Deliberately does *not* invert the y-axis the way the live section
+    panels do (see sec_ax.invert_yaxis()'s own comment on the atlas's y-
+    increases-downward convention) — this produces a plain, naturally-
+    oriented image (like the raw xs/ys, not pre-flipped), the same way a
+    real scatter's own raw data isn't pre-flipped either; the *live*
+    axes' own inversion is what correctly orients it once displayed via
+    imshow (see show_section_home_cache_or_scatter). Inverting here too
+    would flip it twice — this image would come out correctly oriented as
+    its own standalone picture, but upside down once shown on the already-
+    inverted live axes, which is exactly what happened before this
+    comment existed.
+
+    Uses a fresh, throwaway Figure+FigureCanvasAgg at a fixed size/DPI
+    (SECTION_HOME_CACHE_DPI/_LONG_EDGE_IN) — entirely independent of the
+    live interactive window, so the result looks identical regardless of
+    which machine's screen happened to generate it (see section_home_
+    cache_path's own docstring). Returns an RGBA uint8 array, ready for
+    Image.fromarray(...).save(...) or direct imshow use."""
+    x0, x1 = home_xlim
+    y0, y1 = home_ylim
+    width_data, height_data = abs(x1 - x0), abs(y1 - y0)
+    if width_data <= 0 or height_data <= 0:
+        figsize = (SECTION_HOME_CACHE_LONG_EDGE_IN, SECTION_HOME_CACHE_LONG_EDGE_IN)
+    elif width_data >= height_data:
+        figsize = (SECTION_HOME_CACHE_LONG_EDGE_IN, SECTION_HOME_CACHE_LONG_EDGE_IN * height_data / width_data)
+    else:
+        figsize = (SECTION_HOME_CACHE_LONG_EDGE_IN * width_data / height_data, SECTION_HOME_CACHE_LONG_EDGE_IN)
+    fig = Figure(figsize=figsize, dpi=SECTION_HOME_CACHE_DPI)
+    FigureCanvasAgg(fig)
+    fig.patch.set_facecolor(SECTION_PANEL_FACECOLOR)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_facecolor(SECTION_PANEL_FACECOLOR)
+    order = np.argsort(~np.asarray(is_gray), kind='stable')
+    ax.scatter(xs[order], ys[order], c=np.asarray(colors, dtype=object)[order],
+               s=SECTION_BACKGROUND_BASE_SIZE, alpha=SECTION_POINT_ALPHA, linewidths=0)
+    ax.set_aspect('equal', adjustable='box')
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y0, y1)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    fig.canvas.draw()
+    return np.asarray(fig.canvas.buffer_rgba()).copy()
 
 
 # Taxonomy levels a single-section window's Groups view can be colored by.
@@ -7074,6 +7345,7 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
     # synchronous draw on *any* click that lands outside this box — i.e.
     # nearly every click anywhere in the window.
     make_textbox_stop_typing_blit_fast(gene_textbox, blit_hover_overlays)
+    enable_textbox_clipboard_shortcuts(gene_textbox)
 
     # Normal text/outline color, restored when leaving the busy state.
     ENABLED_CONTROL_COLOR = 'black'
@@ -8718,6 +8990,19 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         level: (extract_leading_numeric_id(adata.obs[level]) if level in adata.obs.columns else None)
         for level in LEVEL_OPTIONS
     }
+    # Same leading-numeric-ID extraction, but for background_level_arrays
+    # (every cell of every section, not just this run's own adata) —
+    # precomputed once per level here, over the whole (multi-million-row)
+    # background array, rather than once per *panel* per level inside the
+    # section-panel build loop below (arr[sec_mask][valid] is just numpy
+    # indexing into this). Doing the regex-based extraction 295 times (59
+    # panels x 5 levels) on ~66k-row slices instead of ~5 times on the
+    # full array was previously the single largest cost in opening this
+    # window (~11.5s of the section-panel build loop's ~12.8s).
+    background_level_ids_arrays = {
+        level: (extract_leading_numeric_id(pd.Series(arr)).to_numpy() if arr is not None else None)
+        for level, arr in background_level_arrays.items()
+    }
 
     # UMAP_POINT_SIZE / UMAP_LABEL_FONTSIZE and the rest of this window's
     # tunables now live in the TUNABLE CONSTANTS block at the top of the file.
@@ -8978,6 +9263,106 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     def set_main_scatter_artists(artists):
         main_scatter_state['artists'] = artists
         main_scatter_state['artist'] = artists[0] if artists else None
+        # A snapshot of each artist's own data, taken immediately after
+        # redraw_* just built it from the *complete* point set (this is
+        # always called right after a fresh ax.scatter(), never after any
+        # filtering) — not a live reference, since filter_main_scatter_to_
+        # viewport mutates the artist's own offsets/colors in place below,
+        # and repeatedly re-filtering *that* instead of this untouched
+        # snapshot would compound/lose points across zoom ticks. Read back
+        # generically from whatever the artist actually ended up holding,
+        # rather than needing its own copy of each mode's own color logic
+        # (single gene, multi-gene RGB blend, categorical with or without
+        # shapes all end up here the same way).
+        main_scatter_state['full'] = [
+            {
+                'offsets': np.asarray(a.get_offsets()),
+                'array': a.get_array(),  # None unless this is a continuous (Gene-mode) scatter
+                'facecolors': np.array(a.get_facecolors(), copy=True),
+                'edgecolors': np.array(a.get_edgecolors(), copy=True),
+            }
+            for a in artists
+        ]
+
+    def filter_main_scatter_to_viewport():
+        """Replaces each current UMAP scatter artist's own data with just
+        the subset of main_scatter_state['full'] (the true, complete point
+        set snapshotted once in set_main_scatter_artists) that falls
+        within ax's *current* view — so a real draw at high zoom only ever
+        asks matplotlib to transform/clip the handful of points actually
+        on screen, not the full ~200k. Always re-filters from that
+        untouched full snapshot, never from whatever the artist currently
+        holds, so zooming in/out past ZOOM_BITMAP_ONLY_MAX_MULTIPLIER
+        repeatedly never compounds or loses points. Called by end_zoom_
+        previews right before its own real fig.canvas.draw(); a uniform
+        (single-color, e.g. the gray "rest" scatter) collection's face/
+        edgecolors are left alone rather than indexed, since matplotlib
+        already broadcasts a single row across however many offsets are
+        set — trying to index it would raise."""
+        x0, x1 = ax.get_xlim()
+        y0, y1 = ax.get_ylim()
+        xlo, xhi = min(x0, x1), max(x0, x1)
+        ylo, yhi = min(y0, y1), max(y0, y1)
+        total_full, total_shown = 0, 0
+        for artist, full in zip(main_scatter_state['artists'], main_scatter_state['full']):
+            offsets = full['offsets']
+            if len(offsets) == 0:
+                continue
+            in_view = ((offsets[:, 0] >= xlo) & (offsets[:, 0] <= xhi)
+                       & (offsets[:, 1] >= ylo) & (offsets[:, 1] <= yhi))
+            artist.set_offsets(offsets[in_view])
+            if full['array'] is not None:
+                artist.set_array(full['array'][in_view])
+            else:
+                if len(full['facecolors']) == len(offsets):
+                    artist.set_facecolors(full['facecolors'][in_view])
+                if len(full['edgecolors']) == len(offsets):
+                    artist.set_edgecolors(full['edgecolors'][in_view])
+            total_full += len(offsets)
+            total_shown += int(in_view.sum())
+        if ZOOM_DEBUG_DIAGNOSTICS:
+            print(f"[zoom-filter] umap view=({xlo:.3f},{xhi:.3f})x({ylo:.3f},{yhi:.3f}) "
+                  f"ratio={umap_zoom_ratio():.2f}x  cells: {total_full} -> {total_shown} "
+                  f"across {len(main_scatter_state['artists'])} artist(s)")
+
+    def filter_all_section_scatters_to_viewport():
+        """Section-panel equivalent of filter_main_scatter_to_viewport:
+        for every panel, replaces its single background_artist's data with
+        just the subset of panel['full_offsets']/['full_colors'] (the
+        complete, unfiltered set snapshotted in apply_panel_colors_with_
+        gray_behind — the one choke point every color assignment already
+        goes through) that falls within *that panel's own* current view.
+        Each panel has its own xlim/ylim (they don't pan in lockstep, only
+        zoom by the same shared ratio — see apply_section_zoom_ratio), so
+        this can't reuse one shared view rectangle the way the UMAP's own
+        single axes can."""
+        total_full, total_shown = 0, 0
+        for panel in section_panels.values():
+            full_offsets = panel['full_offsets']
+            if full_offsets is None or len(full_offsets) == 0:
+                continue
+            # A panel currently showing its cached home-view image (see
+            # show_section_home_cache_or_scatter) has its real background_
+            # artist hidden — switch back to it now, since we're about to
+            # filter/draw the real, zoomed-in content and the cached image
+            # (a fixed snapshot of the *home* extent) has nothing useful to
+            # show once zoomed past it.
+            if panel['cached_home_image'] is not None and panel['cached_home_image'].get_visible():
+                panel['cached_home_image'].set_visible(False)
+                panel['background_artist'].set_visible(True)
+            x0, x1 = panel['ax'].get_xlim()
+            y0, y1 = panel['ax'].get_ylim()
+            xlo, xhi = min(x0, x1), max(x0, x1)
+            ylo, yhi = min(y0, y1), max(y0, y1)
+            in_view = ((full_offsets[:, 0] >= xlo) & (full_offsets[:, 0] <= xhi)
+                       & (full_offsets[:, 1] >= ylo) & (full_offsets[:, 1] <= yhi))
+            panel['background_artist'].set_offsets(full_offsets[in_view])
+            panel['background_artist'].set_facecolor(panel['full_colors'][in_view])
+            total_full += len(full_offsets)
+            total_shown += int(in_view.sum())
+        if ZOOM_DEBUG_DIAGNOSTICS:
+            print(f"[zoom-filter] sections ratio={section_zoom_ratio['value']:.2f}x  "
+                  f"cells: {total_full} -> {total_shown} across {len(section_panels)} panel(s)")
 
     def category_of_point_from_mapping(per_cell_keys, color_by_key):
         """(category_of_point, rank_color): category_of_point gives every
@@ -9041,15 +9426,21 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
                     c=point_colors, s=point_size, alpha=point_alpha, linewidths=0))
         return artists
 
-    def umap_zoom_diameter_multiplier():
+    def umap_zoom_ratio():
+        """home_span / current_span — 1.0 at fully zoomed out, growing as
+        the view narrows. Shared by umap_zoom_diameter_multiplier (below,
+        the dot-growth curve) and end_zoom_previews' own ZOOM_BITMAP_ONLY_
+        MAX_MULTIPLIER check, so both ever compute this the same way."""
         home = pannable_axes[ax]
         x0, x1 = ax.get_xlim()
         y0, y1 = ax.get_ylim()
         cur_span = max(abs(x1 - x0), abs(y1 - y0))
         home_span = max(abs(home['home_xlim'][1] - home['home_xlim'][0]),
                          abs(home['home_ylim'][1] - home['home_ylim'][0]))
-        zoom_ratio = (home_span / cur_span) if cur_span > 0 else 1.0
-        return 1.0 + UMAP_ZOOM_DOT_GROWTH_RATE * max(0.0, zoom_ratio - 1.0)
+        return (home_span / cur_span) if cur_span > 0 else 1.0
+
+    def umap_zoom_diameter_multiplier():
+        return 1.0 + UMAP_ZOOM_DOT_GROWTH_RATE * max(0.0, umap_zoom_ratio() - 1.0)
 
     def umap_group_marker_size(multiplier):
         # matplotlib's `s` is area — squaring the diameter ratio (on top of
@@ -9308,6 +9699,13 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # spatial aspect ratio, typically wider than tall) to pick a grid
         # shape that matches it, not just the region's own aspect ratio.
         centroids, half_widths, half_heights = {}, [], []
+        # sec_mask (bg_section == sec) is a full pass over the whole
+        # (multi-million-row) background array — the single costliest step
+        # per section here and, again, in the panel-build loop below, which
+        # used to redo the identical comparison for the same 59 sections.
+        # Cached per section (mask + the resulting valid/xs/ys) so the panel
+        # loop can reuse it instead of recomputing.
+        sec_filtered = {}
         for sec in sections_present:
             sec_mask = bg_section == sec
             xs_sec = bg_x[sec_mask]
@@ -9316,6 +9714,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             xs_sec, ys_sec = xs_sec[valid], ys_sec[valid]
             if len(xs_sec) == 0:
                 continue
+            sec_filtered[sec] = (sec_mask, valid, xs_sec, ys_sec)
             centroids[sec] = ((xs_sec.min() + xs_sec.max()) / 2, (ys_sec.min() + ys_sec.max()) / 2)
             half_widths.append((xs_sec.max() - xs_sec.min()) / 2)
             half_heights.append((ys_sec.max() - ys_sec.min()) / 2)
@@ -9363,6 +9762,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         panel_h = (AREA_TOP - AREA_BOTTOM - (grid_nrows - 1) * panel_gap) / grid_nrows
 
         log_status(f"Step 9: Building {n_sections} section panel(s)...")
+        _panel_timing = {'axes': 0.0, 'mask': 0.0, 'umap_idx': 0.0, 'levels': 0.0, 'scatter': 0.0, 'other': 0.0}
         # Printed every 10th panel (not every one — n_sections can be large
         # enough that per-panel prints would themselves add clutter/latency)
         # purely so the console shows *some* progress during what's often
@@ -9371,12 +9771,23 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # gets rendered for the first time) — the same "show something is
         # happening" reasoning as the sidebar's own Working... indicator,
         # just for the console during setup, before the window exists yet.
-        # (Interval set by PANEL_PROGRESS_INTERVAL, top of file.)
+        # (Interval set by PANEL_PROGRESS_INTERVAL, top of file.) The window
+        # is already on screen by this point (created earlier, above) but
+        # has never been drawn to — without an explicit draw here, it just
+        # sits blank for the whole build loop and then the entire grid
+        # (still gray placeholders — real per-cell colors land later, in
+        # redraw_all_subclasses) pops in all at once at the first real
+        # fig.canvas.draw(). A synchronous draw+flush every Nth panel instead
+        # shows the grid filling in as it's actually built, same "something
+        # is happening" reasoning as the console progress line right below.
         for i, sec in enumerate(sections_present):
             if sec not in centroids:
                 continue
             if i % PANEL_PROGRESS_INTERVAL == 0:
                 log_status(f"Step 9: Building section panel {i + 1}/{n_sections} ({sanitize_section_token(sec)})...")
+                fig.canvas.draw()
+                fig.canvas.flush_events()
+            _t0 = time.perf_counter()
             row, col = divmod(i, grid_ncols)
             x0 = GRID_LEFT + col * (panel_w + panel_gap)
             y0 = AREA_TOP - (row + 1) * panel_h - row * panel_gap
@@ -9393,10 +9804,14 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             sec_ax.set_aspect('equal', adjustable='box')
             for spine in sec_ax.spines.values():
                 spine.set_linewidth(0.5)
-            sec_mask = bg_section == sec
-            xs_sec, ys_sec, ids_sec = bg_x[sec_mask], bg_y[sec_mask], bg_ids[sec_mask]
-            valid = ~(np.isnan(xs_sec) | np.isnan(ys_sec))
-            xs_sec, ys_sec, ids_sec = xs_sec[valid], ys_sec[valid], ids_sec[valid]
+            _panel_timing['axes'] += time.perf_counter() - _t0
+            _t0 = time.perf_counter()
+            # Reuses the mask/valid/xs/ys already computed once for this
+            # section in the centroid loop above, instead of redoing the
+            # expensive full-array `bg_section == sec` comparison here too.
+            sec_mask, valid, xs_sec, ys_sec = sec_filtered[sec]
+            ids_sec = bg_ids[sec_mask][valid]
+            _panel_timing['mask'] += time.perf_counter() - _t0
             # Per-cell class/subclass/supertype/cluster labels (both the raw
             # category string and its leading numeric ID) and, where the
             # cell is also part of this run's own `adata` (not just the
@@ -9405,7 +9820,10 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             # "Color by" mode (update_section_background_colors) doesn't
             # need to re-filter the whole-brain background arrays on every
             # redraw.
+            _t0 = time.perf_counter()
             umap_idx_sec = np.array([cell_id_to_umap_idx.get(cid, -1) for cid in ids_sec], dtype=int)
+            _panel_timing['umap_idx'] += time.perf_counter() - _t0
+            _t0 = time.perf_counter()
             level_values_sec = {}
             level_ids_sec = {}
             for level in LEVEL_OPTIONS:
@@ -9415,6 +9833,14 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
                     # metadata CSV — covers every background cell, including
                     # ones this run filtered out.
                     vals = arr[sec_mask][valid]
+                    # Leading numeric ID, sliced from the full-background
+                    # precomputed array (background_level_ids_arrays, just
+                    # above LEVEL_OPTIONS) with the same mask/valid indexing
+                    # as vals itself — avoids re-running regex extraction on
+                    # this panel's own slice.
+                    level_values_sec[level] = vals
+                    level_ids_sec[level] = background_level_ids_arrays[level][sec_mask][valid]
+                    continue
                 else:
                     # No background column for this level. True for Leiden by
                     # construction: it's computed from *this run's* neighbor
@@ -9426,6 +9852,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
                     # behind, colored in front" convention already renders
                     # sensibly (see apply_panel_colors_with_gray_behind).
                     cells_arr = cell_level_arrays.get(level)
+                    cell_ids_arr = level_ids_arrays.get(level)
                     if cells_arr is None:
                         level_values_sec[level] = None
                         level_ids_sec[level] = None
@@ -9433,8 +9860,17 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
                     in_run = umap_idx_sec >= 0
                     vals = np.full(umap_idx_sec.shape, None, dtype=object)
                     vals[in_run] = cells_arr[umap_idx_sec[in_run]]
-                level_values_sec[level] = vals
-                level_ids_sec[level] = extract_leading_numeric_id(pd.Series(vals)).to_numpy()
+                    ids = np.full(umap_idx_sec.shape, np.nan)
+                    # level_ids_arrays (precomputed above LEVEL_OPTIONS,
+                    # adata's own cells only) sliced by umap_idx_sec — same
+                    # "index once, slice per panel" avoidance of re-running
+                    # extract_leading_numeric_id per panel as the background
+                    # branch above.
+                    if cell_ids_arr is not None:
+                        ids[in_run] = np.asarray(cell_ids_arr)[umap_idx_sec[in_run]]
+                    level_values_sec[level] = vals
+                    level_ids_sec[level] = ids
+            _panel_timing['levels'] += time.perf_counter() - _t0
             # Antialiasing left on (matplotlib's default). It genuinely costs
             # something here — once these dots carry per-point color
             # (update_section_background_colors) rather than one uniform
@@ -9451,9 +9887,12 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             # artist's stored alpha every time set_facecolor runs, so it
             # survives all the recoloring below (categorical, binary, and
             # colormapped alike) without each of those having to know.
+            _t0 = time.perf_counter()
             background_artist = sec_ax.scatter(xs_sec, ys_sec, c='dimgray',
                                                 s=SECTION_BACKGROUND_BASE_SIZE, linewidths=0,
                                                 alpha=SECTION_POINT_ALPHA)
+            _panel_timing['scatter'] += time.perf_counter() - _t0
+            _t0 = time.perf_counter()
             # ROI rectangles drawn for this run (if any) — same dashed-
             # orange convention as the section-grid picker's own ROI
             # borders. Whole-section picks (the entire section selected,
@@ -9524,13 +9963,31 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             # than in this panel's own dict, since nothing else about it is
             # per-panel.
             if section_scalebar is None:
+                # zorder above the zoom-preview stand-in images' own 1e6/
+                # 1e6+1 (see begin_zoom_preview) and the cached home-view
+                # image's 1e6+1 (see set_section_colors_categorical) — see
+                # build_section_scalebar's own animated=True docstring for
+                # why both matter.
                 scalebar_line, scalebar_text = build_section_scalebar(
-                    sec_ax, geometry=compute_scalebar_geometry(sec_ax))
+                    sec_ax, geometry=compute_scalebar_geometry(sec_ax), zorder=1e6 + 10, animated=True)
                 section_scalebar = {'ax': sec_ax, 'line': scalebar_line, 'text': scalebar_text}
             section_panels[sec] = {
                 'ax': sec_ax, 'highlight': highlight, 'group_highlight': None,
                 'dim_veil': dim_veil,
                 'background_artist': background_artist,
+                # Filled in by apply_panel_colors_with_gray_behind on the
+                # first real color assignment — None until then, which
+                # filter_section_scatter_to_viewport treats as "nothing to
+                # filter yet" (matches background_artist's own initial,
+                # already-complete point set, so there's nothing to do
+                # regardless).
+                'full_offsets': None, 'full_colors': None,
+                # A stand-in imshow for this panel's disk-cached home-view
+                # PNG (see section_home_cache_path/show_section_home_
+                # cache_or_scatter) — None until first used, created once
+                # then just toggled visible/hidden afterward, same "create
+                # once, reuse" convention as background_artist itself.
+                'cached_home_image': None,
                 # Precomputed once here (not re-filtered from the full bg_*
                 # arrays on every hover settle) — same x/y/id triples the
                 # background dots themselves were drawn from, just kept
@@ -9544,6 +10001,18 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
                 'level_values': level_values_sec, 'level_ids': level_ids_sec, 'umap_idx': umap_idx_sec,
             }
             pannable_axes[sec_ax] = {'home_xlim': home_xlim, 'home_ylim': home_ylim}
+            _panel_timing['other'] += time.perf_counter() - _t0
+        if ZOOM_DEBUG_DIAGNOSTICS:
+            _timing_str = ', '.join(f"{k}={v:.3f}s" for k, v in _panel_timing.items())
+            print(f"[panel-build] {n_sections} panels — {_timing_str}")
+        # Final draw+flush so every panel built after the last progress
+        # checkpoint above (up to PANEL_PROGRESS_INTERVAL - 1 of them) is
+        # also visible during the coloring phase that follows, rather than
+        # only appearing at the very first real (colored) draw.
+        fig.canvas.draw()
+        fig.canvas.flush_events()
+        log_status(f"Step 9: Built {n_sections} section panel(s) (axes + placeholder scatter only — "
+                   f"real coloring happens in redraw_all_subclasses, timed separately).")
     else:
         empty_grid_ax = fig.add_axes([GRID_LEFT, AREA_BOTTOM, GRID_RIGHT - GRID_LEFT, AREA_TOP - AREA_BOTTOM])
         empty_grid_ax.axis('off')
@@ -9756,6 +10225,14 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     # widens past what that snapshot ever covered.
     home_view_cache = {}
     zoom_settle_timer = {'timer': None}
+    # Which axes the *pending* settle is actually for — 'ax' (the literal
+    # UMAP Axes object) for a UMAP scroll-zoom or a UMAP pan-release,
+    # 'panel' for a section-panel scroll-zoom, set right before each of
+    # on_scroll_zoom's two schedule_zoom_preview_settle(...) calls and in
+    # on_release_pan. end_zoom_previews checks this (is ax) before applying
+    # ZOOM_BITMAP_ONLY_MAX_MULTIPLIER — section-panel bursts are untouched
+    # for now, and always fall through to the existing behavior below.
+    zoom_settle_source = {'ax': None}
     # Debounce lengths (ZOOM_PREVIEW_SETTLE_MS_UMAP/_PANEL) and the snapshot
     # crop inset (SPINE_INSET_PX) are at the top of the file. The two
     # debounces differ even though a burst on either source freezes *all*
@@ -9786,25 +10263,50 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         renderer = fig.canvas.get_renderer()
         if renderer is None:
             return None
-        buf = np.asarray(renderer.buffer_rgba())
-        h = buf.shape[0]
-        bbox = target_ax.bbox
-        x0 = max(0, int(np.ceil(bbox.x0)) + SPINE_INSET_PX)
-        x1 = min(buf.shape[1], int(np.floor(bbox.x1)) - SPINE_INSET_PX)
-        y0 = max(0, int(np.ceil(bbox.y0)) + SPINE_INSET_PX)
-        y1 = min(h, int(np.floor(bbox.y1)) - SPINE_INSET_PX)
-        if x1 <= x0 or y1 <= y0:
-            return None
-        # Row 0 of buffer_rgba() is the *top* of the canvas; matplotlib's
-        # own y-pixel coordinates (bbox) increase upward — hence the flip.
-        snapshot = buf[h - y1:h - y0, x0:x1, :].copy()
-        inv = target_ax.transData.inverted()
-        (ex0, ey0), (ex1, ey1) = inv.transform([(x0, y0), (x1, y1)])
-        # (left, right, bottom, top) in the axes' own coordinate directions —
-        # taken straight from the inverse transform, so an inverted axes
-        # (section panels) gets a correctly-flipped extent with no special
-        # case, exactly as origin='upper' expects.
-        return snapshot, (ex0, ex1, ey0, ey1)
+        # The scale bar (see build_section_scalebar's own animated=True
+        # docstring) is drawn separately, always on top, via draw_
+        # animated_overlays — it must never end up baked into a snapshot
+        # bitmap itself, or it gets magnified/shifted right along with the
+        # rest of the image as that bitmap is zoomed, and can end up
+        # doubled up with the live one once both are on screen at once (a
+        # snapshot from one moment layered under home_view_cache's own
+        # snapshot from another — see capture_home_view_if_at_home —
+        # showing two bars at two different lengths/positions). Hidden and
+        # redrawn into just the *renderer's* own buffer (fig.draw_artist,
+        # no blit — nothing needs to reach the screen for this, only the
+        # pixels read back below), then restored to visible immediately
+        # after: draw_animated_overlays re-stamps it correctly on screen
+        # the next time anything blits, which every real caller of this
+        # function does soon afterward regardless.
+        is_scalebar_ax = section_scalebar is not None and target_ax is section_scalebar['ax']
+        if is_scalebar_ax:
+            section_scalebar['line'].set_visible(False)
+            section_scalebar['text'].set_visible(False)
+            fig.draw_artist(target_ax)
+        try:
+            buf = np.asarray(renderer.buffer_rgba())
+            h = buf.shape[0]
+            bbox = target_ax.bbox
+            x0 = max(0, int(np.ceil(bbox.x0)) + SPINE_INSET_PX)
+            x1 = min(buf.shape[1], int(np.floor(bbox.x1)) - SPINE_INSET_PX)
+            y0 = max(0, int(np.ceil(bbox.y0)) + SPINE_INSET_PX)
+            y1 = min(h, int(np.floor(bbox.y1)) - SPINE_INSET_PX)
+            if x1 <= x0 or y1 <= y0:
+                return None
+            # Row 0 of buffer_rgba() is the *top* of the canvas; matplotlib's
+            # own y-pixel coordinates (bbox) increase upward — hence the flip.
+            snapshot = buf[h - y1:h - y0, x0:x1, :].copy()
+            inv = target_ax.transData.inverted()
+            (ex0, ey0), (ex1, ey1) = inv.transform([(x0, y0), (x1, y1)])
+            # (left, right, bottom, top) in the axes' own coordinate directions —
+            # taken straight from the inverse transform, so an inverted axes
+            # (section panels) gets a correctly-flipped extent with no special
+            # case, exactly as origin='upper' expects.
+            return snapshot, (ex0, ex1, ey0, ey1)
+        finally:
+            if is_scalebar_ax:
+                section_scalebar['line'].set_visible(True)
+                section_scalebar['text'].set_visible(True)
 
     def begin_zoom_preview(target_ax, use_home_cache=False):
         if target_ax in active_zoom_previews:
@@ -9832,6 +10334,13 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # (black backgrounds) came from.
         structural = {target_ax.xaxis, target_ax.yaxis, target_ax.patch,
                       *target_ax.spines.values()}
+        if section_scalebar is not None and target_ax is section_scalebar['ax']:
+            # Animated (see build_section_scalebar's own animated=True
+            # docstring) — never hidden for a preview burst the way every
+            # other real artist on this axes is; it's drawn separately,
+            # always on top of whatever the preview ends up showing, via
+            # draw_animated_overlays.
+            structural = structural | {section_scalebar['line'], section_scalebar['text']}
         hidden = [(artist, artist.get_visible()) for artist in target_ax.get_children()
                   if hasattr(artist, 'get_visible') and artist not in structural]
         for artist, _ in hidden:
@@ -9955,6 +10464,91 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
 
     def end_zoom_previews():
         if not active_zoom_previews:
+            return
+        umap_settle = zoom_settle_source['ax'] is ax
+        if umap_settle and umap_zoom_ratio() <= ZOOM_BITMAP_ONLY_MAX_MULTIPLIER:
+            # Below the threshold, stay on the zoom-preview bitmap already
+            # on screen indefinitely rather than paying for a real, full-
+            # resolution fig.canvas.draw() — see ZOOM_BITMAP_ONLY_MAX_
+            # MULTIPLIER's own comment for why that draw is expensive
+            # regardless of how little ends up visible. teardown_zoom_
+            # previews() (not the heavier finish below) does only the
+            # *in-memory* bookkeeping — restoring the real (possibly
+            # stale/viewport-filtered — see the >threshold branch below)
+            # artists' visibility and clearing active_zoom_previews —
+            # without ever actually drawing them, so that staleness is
+            # never painted. Re-caching blit_bg first (same as the real
+            # path below) matters on its own: several other things (hover's
+            # own blit path, capture_home_view_if_at_home, the resize-
+            # settle handler) treat a non-empty active_zoom_previews as "a
+            # preview owns the screen right now" and suppress themselves
+            # accordingly — correct for the few hundred milliseconds a real
+            # settle used to take, but hover in particular would otherwise
+            # stay dead for as long as the user's zoom stays in this range,
+            # which could be indefinitely — so this clears it every time,
+            # never leaves it set.
+            blit_bg['data'] = fig.canvas.copy_from_bbox(fig.bbox)
+            teardown_zoom_previews()
+            return
+        if umap_settle and umap_zoom_ratio() > ZOOM_BITMAP_ONLY_MAX_MULTIPLIER:
+            # Re-filters from main_scatter_state['full']'s own untouched
+            # snapshot every time (never from whatever the artists
+            # currently hold), so this is correct however many times the
+            # user has already crossed the threshold this session.
+            filter_main_scatter_to_viewport()
+            # Targeted finish, not the generic full-figure one below: a
+            # plain fig.canvas.draw() redraws *every* visible Axes, which
+            # includes every section panel — all ~80 of them, each with
+            # their own few-thousand-point real scatter — even though a
+            # UMAP-only zoom never touched any of them. teardown_zoom_
+            # previews() still restores every axes' real-artist visibility
+            # (in memory only, same as the skip branch above — see its own
+            # comment on why that has to stay a *full*, not per-axes,
+            # teardown: several other guards elsewhere key off active_zoom_
+            # previews being empty, not per-axes), but only `ax` itself
+            # actually gets *drawn* here (fig.draw_artist, same low-level
+            # call blit_zoomed_axes already uses for every mid-burst tick —
+            # it doesn't fire 'draw_event', so cache_blit_background never
+            # runs and blit_bg has to be re-cached by hand afterward, same
+            # as blit_zoomed_axes's own callers already rely on during a
+            # burst). Every section panel's own screen pixels are simply
+            # never touched: their stand-in bitmap was already a pixel-
+            # accurate snapshot of their real, unchanged content, so the
+            # canvas buffer is already correct there without redrawing
+            # anything — blitting the *whole* canvas (not just ax.bbox,
+            # same as blit_zoomed_axes) just re-pushes those already-
+            # correct pixels alongside the UMAP's freshly drawn ones.
+            teardown_zoom_previews()
+            fig.draw_artist(ax)
+            fig.canvas.blit(fig.bbox)
+            force_repaint()
+            blit_bg['data'] = fig.canvas.copy_from_bbox(fig.bbox)
+            return
+        panel_settle = zoom_settle_source['ax'] == 'panel'
+        if panel_settle and section_zoom_ratio['value'] <= ZOOM_BITMAP_ONLY_MAX_MULTIPLIER:
+            # Mirror image of the UMAP skip branch above — same reasoning,
+            # same guarantees (blit_bg re-cached, active_zoom_previews
+            # actually cleared rather than left "stuck", so hover etc.
+            # don't go dead for the whole time zoom stays under threshold).
+            blit_bg['data'] = fig.canvas.copy_from_bbox(fig.bbox)
+            teardown_zoom_previews()
+            return
+        if panel_settle and section_zoom_ratio['value'] > ZOOM_BITMAP_ONLY_MAX_MULTIPLIER:
+            # Mirror image of the UMAP >threshold branch above: filter
+            # every panel to its own current viewport, then draw+blit only
+            # the section panels — never the UMAP, which this zoom never
+            # touched. section_panels.values() is a lot of axes to draw
+            # individually, but each is now cheap (only the in-view subset
+            # of that one panel's own points), and it's still strictly less
+            # work than the full fig.canvas.draw() this replaces, which
+            # drew all of them *and* the UMAP.
+            filter_all_section_scatters_to_viewport()
+            teardown_zoom_previews()
+            for panel in section_panels.values():
+                fig.draw_artist(panel['ax'])
+            fig.canvas.blit(fig.bbox)
+            force_repaint()
+            blit_bg['data'] = fig.canvas.copy_from_bbox(fig.bbox)
             return
         # Re-cache the full-figure background from what's *currently* in the
         # Agg buffer before anything below restores it. Only a burst's first
@@ -10109,21 +10703,41 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             if burst_already_active:
                 blit_zoomed_axes([ax])
             else:
-                # Synchronous, not draw_idle(): a deferred draw here left a
-                # window where the preview image (already showing the
-                # correct zoomed view, right above) could sit on screen for
-                # one or more idle-loop turns before this real draw actually
-                # ran — and if anything else serviced the Tk event queue in
-                # that gap (a queued resize/configure from the window only
-                # just having been mapped, in particular right after the
-                # window first opens), the canvas could repaint with the
-                # *old* home-extent content in between, reading as a flicker
-                # back to zoomed-out before this draw's own result finally
-                # landed. A synchronous draw leaves no such gap: by the time
-                # this call returns, the correct zoomed view (real content
-                # plus preview) is already the only thing that's been drawn.
-                fig.canvas.draw()
+                # Targeted (fig.draw_artist(ax), same as blit_zoomed_axes'
+                # own mid-burst call just above), not a full fig.canvas.
+                # draw() — begin_zoom_preview (just above) already hid
+                # every real artist on *every* axes (UMAP and all section
+                # panels alike), so a full draw's own section-panel work
+                # should in principle be near-free with nothing real left
+                # visible to draw there — but it still means Figure.draw()
+                # walking every one of those ~80 axes' own structural
+                # bits (patch/spines/labels) and however many now-hidden
+                # children each one has, purely to confirm there's nothing
+                # to do. Drawing only `ax` skips that walk entirely; the
+                # sections' own stand-in images (just added, never drawn
+                # yet) don't need drawing either — each one's pixel content
+                # is a snapshot of whatever was already correctly on
+                # screen a moment before begin_zoom_preview hid the real
+                # artists, so the canvas buffer is already right there
+                # without painting anything new.
+                #
+                # Still synchronous, still not draw_idle(): a deferred
+                # draw here left a window where the preview image (already
+                # showing the correct zoomed view, right above) could sit
+                # on screen for one or more idle-loop turns before this
+                # draw actually ran — and if anything else serviced the Tk
+                # event queue in that gap (a queued resize/configure from
+                # the window only just having been mapped, in particular
+                # right after the window first opens), the canvas could
+                # repaint with the *old* home-extent content in between,
+                # reading as a flicker back to zoomed-out before this
+                # draw's own result finally landed. blit_zoomed_axes is
+                # just as synchronous as fig.canvas.draw() was — same
+                # guarantee, by the time this call returns the correct
+                # zoomed view is already the only thing that's been drawn.
+                blit_zoomed_axes([ax])
                 force_repaint()
+            zoom_settle_source['ax'] = ax
             schedule_zoom_preview_settle(ZOOM_PREVIEW_SETTLE_MS_UMAP)
             return
         if any(panel['ax'] is ax_obj for panel in section_panels.values()):
@@ -10155,13 +10769,21 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             section_zoom_ratio['value'] = max(1.0, section_zoom_ratio['value'] / factor)
             apply_section_zoom_ratio(ax_obj, event.xdata, event.ydata)
             if burst_already_active:
-                blit_zoomed_axes([panel['ax'] for panel in section_panels.values()])
+                blit_zoomed_axes(section_axes)
             else:
-                # Synchronous — see the mirror-image comment in the UMAP
-                # branch above; same flicker risk from a deferred draw_idle()
-                # leaving a gap before the burst-starting real draw lands.
-                fig.canvas.draw()
+                # Targeted (blit_zoomed_axes), not a full fig.canvas.draw()
+                # — same reasoning as the mirror-image fix in the UMAP
+                # branch above: begin_zoom_preview already hid every real
+                # artist on every axes (including the UMAP's own, which
+                # this zoom never touches), so a full draw's UMAP-side work
+                # is theoretically near-free but still means walking its
+                # own (large) child list to confirm there's nothing to do.
+                # Still synchronous — same flicker risk from a deferred
+                # draw_idle() leaving a gap before the burst-starting real
+                # draw lands.
+                blit_zoomed_axes(section_axes)
                 force_repaint()
+            zoom_settle_source['ax'] = 'panel'
             schedule_zoom_preview_settle(ZOOM_PREVIEW_SETTLE_MS_PANEL)
 
     fig.canvas.mpl_connect('scroll_event', on_scroll_zoom)
@@ -10265,6 +10887,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
 
     def on_release_pan(event):
         was_previewing = pan_state['preview_started']
+        panned_ax = pan_state['ax']
         pan_state['active'] = False
         pan_state['ax'] = None
         pan_state['last_pixel'] = None
@@ -10273,7 +10896,12 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             # Straight to the real redraw, with none of scrolling's debounce
             # wait: a mouse release is an unambiguous end to the gesture,
             # unlike a gap between scroll notches that may or may not mean
-            # the user is finished.
+            # the user is finished. zoom_settle_source captured *before*
+            # pan_state['ax'] was cleared above — panned_ax is the UMAP
+            # Axes for a UMAP drag, or a section panel's for one of those
+            # (untouched by ZOOM_BITMAP_ONLY_MAX_MULTIPLIER for now, same as
+            # a section scroll-zoom — see zoom_settle_source's own comment).
+            zoom_settle_source['ax'] = ax if panned_ax is ax else 'panel'
             end_zoom_previews()
 
     fig.canvas.mpl_connect('button_press_event', on_press_pan)
@@ -10349,6 +10977,14 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
                 fig.draw_artist(panel['group_highlight'])
             if panel['highlight'].get_visible():
                 fig.draw_artist(panel['highlight'])
+        # Always on top of whatever the scalebar's own panel is currently
+        # showing — real scatter, zoom-preview bitmap, or cached home-view
+        # image — since it's animated (see build_section_scalebar's own
+        # animated=True docstring) and excluded from all of those; this is
+        # the one place it's ever actually drawn.
+        if section_scalebar is not None:
+            fig.draw_artist(section_scalebar['line'])
+            fig.draw_artist(section_scalebar['text'])
         # query_ax/gene_dropdown_ax/level_dropdown_ax are defined further
         # down (query/level box setup) — fine, same forward-reference-via-
         # closure reasoning as everything else here: this function isn't
@@ -11500,6 +12136,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     # widget internals, invisible to and unpreventable by any of the
     # draw_idle()/blit routing done elsewhere in this window.
     make_textbox_stop_typing_blit_fast(query_textbox, blit_sidebar_overlays)
+    enable_textbox_clipboard_shortcuts(query_textbox)
 
     def on_gene_dropdown_click(event):
         if busy_state['active']:
@@ -12085,8 +12722,34 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         draws in."""
         xs, ys = panel['hover_x'], panel['hover_y']
         order = np.argsort(~np.asarray(is_gray), kind='stable')
-        panel['background_artist'].set_offsets(np.column_stack([xs[order], ys[order]]))
-        panel['background_artist'].set_facecolor(np.asarray(colors)[order])
+        full_offsets = np.column_stack([xs[order], ys[order]])
+        full_colors = np.asarray(colors)[order]
+        panel['background_artist'].set_offsets(full_offsets)
+        panel['background_artist'].set_facecolor(full_colors)
+        # Snapshot of the *complete* (unfiltered) point set this call just
+        # set on the artist — filter_section_scatter_to_viewport (see its
+        # own docstring) always re-filters from this, never from whatever
+        # the artist currently holds, so zooming in/out past ZOOM_BITMAP_
+        # ONLY_MAX_MULTIPLIER repeatedly never compounds/loses points. This
+        # function is the single choke point every set_section_colors_*
+        # path already goes through (see the comment below), so it's the
+        # one place that's always right after a fresh, complete color
+        # assignment — same reasoning as set_main_scatter_artists' own
+        # snapshot for the UMAP.
+        panel['full_offsets'] = full_offsets
+        panel['full_colors'] = full_colors
+        # Defaults every caller back to "show the real scatter" — the only
+        # thing that ever hides it instead is show_section_home_cache_or_
+        # scatter, called by set_section_colors_categorical right after
+        # this, for categorical ('All <level>s') mode specifically. Without
+        # this, switching from a cached categorical view to Gene mode or a
+        # 'Specified <level>(s)' highlight (both of which call this
+        # function too, but never show_section_home_cache_or_scatter) left
+        # background_artist hidden and the stale cached image still
+        # showing on top of it, no matter what fresh data was just set.
+        panel['background_artist'].set_visible(True)
+        if panel['cached_home_image'] is not None:
+            panel['cached_home_image'].set_visible(False)
         # This panel no longer looks the way its cached home bitmap does —
         # the single choke point every set_section_colors_* path goes
         # through, so invalidating here covers all of them. Re-captured by
@@ -12152,21 +12815,134 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # bitmap is a valid stand-in any more.
         invalidate_home_view_cache()
 
+    def show_section_home_cache_or_scatter(panel, sec, level):
+        """Called right after apply_panel_colors_with_gray_behind has set
+        panel['background_artist']'s own data (so full_offsets/full_colors
+        — needed for zoom-in filtering regardless of what ends up actually
+        displayed — are always correct), this decides whether the panel's
+        *visible* content should be that real scatter or a cached home-
+        view PNG (see section_home_cache_path's own docstring for why this
+        only applies to categorical coloring, not Gene/Imputed Gene or a
+        'Specified <level>(s)' highlight).
+
+        Only relevant when the panel is currently sitting exactly at its
+        own home extent — a cached home-view image is meaningless once
+        zoomed/panned; end_zoom_previews' own zoom-in handling already
+        takes over there — and run_folder is known (no folder to cache
+        into for a session not tied to a saved run). On a cache hit, swaps
+        to the cached image and hides the real scatter: cheap, since a
+        hidden artist costs ~nothing to draw (same reasoning already
+        established for the UMAP/zoom-preview work this session). On a
+        miss, renders one now — off-screen, independent of this window,
+        see render_section_home_view_png — saves it, and uses it the same
+        way, so *this* session also gets the speedup, not just later ones.
+
+        Also seeds home_view_cache directly from whatever image ends up
+        showing, so zoom-out backfill (swap_preview_to_home_cache) works
+        immediately rather than waiting on capture_home_view_if_at_home's
+        own later, opportunistic capture.
+
+        Returns one of 'hit' (loaded an existing PNG), 'rendered' (no
+        usable PNG existed — rendered and saved one just now), or
+        'skipped' (not at home, no run_folder, or something failed —
+        real scatter shown instead) — purely for set_section_colors_
+        categorical's own ZOOM_DEBUG_DIAGNOSTICS accounting."""
+        ax_ = panel['ax']
+        image_artist = panel['cached_home_image']
+
+        def use_real_scatter():
+            if image_artist is not None:
+                image_artist.set_visible(False)
+            panel['background_artist'].set_visible(True)
+
+        if run_folder is None:
+            use_real_scatter()
+            return 'skipped'
+        home = pannable_axes.get(ax_)
+        if home is None:
+            use_real_scatter()
+            return 'skipped'
+        xlim, ylim = ax_.get_xlim(), ax_.get_ylim()
+        # sorted() comparison, not elementwise — see capture_home_view_if_
+        # at_home's own comment: section panels are y-inverted, so a panel
+        # sitting exactly at home reports get_ylim() as home_ylim reversed.
+        at_home = (np.allclose(sorted(xlim), sorted(home['home_xlim']))
+                   and np.allclose(sorted(ylim), sorted(home['home_ylim'])))
+        if not at_home:
+            use_real_scatter()
+            return 'skipped'
+        cache_path = section_home_cache_path(run_folder, sec, level)
+        rgba = None
+        outcome = 'rendered'
+        if cache_path.exists():
+            try:
+                rgba = np.asarray(Image.open(cache_path).convert('RGBA'), dtype=np.uint8)
+                outcome = 'hit'
+            except Exception:
+                rgba = None  # unreadable/corrupt — just re-render below
+        if rgba is None:
+            outcome = 'rendered'
+            try:
+                # full_offsets/full_colors (set just above, in apply_panel_
+                # colors_with_gray_behind) are already gray-first ordered
+                # and row-aligned with each other — is_gray=all-False here
+                # just means "nothing further to reorder", not "no cell is
+                # actually gray" (their colors already reflect that).
+                full_offsets, full_colors = panel['full_offsets'], panel['full_colors']
+                rgba = render_section_home_view_png(
+                    full_offsets[:, 0], full_offsets[:, 1], full_colors,
+                    np.zeros(len(full_colors), dtype=bool),
+                    home['home_xlim'], home['home_ylim'],
+                )
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                Image.fromarray(rgba, mode='RGBA').save(cache_path)
+            except Exception as e:
+                print(f"Warning: could not cache home-view image for section {sec} ({level}): {e}")
+                rgba = None
+        if rgba is None:
+            use_real_scatter()
+            return 'skipped'
+        extent = (min(home['home_xlim']), max(home['home_xlim']),
+                  min(home['home_ylim']), max(home['home_ylim']))
+        if image_artist is None:
+            image_artist = ax_.imshow(rgba, extent=extent, aspect='auto', origin='upper', zorder=2)
+            panel['cached_home_image'] = image_artist
+        else:
+            image_artist.set_data(rgba)
+            image_artist.set_extent(extent)
+            image_artist.set_visible(True)
+        panel['background_artist'].set_visible(False)
+        home_view_cache[ax_] = {'buf': rgba, 'extent': extent}
+        return outcome
+
     def set_section_colors_categorical(level):
         # section_color_map covers *every* category (recycled past the top
         # N — see UMAP_MAX_COLORED_CATEGORIES), unlike the UMAP's own
         # umap_color_map, so this only falls back to SECTION_UNKNOWN_COLOR
         # for a level with no data at all, not for being a low-ranked
         # category the way the UMAP scatter does.
+        t_start = time.perf_counter()
+        outcome_counts = {'hit': 0, 'rendered': 0, 'skipped': 0}
         color_map = (compute_ranked_category_colors(level)['section_color_map']
                      if level in adata.obs.columns else {})
-        for panel in section_panels.values():
+        for sec, panel in section_panels.items():
             vals = panel['level_values'].get(level)
             if not color_map or vals is None:
                 panel['background_artist'].set_facecolor(SECTION_UNKNOWN_COLOR)
+                if panel['cached_home_image'] is not None:
+                    panel['cached_home_image'].set_visible(False)
+                panel['background_artist'].set_visible(True)
             else:
                 colors = np.array([color_map.get(v, SECTION_UNKNOWN_COLOR) for v in vals], dtype=object)
                 apply_panel_colors_with_gray_behind(panel, colors, colors == SECTION_UNKNOWN_COLOR)
+                outcome = show_section_home_cache_or_scatter(panel, sec, level)
+                outcome_counts[outcome] += 1
+        if ZOOM_DEBUG_DIAGNOSTICS:
+            elapsed = time.perf_counter() - t_start
+            print(f"[section-cache] set_section_colors_categorical('{level}'): {elapsed:.3f}s — "
+                  f"{outcome_counts['hit']} from cache, {outcome_counts['rendered']} rendered+saved fresh, "
+                  f"{outcome_counts['skipped']} skipped (not at home / no run_folder / failed) "
+                  f"(run_folder={'set' if run_folder is not None else 'None — caching disabled'})")
 
     def set_section_colors_for_ids(level, target_colors):
         """Colors each panel's cells to match the UMAP's 'Single <level>'
@@ -14167,6 +14943,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     log_status("Step 9: Rendering initial view...")
     try:
         redraw()  # initial view — MODE_OPTIONS[0] ('All Subclasses')
+        log_status("Step 9: Initial view built (colors/data assigned) — starting first real draw...")
         # Forced synchronous (not the draw_idle() redraw() already scheduled)
         # so the first real draw — which is what populates blit_bg for every
         # blit_hover_overlays()/blit_sidebar_overlays() call, and also warms
@@ -14179,6 +14956,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # few keystrokes — which is why this was "more noticeable right after
         # launch" specifically.
         fig.canvas.draw()
+        log_status("Step 9: First real draw complete.")
         center_figure_window(fig)
     except Exception:
         # A failure anywhere in this block happens *after* the window is
