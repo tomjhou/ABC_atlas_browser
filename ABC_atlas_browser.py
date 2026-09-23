@@ -191,6 +191,11 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.backend_tools import Cursors
 from matplotlib.transforms import Bbox
+# Aliased — pathlib.Path is already imported as plain `Path` and used
+# throughout this file for filesystem paths; this is matplotlib's own,
+# unrelated Path (a vector shape, used below for the multi-gene overlay's
+# selectable marker shapes).
+from matplotlib.path import Path as MplPath
 from matplotlib.offsetbox import AnchoredOffsetbox, DrawingArea, TextArea, VPacker
 
 from abc_atlas_access.abc_atlas_cache.abc_project_cache import AbcProjectCache
@@ -240,6 +245,86 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # here because the atlas location below is remembered in it.
 CACHE_DIR = SCRIPT_DIR / 'cache_local'
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# The interactive UMAP viewer's own Settings dialog (hover-highlighting
+# on/off, the multi-gene overlay's genes-4-6 marker shape) — a real user
+# preference, not disposable/regenerable data, so it lives next to the
+# script rather than inside CACHE_DIR.
+SETTINGS_FILE = SCRIPT_DIR / 'viewer_settings.json'
+
+# Defaults for the interactive UMAP viewer's own Settings dialog. Gene456_
+# shape is validated against GENE456_SHAPE_REGISTRY (defined further down,
+# alongside the rest of the multi-gene overlay's own tunables) inside
+# load_viewer_settings itself, not here — referencing it only from within
+# a function body means definition order in the file doesn't matter, since
+# by the time load_viewer_settings is actually called (opening the
+# interactive viewer), the whole module has already finished loading.
+DEFAULT_VIEWER_SETTINGS = {
+    'hover_enabled': True,
+    'gene456_shape': 'circle',
+    # Itself a setting, with a deliberately asymmetric persistence rule —
+    # see load_viewer_settings/save_viewer_settings's own docstrings.
+    'persist_settings': False,
+}
+
+
+def load_viewer_settings():
+    """The interactive UMAP viewer's own settings (hover-highlighting on/
+    off, the multi-gene overlay's genes-4-6 marker shape), starting from
+    DEFAULT_VIEWER_SETTINGS and layering in whatever's on disk.
+
+    'persist_settings' itself is the one exception to "nothing persists by
+    default": it's always read from the file if present, regardless of its
+    own value, so a user who opts into persistence once stays opted in on
+    every later launch without the choice to persist needing to itself be
+    persisted through some separate mechanism. The other two settings are
+    only loaded from disk when the file's own 'persist_settings' says to —
+    otherwise they're left at their hardcoded defaults for this session,
+    same as if the file didn't exist.
+
+    Never raises — any read/parse problem just falls back to defaults, the
+    same as no file existing at all."""
+    settings = dict(DEFAULT_VIEWER_SETTINGS)
+    try:
+        with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+            on_disk = json.load(f)
+    except Exception:
+        return settings
+    if not isinstance(on_disk, dict):
+        return settings
+    settings['persist_settings'] = bool(on_disk.get('persist_settings', False))
+    if settings['persist_settings']:
+        if 'hover_enabled' in on_disk:
+            settings['hover_enabled'] = bool(on_disk['hover_enabled'])
+        if on_disk.get('gene456_shape') in GENE456_SHAPE_REGISTRY:
+            settings['gene456_shape'] = on_disk['gene456_shape']
+    return settings
+
+
+def save_viewer_settings(settings):
+    """Writes `settings` to SETTINGS_FILE — mirroring load_viewer_
+    settings' own asymmetric rule: 'persist_settings' is always written,
+    but 'hover_enabled'/'gene456_shape' are only included when settings[
+    'persist_settings'] is True. Without that second half, turning
+    persistence off would still leave whatever was last saved sitting in
+    the file, silently reappearing (looking like persistence was somehow
+    still partially on) the next time persistence got turned back on,
+    instead of the user's *current* choices at the time they re-enabled
+    it.
+
+    Best-effort: a write failure (read-only install location, etc.) is
+    swallowed rather than surfaced — failing to persist a preference isn't
+    worth interrupting the session over."""
+    to_write = {'persist_settings': bool(settings.get('persist_settings', False))}
+    if to_write['persist_settings']:
+        to_write['hover_enabled'] = bool(settings.get('hover_enabled', True))
+        to_write['gene456_shape'] = settings.get('gene456_shape', GENE456_SHAPE_DEFAULT)
+    try:
+        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(to_write, f, indent=2)
+    except Exception as e:
+        print(f"Warning: could not save viewer settings ({e})")
 
 # Where the ABC atlas download lives. By default it's next to this repository,
 # in the parent folder. If it isn't there, the user picks a location once (see
@@ -588,16 +673,40 @@ MULTI_GENE_LOW_EXPRESSION_COLOR = (0.0, 0.0, 0.0)
 MULTI_GENE_UMAP_FACECOLOR = (0.1, 0.1, 0.1)
 # Genes 4-6 (UMAP only, so far): a second red/green/blue overlay, drawn as
 # small filled circles centered on top of the circle layer above, instead of
-# its own separate plot — see redraw_multi_genes. Opaque (alpha=1) and
-# smaller than the base circle, so the base layer's own color still shows
-# around its edges. Diameter (not area — matplotlib `s` is area, so this
-# gets squared before use) multiplier on the circle layer's own current
-# size.
+# its own separate plot — see redraw_multi_genes. Opaque (alpha=1). This is
+# specifically the 'circle' shape's own diameter multiplier (see GENE456_
+# SHAPE_REGISTRY below, where each shape carries its own) — kept smaller
+# than the base circle so the base layer's own color still shows around
+# its edges. Diameter (not area — matplotlib `s` is area, so this gets
+# squared before use) multiplier on the circle layer's own current size.
 MULTI_GENE_PLUS_SIZE_DIAMETER_MULTIPLIER = 0.5
 # Cells with exactly zero expression across all of genes 4-6 simply don't
 # get an overlay dot drawn at all (rather than an opaque black one) — see
 # redraw_multi_genes' own visibility mask.
 MULTI_GENE_PLUS_ZORDER = 1.5  # above the circle layer's default zorder (1), below hover highlights (5.2+)
+# Selectable marker shapes for the overlay layer — user-facing names to
+# a (matplotlib marker, own diameter multiplier) pair. The marker half is
+# whatever scatter(marker=...) actually wants: 'circle' is a plain built-
+# in marker code; 'half-circle' is a custom matplotlib Path (scatter's
+# marker= argument accepts an arbitrary Path, not just single-character
+# codes) — Path.wedge(-90, 90) is a wedge spanning that range, which is
+# exactly a semicircle: flat (diameter) edge on the left, curved edge on
+# the right. The size half is per-shape rather than one shared constant:
+# 'circle' stays smaller than the base layer's own circle (so that base
+# color still shows around its edges — the original design intent), while
+# 'half-circle' is drawn at the *same* radius as the base circle, so its
+# curved edge lines up exactly with the base circle's own — covering its
+# right half outright rather than sitting as a smaller shape somewhere
+# inside it. A new shape just needs a new entry here; nothing else needs
+# to know how it's actually built or sized. Picked via the Settings dialog
+# (prompt_viewer_settings_dialog) and stored in viewer_settings/
+# SETTINGS_FILE as 'gene456_shape' — see load_viewer_settings's own
+# docstring for that setting's persistence rule.
+GENE456_SHAPE_REGISTRY = {
+    'circle': {'marker': 'o', 'size_multiplier': MULTI_GENE_PLUS_SIZE_DIAMETER_MULTIPLIER},
+    'half-circle': {'marker': MplPath.wedge(-90, 90), 'size_multiplier': 1.0},
+}
+GENE456_SHAPE_DEFAULT = 'circle'
 # The UMAP axes' own background for every *other* mode (categorical
 # taxonomy levels, single gene) — restored explicitly by clear_colorbar
 # whenever leaving multi-gene mode. Needed because Axes.clear() does *not*
@@ -3421,6 +3530,80 @@ def prompt_deg_comparison_mode(parent_window, title, level_name):
     dialog.grab_set()
     dialog.focus_set()
     dialog.wait_window()  # blocks here (this window's own local event loop) until destroy() above
+    return result['value']
+
+
+def prompt_viewer_settings_dialog(parent_window, current_settings):
+    """The interactive UMAP viewer's own Settings dialog: hover-
+    highlighting on/off, the multi-gene overlay's genes-4-6 marker shape
+    (GENE456_SHAPE_REGISTRY), and whether these choices persist across
+    sessions (see load_viewer_settings/save_viewer_settings's own
+    docstrings for that setting's own asymmetric persistence rule). Same
+    modal-child pattern as prompt_deg_comparison_mode — see its own
+    docstring for why a real Toplevel rather than tkinter.messagebox, and
+    why transient()/grab_set()/wait_window() rather than a second,
+    competing Tk() root.
+
+    `current_settings` is read but never mutated — the caller decides what
+    to do with the result. Returns an updated settings dict once OK is
+    clicked, or None if cancelled (Cancel, the window's own close button,
+    or Escape)."""
+    import tkinter as tk
+
+    result = {'value': None}
+    dialog = tk.Toplevel(parent_window)
+    dialog.title("Viewer settings")
+    dialog.transient(parent_window)
+    dialog.resizable(False, False)
+
+    hover_var = tk.BooleanVar(value=current_settings['hover_enabled'])
+    tk.Checkbutton(dialog, text="Enable hover highlighting", variable=hover_var, anchor='w').pack(
+        fill='x', padx=12, pady=(12, 6))
+
+    shape_frame = tk.Frame(dialog)
+    tk.Label(shape_frame, text="Genes 4-6 shape:").pack(side='left')
+    shape_var = tk.StringVar(value=current_settings.get('gene456_shape', GENE456_SHAPE_DEFAULT))
+    tk.OptionMenu(shape_frame, shape_var, *GENE456_SHAPE_REGISTRY.keys()).pack(side='left', padx=(6, 0))
+    shape_frame.pack(fill='x', padx=12, pady=(0, 6))
+
+    persist_var = tk.BooleanVar(value=current_settings['persist_settings'])
+    tk.Checkbutton(
+        dialog, text="Remember these settings across sessions", variable=persist_var, anchor='w',
+    ).pack(fill='x', padx=12, pady=(0, 12))
+
+    button_frame = tk.Frame(dialog)
+    button_frame.pack(pady=(0, 12))
+
+    def on_ok():
+        result['value'] = {
+            'hover_enabled': hover_var.get(),
+            'gene456_shape': shape_var.get(),
+            'persist_settings': persist_var.get(),
+        }
+        dialog.destroy()
+
+    def on_cancel():
+        result['value'] = None
+        dialog.destroy()
+
+    tk.Button(button_frame, text="OK", command=on_ok, width=10, default='active').pack(side='left', padx=6)
+    tk.Button(button_frame, text="Cancel", command=on_cancel, width=10).pack(side='left', padx=6)
+
+    dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+    dialog.bind('<Return>', lambda event: on_ok())
+    dialog.bind('<Escape>', lambda event: on_cancel())
+
+    # Centered over the parent window — see prompt_deg_comparison_mode's
+    # own identical block for why update_idletasks() has to run first.
+    dialog.update_idletasks()
+    px, py = parent_window.winfo_rootx(), parent_window.winfo_rooty()
+    pw, ph = parent_window.winfo_width(), parent_window.winfo_height()
+    dw, dh = dialog.winfo_width(), dialog.winfo_height()
+    dialog.geometry(f"+{px + max(0, (pw - dw) // 2)}+{py + max(0, (ph - dh) // 2)}")
+
+    dialog.grab_set()
+    dialog.focus_set()
+    dialog.wait_window()
     return result['value']
 
 
@@ -11122,6 +11305,16 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     except Exception:
         tk_widget = None
 
+    # This viewer's own Settings dialog (see the gear button further down,
+    # near color_by_label) — loaded once here, read by on_umap_motion/
+    # on_section_motion below to gate hover highlighting entirely, and by
+    # redraw_multi_genes for the genes-4-6 overlay's marker shape. Declared
+    # here (before either of those) purely for natural top-to-bottom
+    # reading order — Python closures resolve free variables at call time,
+    # not definition time, so where in this function viewer_settings
+    # itself gets assigned doesn't actually matter for correctness.
+    viewer_settings = load_viewer_settings()
+
     # Hold times (VIEWER_HOVER_HOLD_MS, GROUP_HOVER_HOLD_MS) and the status-
     # line text (HOVER_DEFAULT_MESSAGE, HOVER_FIELD_SEP) are at the top of
     # the file. VIEWER_HOVER_HOLD_MS is prefixed because the ROI picker has
@@ -11864,6 +12057,8 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # motion — the group-highlight one is managed from within
         # on_any_hover_settled instead, keyed on the resolved cell (see its
         # own comment on why).
+        if not viewer_settings['hover_enabled']:
+            return
         if event.inaxes is not ax or pan_state['active'] or tk_widget is None:
             return
         if hover_state['timer_id'] is not None:
@@ -11884,6 +12079,8 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # from the UMAP to a section panel (or between panels) correctly
         # cancels whichever was pending, regardless of which of these two
         # handlers had scheduled it.
+        if not viewer_settings['hover_enabled']:
+            return
         sec = section_axes_to_label.get(event.inaxes)
         if sec is None or pan_state['active'] or tk_widget is None:
             return
@@ -12015,6 +12212,57 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
 
     MODE_OPTIONS = ('All Subclasses', 'Single Subclass', 'Gene', 'Imputed Gene')
     color_by_label = fig.text(SIDEBAR_LEFT, 0.965, 'Color by:', fontsize=SIDEBAR_FONTSIZE, va='bottom', ha='left')
+
+    # Settings button (hover on/off, genes-4-6 overlay shape) — tucked into
+    # the top-right corner of the sidebar's own header row, sharing it with
+    # color_by_label above rather than the already-full 7-button stack
+    # further down (see that block's own comment: an 8th button there was
+    # flagged as the point to restructure it into a 2-column grid, not
+    # shrink it a 4th time — a small icon elsewhere avoids that entirely).
+    # color_by_label is short and left-aligned, so the row's right side is
+    # otherwise unused.
+    SETTINGS_BUTTON_SIZE = 0.028
+    settings_button_ax = fig.add_axes(
+        [SIDEBAR_RIGHT - SETTINGS_BUTTON_SIZE, 0.966, SETTINGS_BUTTON_SIZE, SETTINGS_BUTTON_SIZE])
+    settings_button = Button(settings_button_ax, '⚙', hovercolor='0.85')
+    settings_button.label.set_fontsize(SIDEBAR_FONTSIZE * 1.3)
+
+    def apply_viewer_settings(new_settings):
+        """Applies `new_settings` (from prompt_viewer_settings_dialog) to
+        the running session and, if persist_settings says to, writes them
+        to disk — called once right after the dialog returns, never
+        partially. Anything that actually needs to *change on screen*
+        right now (clearing an active hover highlight if hover was just
+        turned off; re-rendering if the genes-4-6 shape changed while that
+        overlay is currently showing) happens here too, so the effect is
+        immediate rather than waiting for the next unrelated redraw."""
+        hover_was_enabled = viewer_settings['hover_enabled']
+        shape_changed = new_settings['gene456_shape'] != viewer_settings['gene456_shape']
+        viewer_settings.update(new_settings)
+        save_viewer_settings(viewer_settings)
+        if hover_was_enabled and not viewer_settings['hover_enabled']:
+            if hover_state['timer_id'] is not None and tk_widget is not None:
+                tk_widget.after_cancel(hover_state['timer_id'])
+                hover_state['timer_id'] = None
+            if hover_state['group_timer_id'] is not None and tk_widget is not None:
+                tk_widget.after_cancel(hover_state['group_timer_id'])
+                hover_state['group_timer_id'] = None
+            hide_all_highlights()
+        if shape_changed and multi_gene_state['active'] and len(multi_gene_state['genes']) > 3:
+            redraw()
+
+    def on_settings_button_clicked(event):
+        parent_window = tk_widget.winfo_toplevel() if tk_widget is not None else None
+        if parent_window is None:
+            status_text.set_text("Could not open Settings (no window handle available).")
+            blit_hover_overlays()
+            return
+        new_settings = prompt_viewer_settings_dialog(parent_window, viewer_settings)
+        if new_settings is not None:
+            apply_viewer_settings(new_settings)
+
+    settings_button.on_clicked(on_settings_button_clicked)
+
     radio_ax = fig.add_axes([SIDEBAR_LEFT, 0.80, SIDEBAR_WIDTH, 0.16])
     radio_ax.set_xlim(0, 1)
     radio_ax.set_ylim(0, 1)
@@ -12818,13 +13066,6 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     # swatch/label matches the actual (brighter) blue multi_gene_rgb uses
     # on screen.
     MULTI_GENE_CHANNEL_COLORS = ('red', 'green', MULTI_GENE_BRIGHT_BLUE, 'red', 'green', MULTI_GENE_BRIGHT_BLUE)
-    # Legend swatch size per gene slot — full-size circle for genes 1-3 (the
-    # base layer), a smaller one (matching MULTI_GENE_PLUS_SIZE_DIAMETER_
-    # MULTIPLIER, squared since this scales an area) for genes 4-6 (the
-    # small overlay dot drawn on top of it in redraw_multi_genes) — so the
-    # legend swatch size reads as which layer each gene actually shows up
-    # in on screen.
-    MULTI_GENE_CHANNEL_SWATCH_SCALE = (1.0, 1.0, 1.0) + (MULTI_GENE_PLUS_SIZE_DIAMETER_MULTIPLIER ** 2,) * 3
 
     def draw_multi_gene_legend(genes, vmins, vmaxes):
         """The multi-gene mode's own legend, into the same cbar_ax slot a
@@ -12854,10 +13095,13 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         n = len(genes)
         row_h = 0.14
         top_y = 0.5 + n * row_h / 2  # centers the n-row block in the strip
-        for i, (gene, color, swatch_scale, vmin, vmax) in enumerate(
-                zip(genes, MULTI_GENE_CHANNEL_COLORS, MULTI_GENE_CHANNEL_SWATCH_SCALE, vmins, vmaxes)):
+        plus_shape = GENE456_SHAPE_REGISTRY.get(
+            viewer_settings['gene456_shape'], GENE456_SHAPE_REGISTRY[GENE456_SHAPE_DEFAULT])
+        for i, (gene, color, vmin, vmax) in enumerate(zip(genes, MULTI_GENE_CHANNEL_COLORS, vmins, vmaxes)):
             y = top_y - (i + 0.5) * row_h
-            cbar_ax.scatter([SWATCH_X], [y], s=legend_fontsize * 4 * swatch_scale, marker='o', c=color,
+            swatch_marker = 'o' if i < 3 else plus_shape['marker']
+            swatch_scale = 1.0 if i < 3 else plus_shape['size_multiplier'] ** 2
+            cbar_ax.scatter([SWATCH_X], [y], s=legend_fontsize * 4 * swatch_scale, marker=swatch_marker, c=color,
                              linewidths=0, clip_on=False)
             cbar_ax.text(TEXT_X, y, gene, fontsize=legend_fontsize, va='center', ha='left', color=color)
             cbar_ax.text(TEXT_X, y - row_h * 0.42, f'log2: {vmin:.1f}–{vmax:.1f}',
@@ -13965,13 +14209,15 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             plus_order = np.argsort(plus_intensity[visible])
             visible_idx = np.flatnonzero(visible)[plus_order]
             plus_rgb = multi_gene_rgb([n[visible_idx] for n in plus_norms], MULTI_GENE_LOW_EXPRESSION_COLOR)
+            plus_shape = GENE456_SHAPE_REGISTRY.get(
+                viewer_settings['gene456_shape'], GENE456_SHAPE_REGISTRY[GENE456_SHAPE_DEFAULT])
             plus_scatter = ax.scatter(
                 coords[visible_idx, 0], coords[visible_idx, 1], c=plus_rgb,
-                marker='o', s=UMAP_POINT_SIZE, alpha=1.0,
+                marker=plus_shape['marker'], s=UMAP_POINT_SIZE, alpha=1.0,
                 linewidths=0, zorder=MULTI_GENE_PLUS_ZORDER,
             )
             main_artists.append(plus_scatter)
-            main_size_multipliers.append(MULTI_GENE_PLUS_SIZE_DIAMETER_MULTIPLIER ** 2)
+            main_size_multipliers.append(plus_shape['size_multiplier'] ** 2)
 
         set_main_scatter_artists(main_artists, size_multipliers=main_size_multipliers)
         set_section_colors_multi_gene(
