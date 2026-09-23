@@ -9462,6 +9462,57 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             print(f"[zoom-filter] sections ratio={section_zoom_ratio['value']:.2f}x  "
                   f"cells: {total_full} -> {total_shown} across {len(section_panels)} panel(s)")
 
+    def restore_full_main_scatter():
+        """Inverse of filter_main_scatter_to_viewport: resets every UMAP
+        scatter artist back to its complete, unfiltered offsets/colors.
+        Called when settling *below* ZOOM_BITMAP_ONLY_MAX_MULTIPLIER (see
+        end_zoom_previews), so the live artist stays self-consistent even
+        if something later forces a real draw of this axes without an
+        intervening real redraw — see restore_full_section_scatters' own
+        docstring for why that matters despite the artist being hidden."""
+        for artist, full in zip(main_scatter_state['artists'], main_scatter_state['full']):
+            if len(full['offsets']) == 0:
+                continue
+            artist.set_offsets(full['offsets'])
+            if full['array'] is not None:
+                artist.set_array(full['array'])
+            else:
+                if len(full['facecolors']) == len(full['offsets']):
+                    artist.set_facecolors(full['facecolors'])
+                if len(full['edgecolors']) == len(full['offsets']):
+                    artist.set_edgecolors(full['edgecolors'])
+
+    def restore_full_section_scatters():
+        """Inverse of filter_all_section_scatters_to_viewport: resets every
+        panel's background_artist back to its complete, unfiltered point
+        set and, where a cached home-view image exists, shows that instead
+        and keeps background_artist hidden.
+
+        Called when settling *below* ZOOM_BITMAP_ONLY_MAX_MULTIPLIER (see
+        end_zoom_previews) — without this, teardown_zoom_previews()'s own
+        blind restore-to-pre-burst-visibility could leave background_
+        artist visible with its data still filtered down to whatever small
+        viewport was on screen the *last* time the zoom crossed *above*
+        threshold (from an earlier, unrelated zoom-in), while cached_home_
+        image stays hidden. That looks fine on screen only by coincidence,
+        via blit_bg's cached pixel snapshot — any later real draw of this
+        axes' live artists (not just a blit-restore), e.g. the *next* zoom
+        burst's own snapshot_axes_region() call, renders straight from
+        that broken state instead: a small correct inset (the stale
+        leftover points) surrounded by black, exactly the "zoom in then
+        out and the background goes black" bug this fixes."""
+        for panel in section_panels.values():
+            full_offsets = panel['full_offsets']
+            if full_offsets is None:
+                continue
+            panel['background_artist'].set_offsets(full_offsets)
+            panel['background_artist'].set_facecolor(panel['full_colors'])
+            if panel['cached_home_image'] is not None:
+                panel['cached_home_image'].set_visible(True)
+                panel['background_artist'].set_visible(False)
+            else:
+                panel['background_artist'].set_visible(True)
+
     def category_of_point_from_mapping(per_cell_keys, color_by_key):
         """(category_of_point, rank_color): category_of_point gives every
         cell (in coords' own row order — per_cell_keys must be too) the
@@ -10591,6 +10642,14 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             # never leaves it set.
             blit_bg['data'] = fig.canvas.copy_from_bbox(fig.bbox)
             teardown_zoom_previews()
+            # See restore_full_main_scatter's own docstring: without this,
+            # a stale, small-viewport-filtered main scatter (left behind by
+            # an earlier >threshold crossing, then wrongly restored visible
+            # by teardown_zoom_previews' own blind pre-burst-state restore)
+            # would only look correct by coincidence, via blit_bg's cached
+            # pixels — broken the next time anything forces a real draw of
+            # this axes' live artists.
+            restore_full_main_scatter()
             if ZOOM_DEBUG_DIAGNOSTICS:
                 print(f"[zoom-settle] umap<=threshold (bitmap-only) in {time.perf_counter() - _settle_t0:.3f}s")
             return
@@ -10638,6 +10697,16 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             # don't go dead for the whole time zoom stays under threshold).
             blit_bg['data'] = fig.canvas.copy_from_bbox(fig.bbox)
             teardown_zoom_previews()
+            # See restore_full_section_scatters' own docstring — this is
+            # the actual fix for "zoom a section panel in, then back out,
+            # and the background goes black except for a small correct
+            # inset": without it, a panel left visible with stale, small-
+            # viewport-filtered data (and its cached_home_image wrongly
+            # still hidden) only looked correct by coincidence, via blit_
+            # bg's cached pixels, until the next zoom burst's own snapshot_
+            # axes_region() forced a fresh render straight from that
+            # broken live-artist state.
+            restore_full_section_scatters()
             if ZOOM_DEBUG_DIAGNOSTICS:
                 print(f"[zoom-settle] panel<=threshold (bitmap-only) in {time.perf_counter() - _settle_t0:.3f}s")
             return
