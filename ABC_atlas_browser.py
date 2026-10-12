@@ -84,7 +84,8 @@ _make_windows_dpi_aware()
 
 
 # Checked before the imports below, at every launch. Import name -> pip
-# package spec (they differ for some).
+# package spec (they differ for some). Specs are plain argv strings, not
+# shell-quoted; _display_spec adds quotes where a user would need them.
 REQUIRED_LIBRARIES = {
     'numpy': 'numpy',
     'pandas': 'pandas',
@@ -92,34 +93,123 @@ REQUIRED_LIBRARIES = {
     'PIL': 'pillow',
     'anndata': 'anndata',
     'scanpy': 'scanpy',
-    'abc_atlas_access': '"abc_atlas_access[notebooks] @ git+https://github.com/alleninstitute/abc_atlas_access.git"',
+    'abc_atlas_access': 'abc_atlas_access[notebooks] @ git+https://github.com/alleninstitute/abc_atlas_access.git',
 }
 # The app runs without these; only the named feature is unavailable.
+# Import name -> (pip spec, what it's needed for).
 OPTIONAL_LIBRARIES = {
     'igraph': ('igraph', 'Leiden clustering of new UMAP runs'),
+    'pyarrow': ('pyarrow', 'Parquet file support'),
 }
+# Install anything missing automatically (into the interpreter running this
+# script) instead of just listing the commands and quitting. Set False to get
+# the old list-the-commands-and-quit behavior.
+AUTO_INSTALL_LIBRARIES = True
 
 
-def check_libraries_or_exit():
-    """Look for every library this script needs, without importing them
-    (importlib.util.find_spec only locates them, so this costs milliseconds).
-    Missing required libraries: show the install commands and quit, since the
-    imports below would fail anyway. Missing optional ones only: ask whether
-    to continue. Commands are plain pip; we can't tell whether the user runs
-    conda or a base Python, so the message says to run them in whichever
-    environment launches this script, and names that interpreter. Everything
-    is also printed to the console, where it can be copied."""
-    def is_missing(name):
+def _display_spec(spec):
+    """A pip spec as it should be typed in a shell: quoted if it has spaces."""
+    return f'"{spec}"' if ' ' in spec else spec
+
+
+def _is_missing_library(name):
+    try:
+        return importlib.util.find_spec(name) is None
+    except (ImportError, ValueError):
+        return True
+
+
+def _install_libraries(specs):
+    """pip-install each spec, one pip call apiece (so one failure doesn't
+    block the rest), into the interpreter running this script. Output goes to
+    the console and, when Tk is available, a small progress window. pip runs
+    in a subprocess whose output a reader thread drains into a queue, so the
+    window keeps repainting even during pip's long quiet stretches (building
+    wheels, resolving dependencies). Returns [(spec, error_tail), ...] for
+    the ones that failed."""
+    import queue
+    ui = None
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+        root.title("Installing Python libraries")
+        root.attributes('-topmost', True)
+        root.protocol("WM_DELETE_WINDOW", lambda: None)  # closing mid-pip would only hide progress
+        label = tk.Label(root, text="", justify='left', anchor='w', width=80, padx=12, pady=12)
+        label.pack()
+        root.update()
+        ui = (root, label)
+    except Exception:
+        ui = None
+
+    def show(text):
+        nonlocal ui
+        if ui is None:
+            return
         try:
-            return importlib.util.find_spec(name) is None
-        except (ImportError, ValueError):
-            return True
+            ui[1].config(text=text)
+            ui[0].update()
+        except Exception:
+            ui = None  # window gone; carry on with console output only
 
-    missing_required = [name for name in REQUIRED_LIBRARIES if is_missing(name)]
-    missing_optional = [name for name in OPTIONAL_LIBRARIES if is_missing(name)]
-    if not missing_required and not missing_optional:
-        return
+    failures = []
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+    for i, spec in enumerate(specs, 1):
+        header = f"Installing {_display_spec(spec)} ({i} of {len(specs)})..."
+        print(header)
+        show(header + "\n\nThis can take a few minutes; the console shows pip's full output.")
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, '-m', 'pip', 'install', spec],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                creationflags=creationflags,
+            )
+        except OSError as e:
+            failures.append((spec, str(e)))
+            continue
+        lines = queue.Queue()
 
+        def drain(stream=proc.stdout, out=lines):
+            for line in stream:
+                out.put(line)
+            out.put(None)  # end-of-output sentinel
+
+        threading.Thread(target=drain, daemon=True).start()
+        tail = []
+        while True:
+            try:
+                line = lines.get(timeout=0.1)
+            except queue.Empty:
+                line = ''
+            if line is None:
+                break
+            if line:
+                print(line, end='')
+                tail.append(line.rstrip())
+            # Repainted on every pass, including empty ones, so the window
+            # stays responsive during pip's quiet stretches.
+            show(header + ("\n\n" + tail[-1][:100] if tail else ""))
+        if proc.wait() != 0:
+            failures.append((spec, "\n".join(tail[-8:])))
+    if ui is not None:
+        try:
+            ui[0].destroy()
+        except Exception:
+            pass
+    importlib.invalidate_caches()  # so find_spec/import see what pip just wrote
+    return failures
+
+
+def _ask_install_choice(missing_required, missing_optional):
+    """Tell the user what's missing and ask what to do, before touching
+    anything: 'install' (pip-install it into this interpreter), 'skip'
+    (continue without; offered only when nothing *required* is missing), or
+    'quit'. Exists because the usual cause of a missing library is launching
+    from the wrong Python environment by mistake, in which case the right
+    move is to quit and relaunch from the correct one, not to build a second
+    working environment — so the interpreter in use is named up front. Closing
+    the window counts as quit. Falls back to the console when Tk isn't
+    available."""
     lines = []
     if missing_required:
         lines += ["These required Python libraries are not installed:", ""]
@@ -129,8 +219,105 @@ def check_libraries_or_exit():
         lines += ["These optional Python libraries are not installed:", ""]
         lines += [f"    {name} (needed for {OPTIONAL_LIBRARIES[name][1]})" for name in missing_optional]
         lines += [""]
+    lines += ["This app is running from this Python:", f"    {sys.executable}", "",
+              "If that's the wrong environment, choose Quit and relaunch from the",
+              "right one. Otherwise Install will pip-install the missing libraries",
+              "into this Python."]
+    message = "\n".join(lines)
+    print("\n" + message + "\n")
+
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+        root.title("Missing Python libraries")
+        root.attributes('-topmost', True)
+        result = {'choice': 'quit'}  # closing the window == quit
+
+        def choose(choice):
+            result['choice'] = choice
+            root.destroy()
+
+        tk.Label(root, text=message, justify='left', anchor='w', padx=14, pady=12).pack()
+        buttons = tk.Frame(root)
+        buttons.pack(pady=(0, 12))
+        tk.Button(buttons, text="Install", width=14, command=lambda: choose('install')).pack(side='left', padx=6)
+        if not missing_required:
+            tk.Button(buttons, text="Continue without", width=14,
+                      command=lambda: choose('skip')).pack(side='left', padx=6)
+        tk.Button(buttons, text="Quit", width=14, command=lambda: choose('quit')).pack(side='left', padx=6)
+        root.protocol("WM_DELETE_WINDOW", lambda: choose('quit'))
+        root.mainloop()
+        return result['choice']
+    except Exception:
+        # No GUI available: fall back to the console.
+        options = "[i]nstall / [c]ontinue without / [q]uit" if not missing_required else "[i]nstall / [q]uit"
+        try:
+            answer = input(f"{options}: ").strip().lower()
+        except EOFError:
+            return 'quit'
+        if answer in ('i', 'install'):
+            return 'install'
+        if answer in ('c', 'continue') and not missing_required:
+            return 'skip'
+        return 'quit'
+
+
+def check_libraries_or_exit():
+    """Look for every library this script needs, without importing them
+    (importlib.util.find_spec only locates them, so this costs milliseconds).
+    Anything missing, required or optional, is reported in a dialog that
+    offers to pip-install it automatically (AUTO_INSTALL_LIBRARIES) or quit
+    (or, if only optional ones are missing, continue without) — see
+    _ask_install_choice. If installing fails: missing required libraries show
+    the manual install commands and quit, since the imports below would fail
+    anyway; missing optional ones only ask whether to continue. Manual
+    commands are plain pip; we can't tell whether the user runs conda or a
+    base Python, so the message says to run them in whichever environment
+    launches this script, and names that interpreter. Everything is also
+    printed to the console, where it can be copied."""
+    missing_required = [name for name in REQUIRED_LIBRARIES if _is_missing_library(name)]
+    missing_optional = [name for name in OPTIONAL_LIBRARIES if _is_missing_library(name)]
+    if not missing_required and not missing_optional:
+        return
+
+    failures = []
+    if AUTO_INSTALL_LIBRARIES:
+        choice = _ask_install_choice(missing_required, missing_optional)
+        if choice == 'quit':
+            sys.exit(1)
+        if choice == 'skip':
+            return
+        specs = ([REQUIRED_LIBRARIES[name] for name in missing_required]
+                 + [OPTIONAL_LIBRARIES[name][0] for name in missing_optional])
+        print("Installing missing Python libraries into:", sys.executable)
+        failures = _install_libraries(specs)
+        # Re-check rather than trusting pip's exit codes alone: a package can
+        # install fine yet still not be importable under the name we expect.
+        missing_required = [name for name in REQUIRED_LIBRARIES if _is_missing_library(name)]
+        missing_optional = [name for name in OPTIONAL_LIBRARIES if _is_missing_library(name)]
+        if not missing_required and not missing_optional:
+            return
+
+    lines = []
+    if AUTO_INSTALL_LIBRARIES:
+        lines += ["Automatic installation did not succeed for everything.", ""]
+        for spec, error_tail in failures:
+            lines += [f"pip install {_display_spec(spec)} failed:"]
+            lines += [f"    {row}" for row in error_tail.splitlines()[-4:]]
+            lines += [""]
+        if any('git+' in spec for spec, _ in failures) and shutil.which('git') is None:
+            lines += ["abc_atlas_access installs from GitHub and needs git, which was not found",
+                      "on PATH. Install git (https://git-scm.com), then relaunch.", ""]
+    if missing_required:
+        lines += ["These required Python libraries are not installed:", ""]
+        lines += [f"    {name}" for name in missing_required]
+        lines += [""]
+    if missing_optional:
+        lines += ["These optional Python libraries are not installed:", ""]
+        lines += [f"    {name} (needed for {OPTIONAL_LIBRARIES[name][1]})" for name in missing_optional]
+        lines += [""]
     lines += ["Install them with:", ""]
-    lines += [f"    python -m pip install {REQUIRED_LIBRARIES[name]}" for name in missing_required]
+    lines += [f"    python -m pip install {_display_spec(REQUIRED_LIBRARIES[name])}" for name in missing_required]
     lines += [f"    python -m pip install {OPTIONAL_LIBRARIES[name][0]}" for name in missing_optional]
     lines += ["", "Run these in the same Python environment you use to launch this app",
               "(e.g. after 'conda activate <env>' if you use conda). This app is running from:",
@@ -1390,6 +1577,44 @@ def set_wait_cursor_on_open_figures():
     return restore
 
 
+LOAD_TIMINGS_FILE = CACHE_DIR / 'load_timings.json'
+
+
+def load_recorded_duration(key):
+    """Seconds the last successful run of the named load took on this
+    machine, or None. Lets a load whose progress can't be measured (opening
+    a huge h5ad reads all of obs with no hook to report on) show an
+    estimated bar instead of an empty one."""
+    try:
+        return float(json.loads(LOAD_TIMINGS_FILE.read_text(encoding='utf-8')).get(key))
+    except Exception:
+        return None
+
+
+def record_load_duration(key, seconds):
+    try:
+        try:
+            timings = json.loads(LOAD_TIMINGS_FILE.read_text(encoding='utf-8'))
+        except Exception:
+            timings = {}
+        timings[key] = round(seconds, 2)
+        LOAD_TIMINGS_FILE.write_text(json.dumps(timings, indent=2), encoding='utf-8')
+    except Exception:
+        pass  # a missing estimate next time isn't worth failing a load over
+
+
+def imputed_file_attributes(abc_cache):
+    """(expected_size_bytes, local_path) for the imputed dataset, from the
+    cache manifest (same private-API reach as is_data_file_cached, for the
+    same reason), or (None, None) if it can't be determined."""
+    try:
+        attrs = abc_cache.cache._manifest.get_file_attributes(
+            directory=IMPUTED_DATASET_DIRECTORY, file_name=IMPUTED_DATASET_FILE_NAME)
+        return int(attrs.file_size), Path(attrs.local_path)
+    except Exception:
+        return None, None
+
+
 def ensure_imputed_gene_dataset_loaded(imputed_state, abc_cache):
     """Loads the imputed gene dataset into imputed_state['adata'] if it
     isn't already (or already in flight). Warns the user first that this
@@ -1462,10 +1687,58 @@ def ensure_imputed_gene_dataset_loaded(imputed_state, abc_cache):
         "Loading imputed gene dataset (first use this session; this can take a while)..."
     )
     try:
-        set_progress(None)  # indeterminate — no fine-grained progress available for this load
+        # What can be measured, and what can't:
+        #  - Download (first use only): the file grows on disk as it
+        #    arrives (abc_atlas_access writes it in place), so bytes on disk
+        #    over the manifest's size is a real fraction.
+        #  - Everything after that (hash check of a fresh download, then
+        #    opening the file, which loads all of obs): no hook exists. If an
+        #    earlier open of an already-complete file was timed on this
+        #    machine, show an estimate from that, parked below 100% and
+        #    switching to the sweeping animation if it runs over; otherwise
+        #    just the animation. The animation moves without claiming any
+        #    amount of progress, which an empty bar did not.
+        expected_bytes, local_path = imputed_file_attributes(abc_cache)
+        loop_started = time.perf_counter()
+        open_phase_started = None
+        opened_from_complete_file = None  # was the file already whole when we started waiting?
+        pulse = 0.0
+        set_progress(0.0)
         while thread.is_alive() and not cancel_flag['cancelled']:
+            elapsed = time.perf_counter() - loop_started
+            try:
+                size = local_path.stat().st_size if local_path is not None else None
+            except OSError:
+                size = 0
+            if expected_bytes and size is not None and size < expected_bytes:
+                if opened_from_complete_file is None:
+                    opened_from_complete_file = False
+                proc_fig._set_status(
+                    f"Downloading: {size / 1e9:.1f} of {expected_bytes / 1e9:.1f} GB  ({elapsed:.0f} s)")
+                set_progress(size / expected_bytes)
+            else:
+                if open_phase_started is None:
+                    open_phase_started = time.perf_counter()
+                    if opened_from_complete_file is None:
+                        opened_from_complete_file = True
+                phase_elapsed = time.perf_counter() - open_phase_started
+                estimate = load_recorded_duration('imputed_open_s') if opened_from_complete_file else None
+                what = "Opening dataset" if opened_from_complete_file else "Verifying download and opening"
+                if estimate and phase_elapsed < estimate:
+                    proc_fig._set_status(f"{what}…  ({phase_elapsed:.0f} s, about {estimate:.0f} s expected)")
+                    set_progress(min(0.95, phase_elapsed / estimate))
+                else:
+                    proc_fig._set_status(f"{what}…  ({phase_elapsed:.0f} s)")
+                    pulse += 0.04
+                    proc_fig._set_pulse(pulse)
             proc_fig.canvas.flush_events()
             time.sleep(0.05)
+        # Timed only when the file was already complete on arrival: after a
+        # fresh download this phase also includes hashing the whole file,
+        # which would make every later estimate wildly pessimistic.
+        if (open_phase_started is not None and opened_from_complete_file
+                and imputed_state['adata'] is not None and not cancel_flag['cancelled']):
+            record_load_duration('imputed_open_s', time.perf_counter() - open_phase_started)
     finally:
         plt.close(proc_fig)
         restore_cursors()
@@ -2506,6 +2779,10 @@ def show_processing_dialog(message):
     actually register, and is responsible for calling plt.close(fig) when
     the work finishes or is cancelled.
 
+    Also attaches fig._set_pulse(position) (a sweeping "still working"
+    block for unmeasurable work) and fig._set_status(text) (a line under the
+    bar) for callers that want them.
+
     Returns (fig, cancel_flag, set_progress): cancel_flag['cancelled']
     becomes True once Cancel is clicked; set_progress(fraction) fills the
     bar to `fraction` (0.0-1.0, clamped) — call it from the same place
@@ -2525,7 +2802,8 @@ def show_processing_dialog(message):
     lines = [wrapped for paragraph in message.split('\n')
              for wrapped in (textwrap.wrap(paragraph, chars_per_line) or [''])]
     button_bottom_in, button_h_in = 0.15, 0.45
-    bar_bottom_in, bar_h_in = button_bottom_in + button_h_in + 0.3, 0.26
+    status_h_in = 0.3  # one line between the Cancel button and the bar, see set_status below
+    bar_bottom_in, bar_h_in = button_bottom_in + button_h_in + status_h_in, 0.26
     text_bottom_in = bar_bottom_in + bar_h_in + 0.2
     fig_h_in = text_bottom_in + len(lines) * line_h_in + 0.25
 
@@ -2545,7 +2823,32 @@ def show_processing_dialog(message):
     progress_ax.add_patch(progress_fill)
 
     def set_progress(fraction):
+        progress_fill.set_x(0.0)
         progress_fill.set_width(0.0 if fraction is None else max(0.0, min(1.0, fraction)))
+        fig.canvas.draw_idle()
+
+    def set_pulse(position):
+        """Indeterminate "still working" animation, for work whose progress
+        can't be measured: a short block sweeping back and forth along the
+        bar. `position` increases without bound (call it with a steadily
+        growing number); each +2 is one full there-and-back sweep. Unlike
+        set_progress(None) (an empty bar, which reads as stuck), this
+        visibly moves without claiming any amount of completion."""
+        block = 0.25
+        along = 1.0 - abs((position % 2.0) - 1.0)  # triangle wave, 0 -> 1 -> 0
+        progress_fill.set_x(along * (1.0 - block))
+        progress_fill.set_width(block)
+        fig.canvas.draw_idle()
+
+    status_text = ax.text(0.5, (button_bottom_in + button_h_in + status_h_in / 2) / fig_h_in, '',
+                          ha='center', va='center', fontsize=UI_BUTTON_FONTSIZE * 0.8, color='0.3',
+                          transform=fig.transFigure)
+
+    def set_status(text):
+        """Short one-line detail under the bar (e.g. "Downloading: 3.2 of
+        50.2 GB"). Like set_progress, only updates the artist; the caller's
+        flush_events() loop does the repaint."""
+        status_text.set_text(text)
         fig.canvas.draw_idle()
 
     cancel_flag = {'cancelled': False}
@@ -2561,6 +2864,10 @@ def show_processing_dialog(message):
     # this same bug elsewhere in this file) by hanging it off the figure,
     # which the caller holds a reference to until it closes it.
     fig._cancel_button_ref = cancel_button
+    # Extras beyond the (fig, cancel_flag, set_progress) return contract that
+    # every existing caller unpacks; reached only by callers that want them.
+    fig._set_pulse = set_pulse
+    fig._set_status = set_status
 
     fig.canvas.manager.set_window_title("Processing")
     center_figure_window(fig)
@@ -2569,6 +2876,76 @@ def show_processing_dialog(message):
     fig.canvas.draw_idle()
     fig.canvas.flush_events()
     return fig, cancel_flag, set_progress
+
+
+def run_with_loading_window(message, work, show_after_s=0.4):
+    """Run `work()` on a background thread and return its result (re-raising
+    anything it raised), showing a small "loading" window if it takes longer
+    than `show_after_s`. Exists because a few steps between a click and the
+    next window appearing are long blocking reads (opening the 7+ GB raw h5ad
+    loads all ~4.3 M rows of obs even in backed mode; cold off disk that is
+    many seconds), during which the previous window is already gone and
+    nothing else is on screen — so the app looks hung when it isn't.
+
+    The window is only created after `show_after_s`, so a fast (already
+    cached) step doesn't flash a window open and shut. It shows `message`, an
+    indeterminate bar, and elapsed seconds, repainted by this thread's own
+    polling loop (Tk stays on the main thread; only `work` runs elsewhere —
+    work must not touch any GUI object). No Cancel button: a blocking file
+    read can't be interrupted, and a button that did nothing would be worse
+    than none. If Tk isn't available it just waits, printing the message."""
+    outcome = {}
+
+    def runner():
+        try:
+            outcome['value'] = work()
+        except BaseException as e:  # re-raised on the calling thread below
+            outcome['error'] = e
+
+    print(message)
+    thread = threading.Thread(target=runner, daemon=True)
+    started = time.perf_counter()
+    thread.start()
+
+    ui = None
+    while thread.is_alive():
+        elapsed = time.perf_counter() - started
+        if ui is None and elapsed >= show_after_s:
+            try:
+                import tkinter as tk
+                from tkinter import ttk
+                root = tk.Tk()
+                root.title("Loading")
+                root.attributes('-topmost', True)
+                root.protocol("WM_DELETE_WINDOW", lambda: None)  # nothing to cancel; ignore close
+                tk.Label(root, text=message, justify='left', padx=18, pady=(14), wraplength=460).pack()
+                bar = ttk.Progressbar(root, mode='indeterminate', length=420)
+                bar.pack(padx=18)
+                bar.start(12)
+                elapsed_label = tk.Label(root, text="", fg='gray35', pady=10)
+                elapsed_label.pack()
+                root.update_idletasks()
+                w, h = root.winfo_reqwidth(), root.winfo_reqheight()
+                root.geometry(f"+{(root.winfo_screenwidth() - w) // 2}+{(root.winfo_screenheight() - h) // 3}")
+                ui = (root, elapsed_label)
+            except Exception:
+                ui = False  # no usable Tk; just wait
+        if ui:
+            try:
+                ui[1].config(text=f"{int(elapsed)} s")
+                ui[0].update()
+            except Exception:
+                ui = False
+        time.sleep(0.03)
+    thread.join()
+    if ui:
+        try:
+            ui[0].destroy()
+        except Exception:
+            pass
+    if 'error' in outcome:
+        raise outcome['error']
+    return outcome.get('value')
 
 
 def map_data_to_pixel(section_layout, x, y):
@@ -3592,7 +3969,302 @@ def prompt_deg_comparison_mode(parent_window, title, level_name):
     return result['value']
 
 
-def prompt_viewer_settings_dialog(parent_window, current_settings):
+# ---------------------------------------------------------------------------
+# UMAP parameter variants
+# ---------------------------------------------------------------------------
+# The embedding a run was first computed with (Step 6) uses scanpy's usual
+# parameters. The viewer's Settings dialog can recompute it with different
+# ones to compare how they change the picture; each (n_neighbors, min_dist,
+# n_pcs) combination is cached in the run folder under a name that carries
+# the parameters, so trying a combination a second time is instant.
+UMAP_PARAM_DEFAULTS = {'n_neighbors': 15, 'min_dist': 0.5, 'n_pcs': 50}
+UMAP_PARAM_MAX_PCS = 100         # Step 6 stores 50; a variant asking for more recomputes PCA (see principal_components_for_variant)
+UMAP_PARAMS_FILE_NAME = 'umap_params.json'
+UMAP_VARIANT_ESTIMATE_KEY = 'umap_variant_s'
+UMAP_VARIANT_METADATA_COLS = ('class', 'subclass', 'supertype', 'cluster', SECTION_COL)
+
+
+def normalize_umap_params(params):
+    """`params` as {'n_neighbors': int, 'min_dist': float, 'n_pcs': int},
+    with any missing key taken from UMAP_PARAM_DEFAULTS."""
+    merged = dict(UMAP_PARAM_DEFAULTS)
+    merged.update({k: v for k, v in dict(params).items() if k in merged})
+    return {'n_neighbors': int(merged['n_neighbors']), 'min_dist': float(merged['min_dist']),
+            'n_pcs': int(merged['n_pcs'])}
+
+
+def umap_params_key(params):
+    p = normalize_umap_params(params)
+    return (p['n_neighbors'], round(p['min_dist'], 6), p['n_pcs'])
+
+
+def umap_params_are_default(params):
+    return umap_params_key(params) == umap_params_key(UMAP_PARAM_DEFAULTS)
+
+
+def umap_params_token(params):
+    """Filename-safe tag for a parameter set ('nn15_md0.5_pc50'); empty for
+    the defaults, so everything made with the default embedding keeps the
+    names it always had."""
+    if umap_params_are_default(params):
+        return ''
+    p = normalize_umap_params(params)
+    return f"nn{p['n_neighbors']}_md{p['min_dist']:g}_pc{p['n_pcs']}"
+
+
+def umap_params_label(params):
+    p = normalize_umap_params(params)
+    return f"n_neighbors={p['n_neighbors']}, min_dist={p['min_dist']:g}, n_pcs={p['n_pcs']}"
+
+
+def umap_variant_csv_path(run_folder, params):
+    """Where the embedding for `params` lives: the run's own umap_coords.csv
+    for the defaults, umap_coords_<token>.csv otherwise."""
+    token = umap_params_token(params)
+    name = 'umap_coords.csv' if not token else f'umap_coords_{token}.csv'
+    return Path(run_folder) / name
+
+
+def parse_umap_params(n_neighbors, min_dist, n_pcs, n_cells=None):
+    """Validates the Settings dialog's three text fields. Returns
+    (params, None) or (None, message for the user)."""
+    try:
+        nn = int(str(n_neighbors).strip())
+    except ValueError:
+        return None, "Neighbors (n_neighbors) must be a whole number."
+    try:
+        md = float(str(min_dist).strip())
+    except ValueError:
+        return None, "min_dist must be a number between 0 and 1."
+    try:
+        pcs = int(str(n_pcs).strip())
+    except ValueError:
+        return None, "n_pcs must be a whole number."
+    nn_max = max(2, (n_cells - 1)) if n_cells else None
+    if nn < 2 or (nn_max is not None and nn > nn_max):
+        return None, f"n_neighbors must be between 2 and {nn_max if nn_max else 'the number of cells'}."
+    if not (0.0 <= md <= 1.0):
+        return None, "min_dist must be between 0 and 1."
+    if not (2 <= pcs <= UMAP_PARAM_MAX_PCS):
+        return None, f"n_pcs must be between 2 and {UMAP_PARAM_MAX_PCS}."
+    return {'n_neighbors': nn, 'min_dist': md, 'n_pcs': pcs}, None
+
+
+def read_last_umap_params(run_folder):
+    """The parameters the run was last viewed with (UMAP_PARAMS_FILE_NAME in
+    the run folder); the defaults when absent or unreadable."""
+    try:
+        data = json.loads((Path(run_folder) / UMAP_PARAMS_FILE_NAME).read_text(encoding='utf-8'))
+        return normalize_umap_params(data)
+    except Exception:
+        return dict(UMAP_PARAM_DEFAULTS)
+
+
+def write_last_umap_params(run_folder, params):
+    try:
+        (Path(run_folder) / UMAP_PARAMS_FILE_NAME).write_text(
+            json.dumps(normalize_umap_params(params), indent=2), encoding='utf-8')
+    except Exception as e:
+        print(f"Warning: could not save the UMAP parameters to {run_folder} ({e}).")
+
+
+def load_umap_variant(csv_path, obs_names):
+    """(embedding as an (n, 2) float array, Leiden labels or None) from a
+    variant CSV, aligned to `obs_names`."""
+    table = pd.read_csv(csv_path, index_col=0, converters={0: str})
+    table = table.reindex(list(obs_names))
+    if table['UMAP1'].isna().any() or table['UMAP2'].isna().any():
+        raise RuntimeError(f"{csv_path} does not cover every cell in this run.")
+    leiden = leiden_labels_from_csv(table[LEIDEN_KEY]) if LEIDEN_KEY in table.columns else None
+    return table[['UMAP1', 'UMAP2']].to_numpy(dtype=float), leiden
+
+
+def principal_components_for_variant(adata, run_folder, n_pcs, report=None):
+    """The run's PCA coordinates (cells x >= n_pcs). Normally just the
+    X_pca Step 6 stored in the processed AnnData. A run rebuilt from its CSV
+    has none, so it is recomputed by replaying Step 5/6 on layers['counts']
+    (the same recipe, so the result matches what the run would have had) and
+    saved as pca.npy in the run folder for next time."""
+    import anndata
+    import scanpy as sc
+    if 'X_pca' in adata.obsm and adata.obsm['X_pca'].shape[1] >= n_pcs:
+        return np.asarray(adata.obsm['X_pca'])
+    pca_path = Path(run_folder) / 'pca.npy' if run_folder is not None else None
+    if pca_path is not None and pca_path.exists():
+        saved = np.load(pca_path)
+        if saved.shape[0] == adata.n_obs and saved.shape[1] >= n_pcs:
+            return saved
+    if 'counts' not in adata.layers:
+        raise RuntimeError("This run has no PCA coordinates or raw counts to recompute them from.")
+    if report:
+        report("Computing principal components")
+    counts = adata.layers['counts']
+    work = anndata.AnnData(X=counts.copy(), obs=pd.DataFrame(index=adata.obs_names),
+                           var=pd.DataFrame(index=adata.var_names))
+    from scipy.sparse import issparse
+    if issparse(work.X):
+        work.X.data = np.nan_to_num(work.X.data, nan=0.0)
+    else:
+        work.X = np.nan_to_num(work.X, nan=0.0)
+    sc.pp.filter_genes(work, min_cells=5)
+    sc.pp.normalize_total(work)
+    sc.pp.log1p(work)
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', message='zero-centering a sparse array/matrix densifies it',
+                                category=UserWarning)
+        sc.pp.scale(work, max_value=10)
+    sc.tl.pca(work, n_comps=min(UMAP_PARAM_MAX_PCS, work.n_vars - 1, work.n_obs - 1), svd_solver='arpack')
+    pcs = np.asarray(work.obsm['X_pca'], dtype=np.float32)
+    if pca_path is not None:
+        try:
+            np.save(pca_path, pcs)
+        except Exception as e:
+            print(f"Warning: could not save {pca_path} ({e}).")
+    return pcs
+
+
+def compute_umap_variant_csv(adata, params, run_folder, report=None):
+    """Computes the embedding (and its Leiden clustering, which depends on
+    the neighbor graph) for `params` and writes the variant CSV. Returns a
+    message about Leiden if it could not be computed, else None. Safe to
+    run on a worker thread: touches no GUI state and never modifies
+    `adata`."""
+    import anndata
+    import scanpy as sc
+    report = report or (lambda text: None)
+    params = normalize_umap_params(params)
+    csv_path = umap_variant_csv_path(run_folder, params)
+    pcs = principal_components_for_variant(adata, run_folder, params['n_pcs'], report)
+    n_pcs = min(params['n_pcs'], pcs.shape[1])
+    # Only the PCs go into the working AnnData: the neighbor graph is built
+    # from X_pca alone, and this keeps the expression matrix out of it.
+    work = anndata.AnnData(np.zeros((adata.n_obs, 1), dtype=np.float32))
+    work.obs_names = adata.obs_names
+    work.obsm['X_pca'] = np.ascontiguousarray(pcs[:, :n_pcs])
+    report("Step 1 of 3: building the neighbor graph")
+    sc.pp.neighbors(work, n_neighbors=params['n_neighbors'], use_rep='X_pca')
+    report("Step 2 of 3: computing the UMAP embedding")
+    sc.tl.umap(work, min_dist=params['min_dist'])
+    report("Step 3 of 3: clustering (Leiden)")
+    leiden_problem = None
+    try:
+        sc.tl.leiden(work, key_added=LEIDEN_KEY, flavor='igraph', n_iterations=2,
+                     resolution=LEIDEN_RESOLUTION)
+    except Exception as e:
+        leiden_problem = str(e)
+
+    table = pd.DataFrame(work.obsm['X_umap'], index=adata.obs.index, columns=['UMAP1', 'UMAP2'])
+    for col in UMAP_VARIANT_METADATA_COLS:
+        if col in adata.obs.columns:
+            table[col] = adata.obs[col].values
+    if LEIDEN_KEY in work.obs.columns:
+        table[LEIDEN_KEY] = work.obs[LEIDEN_KEY].astype(str).values
+    tmp_path = csv_path.with_name(csv_path.name + '.tmp')
+    table.to_csv(tmp_path)
+    os.replace(tmp_path, csv_path)  # a half-written file is never mistaken for a cached variant
+    return leiden_problem
+
+
+_UMAP_VARIANT_JOBS = {}
+
+
+def ensure_umap_variant_csv(adata, params, run_folder):
+    """Makes sure the variant CSV for `params` exists, computing it behind a
+    progress window if it doesn't. Returns (csv_path or None, message): None
+    when the user cancelled or the computation failed. A cancelled
+    computation keeps running in the background and still lands in the
+    cache, so asking again shortly afterwards just finds the result."""
+    csv_path = umap_variant_csv_path(run_folder, params)
+    if csv_path.exists():
+        return csv_path, None
+    job = _UMAP_VARIANT_JOBS.get(csv_path)
+    if job is None or job['done']:
+        job = {'status': 'Starting', 'error': None, 'leiden_problem': None, 'done': False}
+
+        def worker():
+            try:
+                job['leiden_problem'] = compute_umap_variant_csv(
+                    adata, params, run_folder, lambda text: job.update(status=text))
+            except Exception as e:
+                job['error'] = e
+            finally:
+                job['done'] = True
+
+        _UMAP_VARIANT_JOBS[csv_path] = job
+        # pynndescent calls gc.collect() itself mid-computation. That would
+        # run on the worker thread, which must not be the one to free the
+        # leftover Tk objects of already-closed windows (Tkinter raises "main
+        # thread is not in main loop"), and the viewer keeps automatic gc off
+        # so such garbage is still waiting. Collected here, on the Tk thread,
+        # first.
+        gc_started = time.perf_counter()
+        gc.collect()
+        print(f"[umap-variant] pre-collected garbage on the main thread in "
+              f"{time.perf_counter() - gc_started:.2f} s.", flush=True)
+        threading.Thread(target=worker, daemon=True).start()
+
+    estimate_key = f"{UMAP_VARIANT_ESTIMATE_KEY}_{adata.n_obs}"
+    estimate = load_recorded_duration(estimate_key)
+    started = time.perf_counter()
+    restore_cursors = set_wait_cursor_on_open_figures()
+    proc_fig, cancel_flag, set_progress = show_processing_dialog(
+        f"Computing the UMAP with {umap_params_label(params)}.\n"
+        "The first calculation in a session takes longest; results are cached for next time.")
+    pulse = 0.0
+    try:
+        set_progress(0.0)
+        while not job['done'] and not cancel_flag['cancelled']:
+            elapsed = time.perf_counter() - started
+            if estimate and elapsed < estimate:
+                proc_fig._set_status(f"{job['status']}…  ({elapsed:.0f} s, about {estimate:.0f} s expected)")
+                set_progress(min(0.95, elapsed / estimate))
+            else:
+                proc_fig._set_status(f"{job['status']}…  ({elapsed:.0f} s)")
+                pulse += 0.04
+                proc_fig._set_pulse(pulse)
+            proc_fig.canvas.flush_events()
+            time.sleep(0.05)
+    finally:
+        plt.close(proc_fig)
+        restore_cursors()
+    if not job['done']:
+        return None, "UMAP recalculation cancelled (it will finish in the background and be cached)."
+    if job['error'] is not None:
+        return None, f"UMAP recalculation failed: {job['error']}"
+    record_load_duration(estimate_key, time.perf_counter() - started)
+    return csv_path, (f"Leiden clustering unavailable: {job['leiden_problem']}" if job['leiden_problem'] else None)
+
+
+_umap_warmup_started = False
+
+
+def start_umap_warmup():
+    """Runs a throwaway neighbors + UMAP on random data in a background
+    thread. numba/pynndescent compile their kernels on first use (~25-30 s,
+    once per process), which would otherwise land on the user's first
+    parameter change; paying it while they look at the freshly opened viewer
+    makes that first recalculation take about as long as later ones."""
+    global _umap_warmup_started
+    if _umap_warmup_started:
+        return
+    _umap_warmup_started = True
+
+    def warm():
+        try:
+            import anndata
+            import scanpy as sc
+            rng = np.random.default_rng(0)
+            tiny = anndata.AnnData(np.zeros((5000, 1), dtype=np.float32))
+            tiny.obsm['X_pca'] = rng.normal(size=(5000, 10)).astype(np.float32)
+            sc.pp.neighbors(tiny, n_neighbors=15, use_rep='X_pca')
+            sc.tl.umap(tiny, min_dist=0.5)
+        except Exception:
+            pass  # purely an optimization
+
+    threading.Thread(target=warm, daemon=True).start()
+
+
+def prompt_viewer_settings_dialog(parent_window, current_settings, umap_params=None, n_cells=None):
     """The interactive UMAP viewer's own Settings dialog: hover-
     highlighting on/off, the multi-gene overlay's genes-4-6 marker shape
     (GENE456_SHAPE_REGISTRY), the overall UMAP dot size (UMAP_CIRCLE_SIZE_
@@ -3603,11 +4275,18 @@ def prompt_viewer_settings_dialog(parent_window, current_settings):
     Toplevel rather than tkinter.messagebox, and why transient()/
     grab_set()/wait_window() rather than a second, competing Tk() root.
 
+    When `umap_params` (the run's current n_neighbors/min_dist/n_pcs) is
+    given, the dialog also offers those three, validated against `n_cells`;
+    the result then carries them under 'umap_params'. They belong to the
+    run rather than to the user's preferences, so the caller must keep them
+    out of the persisted settings.
+
     `current_settings` is read but never mutated — the caller decides what
     to do with the result. Returns an updated settings dict once OK is
     clicked, or None if cancelled (Cancel, the window's own close button,
     or Escape)."""
     import tkinter as tk
+    from tkinter import messagebox
 
     result = {'value': None}
     dialog = tk.Toplevel(parent_window)
@@ -3636,16 +4315,52 @@ def prompt_viewer_settings_dialog(parent_window, current_settings):
         dialog, text="Remember these settings across sessions", variable=persist_var, anchor='w',
     ).pack(fill='x', padx=12, pady=(0, 12))
 
+    umap_vars = {}
+    if umap_params is not None:
+        umap_frame = tk.LabelFrame(dialog, text="UMAP calculation (kept with this run)")
+        field_rows = (
+            ('n_neighbors', "Neighbors (n_neighbors):", "2 or more; larger favors broad structure"),
+            ('min_dist', "Minimum distance (min_dist):", "0 to 1; smaller packs cells tighter"),
+            ('n_pcs', "Principal components (n_pcs):", f"2 to {UMAP_PARAM_MAX_PCS}"),
+        )
+        for row, (key, label, hint) in enumerate(field_rows):
+            tk.Label(umap_frame, text=label, anchor='w').grid(row=row, column=0, sticky='w', padx=(8, 4), pady=2)
+            umap_vars[key] = tk.StringVar(value=f"{umap_params[key]:g}")
+            tk.Entry(umap_frame, textvariable=umap_vars[key], width=7).grid(row=row, column=1, pady=2)
+            tk.Label(umap_frame, text=f"default {UMAP_PARAM_DEFAULTS[key]:g} - {hint}", fg='gray35',
+                     anchor='w').grid(row=row, column=2, sticky='w', padx=(6, 8), pady=2)
+        tk.Label(umap_frame, justify='left', fg='gray35', anchor='w',
+                 text="Changing these recalculates the UMAP (about 30 s the first time; each\n"
+                      "combination is cached with the run, so revisiting one is instant)."
+                 ).grid(row=3, column=0, columnspan=3, sticky='w', padx=8, pady=(4, 2))
+
+        def reset_umap_fields():
+            for key, var in umap_vars.items():
+                var.set(f"{UMAP_PARAM_DEFAULTS[key]:g}")
+
+        tk.Button(umap_frame, text="Reset to defaults", command=reset_umap_fields).grid(
+            row=4, column=0, columnspan=3, sticky='w', padx=8, pady=(2, 8))
+        umap_frame.pack(fill='x', padx=12, pady=(0, 12))
+
     button_frame = tk.Frame(dialog)
     button_frame.pack(pady=(0, 12))
 
     def on_ok():
+        chosen_umap_params = None
+        if umap_vars:
+            chosen_umap_params, problem = parse_umap_params(
+                umap_vars['n_neighbors'].get(), umap_vars['min_dist'].get(), umap_vars['n_pcs'].get(), n_cells)
+            if problem:
+                messagebox.showerror("Viewer settings", problem, parent=dialog)
+                return
         result['value'] = {
             'hover_enabled': hover_var.get(),
             'gene456_shape': shape_var.get(),
             'umap_circle_size': size_var.get(),
             'persist_settings': persist_var.get(),
         }
+        if chosen_umap_params is not None:
+            result['value']['umap_params'] = chosen_umap_params
         dialog.destroy()
 
     def on_cancel():
@@ -9226,9 +9941,35 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     # this only defers the *cyclic* collector, at the cost of temporarily
     # higher memory use, for the lifetime of this one window.
     gc_was_enabled = gc.isenabled()
+    # While the heap is still small: frees the closed startup/picker windows'
+    # Tk objects here, on the Tk thread, rather than whenever a background
+    # thread (the numba warm-up's pynndescent calls gc.collect() itself)
+    # next collects.
+    gc.collect()
     gc.disable()
 
     log_status("Step 9: Preparing interactive UMAP viewer data...")
+    # A run reopens on the UMAP parameters it was last viewed with. Only a
+    # cached variant is loaded here (never recomputed): the file is written
+    # before the parameters are, so a missing one means something was
+    # deleted, and the default embedding already on `adata` is the fallback.
+    current_umap_params = dict(UMAP_PARAM_DEFAULTS)
+    if run_folder is not None:
+        last_params = read_last_umap_params(run_folder)
+        if not umap_params_are_default(last_params):
+            variant_path = umap_variant_csv_path(run_folder, last_params)
+            try:
+                variant_coords, variant_leiden = load_umap_variant(variant_path, adata.obs_names)
+                adata.obsm['X_umap'] = variant_coords
+                if variant_leiden is not None:
+                    adata.obs[LEIDEN_KEY] = pd.Categorical(variant_leiden)
+                else:
+                    adata.obs.drop(columns=[LEIDEN_KEY], inplace=True, errors='ignore')
+                current_umap_params = last_params
+                log_status(f"Step 9: Opened with the saved UMAP parameters ({umap_params_label(last_params)}).")
+            except Exception as e:
+                log_status(f"Step 9: Could not reopen the saved UMAP variant {variant_path.name} ({e}); "
+                           "using the default embedding.")
     coords = adata.obsm['X_umap']
     has_subclass = 'subclass' in adata.obs.columns
     subclass_ids = extract_leading_numeric_id(adata.obs['subclass']) if has_subclass else None
@@ -9369,10 +10110,14 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     # file for the run lands in, so it's the same token the user sees on
     # disk. Omitted entirely when the caller didn't pass one, rather than
     # showing an empty separator.
-    umap_window_title = "Interactive UMAP viewer"
-    if run_folder is not None:
-        umap_window_title = f"{Path(run_folder).name} — {umap_window_title}"
-    fig.canvas.manager.set_window_title(umap_window_title)
+    def build_umap_window_title():
+        title = "Interactive UMAP viewer"
+        if not umap_params_are_default(current_umap_params):
+            title = f"{title} ({umap_params_label(current_umap_params)})"
+        if run_folder is not None:
+            title = f"{Path(run_folder).name} — {title}"
+        return title
+    fig.canvas.manager.set_window_title(build_umap_window_title())
     # Forced early (rather than waiting for show_figure_blocking's own
     # show() call much later, after the rest of this function has built out
     # every axes/widget below) — without this, the window opened at its
@@ -9601,7 +10346,9 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         characters safe in a filename on every platform; gene symbols and
         ID lists are already tame, but a stray '/' or ':' from a category
         name would otherwise fail the write outright."""
-        return re.sub(r'[^A-Za-z0-9._-]+', '_', str(current_view_name['token'])).strip('_') or 'view'
+        token = re.sub(r'[^A-Za-z0-9._-]+', '_', str(current_view_name['token'])).strip('_') or 'view'
+        params_token = umap_params_token(current_umap_params)
+        return f"{token}_{params_token}" if params_token else token
     # Derived from UMAP_POINT_SIZE (top of file) rather than set here, so it
     # keeps its proportion to the cells automatically when that's tuned.
     # The extra *2.25 is a 50% bump to the marker's *diameter*, not its area
@@ -12344,9 +13091,15 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             status_text.set_text("Could not open Settings (no window handle available).")
             blit_hover_overlays()
             return
-        new_settings = prompt_viewer_settings_dialog(parent_window, viewer_settings)
+        new_settings = prompt_viewer_settings_dialog(
+            parent_window, viewer_settings, umap_params=current_umap_params, n_cells=adata.n_obs)
         if new_settings is not None:
+            # The UMAP parameters belong to this run, not to the user's
+            # persisted preferences, so they never reach apply_viewer_settings.
+            new_umap_params = new_settings.pop('umap_params', None)
             apply_viewer_settings(new_settings)
+            if new_umap_params is not None:
+                switch_umap_variant(new_umap_params)
 
     settings_button.on_clicked(on_settings_button_clicked)
 
@@ -13481,7 +14234,12 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # cached cell dot displays at the same size a live one would.
         dot_size_scale = (target_long_edge_in / panel_long_edge_in) ** 2 if panel_long_edge_in > 0 else 1.0
 
-        cache_path = section_home_cache_path(run_folder, sec, level)
+        # Leiden labels differ between UMAP variants (they come from that
+        # variant's neighbor graph), so its cached colors are kept per variant.
+        cache_level = level
+        if level == LEIDEN_KEY and not umap_params_are_default(current_umap_params):
+            cache_level = f"{level}_{umap_params_token(current_umap_params)}"
+        cache_path = section_home_cache_path(run_folder, sec, cache_level)
         rgba = None
         outcome = 'rendered'
         if cache_path.exists():
@@ -14372,6 +15130,130 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             redraw_gene(query, imputed=False)
         else:
             redraw_gene(query, imputed=True)
+
+    umap_variants_in_memory = {umap_params_key(current_umap_params): (np.array(coords), cell_leiden)}
+
+    def install_umap_variant(new_coords, new_leiden, new_params):
+        """Swaps the embedding and its Leiden clustering in place, then
+        redraws. Everything derived from either is refreshed here: the home
+        view, the per-level arrays (hover text, typed IDs, colors, legend),
+        the section panels' own Leiden values, and every cached picture of
+        the old state."""
+        nonlocal cell_leiden
+        hide_all_highlights()
+        coords[:] = new_coords
+        if new_leiden is not None:
+            adata.obs[LEIDEN_KEY] = pd.Categorical(new_leiden)
+            cell_leiden = adata.obs[LEIDEN_KEY].astype(str).to_numpy()
+            cell_level_arrays[LEIDEN_KEY] = cell_leiden
+            level_ids_arrays[LEIDEN_KEY] = extract_leading_numeric_id(adata.obs[LEIDEN_KEY])
+        else:
+            adata.obs.drop(columns=[LEIDEN_KEY], inplace=True, errors='ignore')
+            cell_leiden = None
+            cell_level_arrays[LEIDEN_KEY] = None
+            level_ids_arrays[LEIDEN_KEY] = None
+        category_color_cache.pop(LEIDEN_KEY, None)
+        for panel in section_panels.values():
+            idx = panel['umap_idx']
+            in_run = idx >= 0
+            if cell_level_arrays[LEIDEN_KEY] is None:
+                panel['level_values'][LEIDEN_KEY] = None
+                panel['level_ids'][LEIDEN_KEY] = None
+                continue
+            vals = np.full(idx.shape, None, dtype=object)
+            vals[in_run] = cell_level_arrays[LEIDEN_KEY][idx[in_run]]
+            ids = np.full(idx.shape, np.nan)
+            ids[in_run] = np.asarray(level_ids_arrays[LEIDEN_KEY])[idx[in_run]]
+            panel['level_values'][LEIDEN_KEY] = vals
+            panel['level_ids'][LEIDEN_KEY] = ids
+        x_pad = ((coords[:, 0].max() - coords[:, 0].min()) * 0.05) or 1.0
+        y_pad = ((coords[:, 1].max() - coords[:, 1].min()) * 0.05) or 1.0
+        pannable_axes[ax]['home_xlim'] = (coords[:, 0].min() - x_pad, coords[:, 0].max() + x_pad)
+        pannable_axes[ax]['home_ylim'] = (coords[:, 1].min() - y_pad, coords[:, 1].max() + y_pad)
+        invalidate_home_view_cache()
+        current_umap_params.clear()
+        current_umap_params.update(normalize_umap_params(new_params))
+        fig.canvas.manager.set_window_title(build_umap_window_title())
+        if run_folder is not None:
+            write_last_umap_params(run_folder, current_umap_params)
+        redraw()
+
+    def switch_umap_variant(new_params):
+        """Shows the UMAP for `new_params`: from memory, else from the run's
+        cache, else by computing it (progress window) and caching it. On
+        cancel or failure the previous embedding stays up and the status
+        line says why.
+
+        The busy cursor stays on from the start until the new picture is
+        actually on screen: redraw() only schedules a repaint, and re-
+        rendering every section panel takes a while, so the cursor is
+        restored only after an explicit draw."""
+        if umap_params_key(new_params) == umap_params_key(current_umap_params):
+            return
+        restore_cursors = set_wait_cursor_on_open_figures()
+        unblock_input = block_viewer_input()
+        status_text.set_text("Working… recalculating the UMAP; the viewer is locked until it finishes.")
+        fig.canvas.draw_idle()
+        fig.canvas.flush_events()
+        try:
+            switch_umap_variant_unwrapped(new_params)
+            fig.canvas.draw()
+            fig.canvas.flush_events()  # let any repaints the draw scheduled run while still locked
+        finally:
+            unblock_input()
+            restore_cursors()
+
+    def block_viewer_input():
+        """Makes the viewer ignore the mouse and keyboard until the returned
+        function is called, for work that pumps the Tk event loop (the
+        recalculation's progress window does). Done at matplotlib's single
+        event-dispatch point rather than per widget, so every button, text
+        box, hand-rolled radio, hover, pan and zoom handler is covered, and
+        input typed meanwhile is dropped rather than replayed afterwards.
+        Draw/resize events still pass."""
+        blocked = {'button_press_event', 'button_release_event', 'motion_notify_event',
+                   'scroll_event', 'key_press_event', 'key_release_event', 'pick_event'}
+        registry = fig.canvas.callbacks
+        original_process = registry.process
+
+        def process(signal, *args, **kwargs):
+            if signal in blocked:
+                return None
+            return original_process(signal, *args, **kwargs)
+
+        registry.process = process
+
+        def unblock():
+            try:
+                del registry.process  # back to the class's own method
+            except AttributeError:
+                pass
+        return unblock
+
+    def switch_umap_variant_unwrapped(new_params):
+        key = umap_params_key(new_params)
+        if key == umap_params_key(current_umap_params):
+            return
+        entry = umap_variants_in_memory.get(key)
+        message = None
+        if entry is None:
+            folder = Path(run_folder) if run_folder is not None else CACHE_DIR
+            csv_path, message = ensure_umap_variant_csv(adata, new_params, folder)
+            if csv_path is None:
+                status_text.set_text(message)
+                blit_hover_overlays()
+                return
+            try:
+                new_coords, new_leiden = load_umap_variant(csv_path, adata.obs_names)
+            except Exception as e:
+                status_text.set_text(f"Could not read the recalculated UMAP: {e}")
+                blit_hover_overlays()
+                return
+            entry = (new_coords, None if new_leiden is None else np.asarray(new_leiden, dtype=object))
+            umap_variants_in_memory[key] = entry
+        install_umap_variant(entry[0], entry[1], new_params)
+        status_text.set_text(message or f"UMAP shown with {umap_params_label(new_params)}.")
+        blit_hover_overlays()
 
     def full_taxonomy_label(level, target_id):
         """The full descriptive string (e.g. '268 L5 PT CTX Glut') behind a
@@ -15683,6 +16565,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # close, from the caller's perspective.
         plt.close(fig)
         raise
+    start_umap_warmup()
     try:
         show_figure_blocking(fig)
     finally:
@@ -15690,9 +16573,16 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # its many thousands of cyclic-referencing Artists) is closed and
         # can actually be reclaimed, rather than leaving gc permanently
         # disabled for the rest of the script.
+        #
+        # Collected *before* re-enabling, on this (the Tk) thread: the
+        # window's leftover tkinter Images/Variables must be finalized here.
+        # Tkinter refuses to touch Tcl from another thread ("main thread is
+        # not in main loop"), and a background thread (the numba warm-up, or
+        # an abandoned UMAP recalculation) can trigger an automatic
+        # collection the moment gc is enabled again.
+        gc.collect()
         if gc_was_enabled:
             gc.enable()
-        gc.collect()
 
 
 def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
@@ -15751,15 +16641,23 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         # get_cached_raw_backed_adata reuses it across sessions instead of
         # re-opening the file every time.
         print(f"Loading cached run from {load_existing_folder}...")
-        adata_backed = get_cached_raw_backed_adata(raw_backed_cache, abc_cache)
-
         required_files = required_cached_run_files(load_existing_folder)
         processed_h5ad_path = required_files['Processed AnnData']
         roi_csv_path = required_files['ROI coordinates']
-        if processed_h5ad_path.exists():
-            print(f"Loading processed AnnData from {processed_h5ad_path}...")
-            adata = anndata.read_h5ad(processed_h5ad_path)
-        else:
+
+        # Same reasoning as the 'new_run' path below: both reads can be slow
+        # and nothing else is on screen while they run.
+        def load_raw_and_processed():
+            backed = get_cached_raw_backed_adata(raw_backed_cache, abc_cache)
+            processed = None
+            if processed_h5ad_path.exists():
+                print(f"Loading processed AnnData from {processed_h5ad_path}...")
+                processed = anndata.read_h5ad(processed_h5ad_path)
+            return backed, processed
+
+        adata_backed, adata = run_with_loading_window(
+            f"Loading saved run {Path(load_existing_folder).name}.", load_raw_and_processed)
+        if adata is None:
             # Deleted (or never kept) — rebuildable from this run's own
             # umap_coords.csv without reopening the section/ROI picker, since
             # that CSV already records exactly which cells the run covered.
@@ -15805,13 +16703,23 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
     # ---------------------------------------------------------------------------
     # abc_cache = ...  # assumed already created/configured elsewhere in your workflow
 
-    adata = get_cached_raw_backed_adata(raw_backed_cache, abc_cache)
+    # Both reads are slow on a cold start and the startup panel is already
+    # gone, so run them behind a loading window (see run_with_loading_window)
+    # rather than leaving the screen empty. get_section_labels is nearly free
+    # when brain_section_label is already in adata.obs, but reads the whole
+    # metadata CSV when it isn't.
+    def load_raw_and_section_labels():
+        loaded = get_cached_raw_backed_adata(raw_backed_cache, abc_cache)
+        return loaded, get_section_labels(loaded, abc_cache)
+
+    adata, section_series = run_with_loading_window(
+        "Loading the MERFISH brain atlas (4+ million cells).\n"
+        "The first load after startup can take a minute.", load_raw_and_section_labels)
     print(f"Step 0: Loaded backed AnnData with {adata.n_obs} cells x {adata.n_vars} genes.")
 
     # ---------------------------------------------------------------------------
     # Section subset selection
     # ---------------------------------------------------------------------------
-    section_series = get_section_labels(adata, abc_cache)
     try:
         print("Attempting to open the clickable section-thumbnail picker...")
         selected_sections, sections_suffix, rois, imputed_adata_from_picker = prompt_section_selection_gui(

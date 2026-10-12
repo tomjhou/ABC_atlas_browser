@@ -8,10 +8,14 @@ taxonomy level or gene expression (including the imputed gene dataset).
 ## Setup
 
 1. Install Python.
-2. Install the required libraries by running `python-install.bat` from the same
-   Python environment you will launch the app with (e.g. after
-   `conda activate <env>` if you use conda). The app checks for missing
-   libraries at startup and lists the install commands if any are missing.
+2. Launch the app (see Running) from the Python environment you want to use
+   (e.g. after `conda activate <env>` if you use conda). At startup it checks
+   for missing libraries and pip-installs them automatically into that
+   environment. `abc_atlas_access` installs from GitHub, so it needs git on
+   your PATH. If anything fails to install, the app lists the commands to run
+   by hand. To install everything up front instead, run `python-install.bat`
+   from the same environment, or set `AUTO_INSTALL_LIBRARIES = False` in
+   `ABC_atlas_browser.py` to turn automatic installation off.
 
 ## Running
 
