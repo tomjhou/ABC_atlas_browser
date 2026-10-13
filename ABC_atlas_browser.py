@@ -102,6 +102,7 @@ OPTIONAL_LIBRARIES = {
     'pyarrow': ('pyarrow', 'Parquet file support'),
     'plotly': ('plotly', 'the 3D view in the browser'),
     'skimage': ('scikit-image', 'the translucent-surfaces background of the browser 3D view'),
+    'tkinterdnd2': ('tkinterdnd2', 'dragging a CSV file into the 3D viewer window'),
 }
 # Install anything missing automatically (into the interpreter running this
 # script) instead of just listing the commands and quitting. Set False to get
@@ -1568,6 +1569,16 @@ CCF_VOLUME_FILE_NAME = 'annotation_25'      # ~3.6 MB download; 528 x 320 x 456 
 CCF_VOLUME_VOXEL_MM = 0.025
 CCF_VENTRICLE_DIVISIONS = ('VL', 'V3', 'V4', 'AQ', 'c')   # lateral, third, fourth ventricle, aqueduct, central canal
 CCF_EDGES_CACHE_VERSION = 1
+# White-matter background objects, each a set of CCF fibre-tract labels picked by the parcellation table's `structure`
+# or `substructure` acronyms: (column, acronyms, colour). The corpus callosum is every callosal part (forceps, genu,
+# body, splenium, external capsule); the commissures are the anterior (olfactory and temporal limbs), posterior,
+# hippocampal, cerebellar, superior and inferior collicular commissures and the trapezoid body; the decussations are the
+# supraoptic, dorsal and ventral tegmental and pyramidal ones.
+CCF_WHITE_MATTER = {
+    'corpus callosum': ('structure', ('cc',), '#ffffff'),
+    'commissures': ('substructure', ('act', 'aco', 'pc', 'dhc', 'vhc', 'cbc', 'csc', 'cic', 'tb'), '#ffd9a0'),
+    'decussations': ('substructure', ('sup', 'dtd', 'vtd', 'pyd'), '#b8f2e6'),
+}
 THREED_EDGE_SLICE_MM = 0.5            # contour spacing (every direction) for the brain and ventricle line edges
 THREED_EDGE_REGION_SLICE_MM = 0.25    # ... and for a cells' region, which is usually much smaller
 THREED_EDGE_REGION_MAX = 4            # at most this many regions (the ones holding most of the shown cells) get edges
@@ -1595,16 +1606,37 @@ THREED_WEB_MESH_SCRIPT = """
   var vertexGroup = new Uint8Array(vertexCount);
   vertexStarts.forEach(function (start, group) { for (var v = start; v < vertexCount; v++) vertexGroup[v] = group; });
   var hidden = legendIndices.map(function () { return false; });
-  var busy = false, timer = null;
-  function rebuild() {
+  var busy = false, timer = null, forced = false, lastDirection = null;
+  // A restyle makes plotly re-plot the 3D scene from the camera stored in the layout, which lags behind the live one while a
+  // scroll-zoom or drag is still settling, so the view would snap back a little. Handing the live camera to the layout
+  // first avoids that.
+  function syncCamera() {
+    try {
+      var scene = gd._fullLayout.scene, live = scene._scene.getCamera();
+      scene.camera = live;
+      if (gd.layout.scene) gd.layout.scene.camera = live;
+    } catch (err) { /* the layout keeps its own camera */ }
+  }
+  function rebuild(force) {
     var scene = gd._fullLayout.scene || {};
     var camera = scene.camera || {eye: {x: 1.25, y: 1.25, z: 1.25}, center: {x: 0, y: 0, z: 0}};
     var flipZ = gd.layout.scene && gd.layout.scene.zaxis && gd.layout.scene.zaxis.autorange === 'reversed' ? -1 : 1;
     var ex = camera.eye.x - camera.center.x, ey = camera.eye.y - camera.center.y,
         ez = (camera.eye.z - camera.center.z) * flipZ;
+    // The back-to-front order depends on the viewing direction only, so a zoom (which leaves it unchanged) needs no new
+    // sort; skipping it keeps the page responsive right after a scroll. Anything else (cut, group, opacity) forces one.
+    var length = Math.sqrt(ex * ex + ey * ey + ez * ez) || 1, direction = [ex / length, ey / length, ez / length];
+    if (!force && lastDirection && direction[0] * lastDirection[0] + direction[1] * lastDirection[1] +
+        direction[2] * lastDirection[2] > 0.99999) return;
+    lastDirection = direction;
     var translucent = gd._fullData[meshIndex].opacity < 1;
-    var keep = [];
-    for (var f = 0; f < faceCount; f++) if (!hidden[vertexGroup[o.i[f]]]) keep.push(f);
+    var keep = [], drop = gd.__sliceDrop;  // drop: set by the Slice checkbox's script, else absent
+    for (var f = 0; f < faceCount; f++) {
+      if (hidden[vertexGroup[o.i[f]]]) continue;
+      if (drop && drop((o.x[o.i[f]] + o.x[o.j[f]] + o.x[o.k[f]]) / 3, (o.y[o.i[f]] + o.y[o.j[f]] + o.y[o.k[f]]) / 3,
+                       (o.z[o.i[f]] + o.z[o.j[f]] + o.z[o.k[f]]) / 3)) continue;
+      keep.push(f);
+    }
     if (translucent) {
       var depth = new Float64Array(vertexCount);
       for (var v = 0; v < vertexCount; v++) depth[v] = o.x[v] * ex + o.y[v] * ey + o.z[v] * ez;
@@ -1617,12 +1649,18 @@ THREED_WEB_MESH_SCRIPT = """
     var ni = new Int32Array(keep.length), nj = new Int32Array(keep.length), nk = new Int32Array(keep.length);
     for (var m = 0; m < keep.length; m++) { var src = keep[m]; ni[m] = o.i[src]; nj[m] = o.j[src]; nk[m] = o.k[src]; }
     busy = true;
+    syncCamera();
     Plotly.restyle(gd, {i: [ni], j: [nj], k: [nk]}, [meshIndex]).then(function () { busy = false; }, function () { busy = false; });
   }
-  function schedule() { clearTimeout(timer); timer = setTimeout(rebuild, 60); }
+  function schedule(force) {
+    forced = forced || force !== false;   // only the camera handler passes false
+    clearTimeout(timer);
+    timer = setTimeout(function () { var f = forced; forced = false; rebuild(f); }, 60);
+  }
+  gd.__rebuildCells = function () { rebuild(true); };  // the Slice checkbox's script calls this when its cut moves
   gd.on('plotly_relayout', function (e) {
     if (busy || !e) return;
-    if (Object.keys(e).some(function (name) { return name.indexOf('scene.camera') === 0; })) schedule();
+    if (Object.keys(e).some(function (name) { return name.indexOf('scene.camera') === 0; })) schedule(false);
   });
   gd.on('plotly_restyle', function (e) {
     if (busy || !e || !e[0]) return;
@@ -1647,6 +1685,8 @@ THREED_WEB_EDGE_SCRIPT = """
 (function () {
   var gd = document.getElementById('{plot_id}');
   var roles = __ROLES__;
+  var switchedOff = {};   // traces the user has switched off with a legend click (some start that way): they stay off
+  __OFF__.forEach(function (index) { switchedOff[index] = true; });
   var modes = [['cloud', 'Cloud'], ['lines', 'Lines']];
   if (roles.surfaces.length) modes.push(['surfaces', 'Surfaces']);
   var box = document.createElement('div');
@@ -1656,7 +1696,13 @@ THREED_WEB_EDGE_SCRIPT = """
   function apply(mode) {
     var show = {cloud: mode === 'cloud', walls: mode === 'cloud', lines: mode === 'lines', surfaces: mode === 'surfaces'};
     Object.keys(roles).forEach(function (role) {
-      if (roles[role].length) Plotly.restyle(gd, {visible: show[role]}, roles[role]);
+      roles[role].forEach(function (index) {   // note which are off now (a hidden mode's traces keep their old note)
+        var state = gd.data[index].visible;
+        if (state === 'legendonly') switchedOff[index] = true; else if (state === true || state === undefined) delete switchedOff[index];
+      });
+      if (!roles[role].length) return;
+      var visible = roles[role].map(function (index) { return show[role] ? (switchedOff[index] ? 'legendonly' : true) : false; });
+      Plotly.restyle(gd, {visible: visible}, roles[role]);
     });
   }
   modes.forEach(function (mode, n) {
@@ -1675,23 +1721,199 @@ THREED_WEB_EDGE_SCRIPT = """
 """
 
 
-# TEMPORARY (remove once the brain shell's base opacity, 0.10 in write_3d_group_html's edge_sets, is settled): a 0-100%
-# slider for that base opacity, to find a good value by eye. It composes with the Background opacity slider (shell
-# opacity = this base x that slider's factor). To remove: delete this constant and the scripts.append(...) that uses it.
-THREED_WEB_SHELL_TEST_SCRIPT = """
+# The "slice" checkbox under the Background radio group: while it is ticked, three sliders place a coronal, a horizontal
+# and a sagittal plane, and only what is on
+# the posterior side of the coronal plane, the ventral side of the horizontal plane and the far side of the sagittal
+# plane (the side away from the camera, which follows the camera when it is rotated) is shown: a cutaway whose corner you move.
+# Opening positions: the coronal plane at the anterior edge and the horizontal plane at the dorsal edge of the plotted
+# range (so they hide nothing) and the sagittal plane at the brain's midline (5.7 mm), which hides the near half.
+# Plotly has no clipping planes, so the page re-filters the geometry itself: triangles whose centre is cut away are
+# dropped from the shell meshes (and from the cells' mesh, through gd.__sliceDrop, see THREED_WEB_MESH_SCRIPT), and
+# points that are cut away are blanked in the line and marker traces.
+THREED_WEB_SLICE_SCRIPT = """
 (function () {
   var gd = document.getElementById('{plot_id}');
-  var index = __BRAIN_INDEX__, base = __BASE__, factor = 1;
+  var cellMesh = __MESH_INDEX__;
+  var traces = [];   // what is re-filtered: {index, kind: 'mesh' | 'points', original arrays}
+  gd._fullData.forEach(function (t, index) {
+    if (index === cellMesh || !t.x || t.x.length < 2) return;
+    if (t.type === 'mesh3d') {
+      traces.push({index: index, kind: 'mesh', x: t.x, y: t.y, z: t.z, i: Int32Array.from(t.i), j: Int32Array.from(t.j),
+                   k: Int32Array.from(t.k)});
+    } else if (t.type === 'scatter3d') {
+      traces.push({index: index, kind: 'points', x: Array.from(t.x), y: Array.from(t.y), z: Array.from(t.z)});
+    }
+  });
+
+  var MIDLINE_MM = 5.7;
+  // A restyle makes plotly re-plot the 3D scene from the camera stored in the layout, which lags behind the live one while a
+  // scroll-zoom or drag is still settling, so the view would snap back a little. Handing the live camera to the layout
+  // first avoids that.
+  function syncCamera() {
+    try {
+      var scene = gd._fullLayout.scene, live = scene._scene.getCamera();
+      scene.camera = live;
+      if (gd.layout.scene) gd.layout.scene.camera = live;
+    } catch (err) { /* the layout keeps its own camera */ }
+  }
+  var axes = ['xaxis', 'yaxis', 'zaxis'].map(function (name) { return gd._fullLayout.scene[name].range; });
+  var low = axes.map(function (r) { return Math.min(r[0], r[1]); }), high = axes.map(function (r) { return Math.max(r[0], r[1]); });
+  // The page's scene axes are x = left-right (CCF z), y = anterior-posterior (CCF x), z = dorsal-ventral (CCF y), so
+  // position[0] is the sagittal plane, [1] the coronal and [2] the horizontal one.
+  var position = [Math.min(Math.max(MIDLINE_MM, low[0]), high[0]), low[1], low[2]];
+  // The sagittal plane keeps the side away from the viewer, so which side that is follows the camera: the eye's CCF z is
+  // found by carrying the eye (the origin of view space) back through plotly's view and model matrices (the data is
+  // scaled by scene.dataScale before the model matrix acts on it).
+  var scene = gd._fullLayout.scene._scene, farSide = 1;   // +1: keep x above the sagittal plane, -1: keep x below it
+  function matMul(a, b) {
+    var out = new Float64Array(16);
+    for (var c = 0; c < 4; c++) for (var r = 0; r < 4; r++) {
+      var sum = 0;
+      for (var k = 0; k < 4; k++) sum += a[k * 4 + r] * b[c * 4 + k];
+      out[c * 4 + r] = sum;
+    }
+    return out;
+  }
+  function eyeX() {   // Gauss-Jordan on [M | I] for M = view x model, then M^-1 applied to the origin
+    var cp = scene.glplot.cameraParams, m = matMul(cp.view, cp.model), n = 4, a = [];
+    for (var r = 0; r < n; r++) {
+      a.push([]);
+      for (var c = 0; c < n; c++) a[r].push(m[c * 4 + r]);
+      for (var d = 0; d < n; d++) a[r].push(r === d ? 1 : 0);
+    }
+    for (var col = 0; col < n; col++) {
+      var pivot = col;
+      for (var r2 = col + 1; r2 < n; r2++) if (Math.abs(a[r2][col]) > Math.abs(a[pivot][col])) pivot = r2;
+      var tmp = a[col]; a[col] = a[pivot]; a[pivot] = tmp;
+      var div = a[col][col];
+      for (var c2 = 0; c2 < 2 * n; c2++) a[col][c2] /= div;
+      for (var r3 = 0; r3 < n; r3++) {
+        if (r3 === col) continue;
+        var f = a[r3][col];
+        for (var c3 = 0; c3 < 2 * n; c3++) a[r3][c3] -= f * a[col][c3];
+      }
+    }
+    // inverse column 3 (the image of the origin) is the eye in scaled data coordinates; its w is entry [3][7]
+    return a[0][7] / a[3][7] / scene.dataScale[0];
+  }
+  function updateSide() { var side = eyeX() < position[0] ? 1 : -1; var changed = side !== farSide; farSide = side; return changed; }
+  function cutAway(x, y, z) { return farSide * (x - position[0]) < 0 || y < position[1] || z < position[2]; }
+
+  // --- the controls, under the Background radio group
   var box = document.createElement('div');
   box.style.cssText = 'position:absolute;left:14px;top:86px;z-index:20;padding:6px 10px;' +
     'background:rgba(29,32,41,0.88);color:#e6e8ee;border:1px solid #3a3f4d;border-radius:6px;font:12px sans-serif;';
+  var checkboxLabel = document.createElement('label');
+  checkboxLabel.style.cssText = 'cursor:pointer;';
+  var checkbox = document.createElement('input');
+  checkbox.type = 'checkbox';
+  checkboxLabel.appendChild(checkbox);
+  checkboxLabel.appendChild(document.createTextNode(' slice'));
+  var sliderRows = document.createElement('div');
+  sliderRows.style.cssText = 'display:none;';
+  var names = ['Sagittal (left to right)', 'Coronal (anterior to posterior)', 'Horizontal (dorsal to ventral)'];
+  [1, 2, 0].forEach(function (axis) {   // shown as coronal, horizontal, sagittal
+    var name = names[axis];
+    var row = document.createElement('div');
+    row.style.cssText = 'margin-top:6px;';
+    var text = document.createElement('div');
+    var input = document.createElement('input');
+    input.type = 'range'; input.min = low[axis]; input.max = high[axis]; input.step = 0.05; input.value = position[axis];
+    input.style.cssText = 'width:170px;margin:3px 0 0 0;display:block;';
+    function label() { text.textContent = name + ': ' + position[axis].toFixed(2) + ' mm'; }
+    label();
+    input.addEventListener('input', function () { position[axis] = parseFloat(input.value); label(); request(); });
+    row.appendChild(text); row.appendChild(input); sliderRows.appendChild(row);
+  });
+  box.appendChild(checkboxLabel); box.appendChild(sliderRows);
+
+  // --- re-filtering the geometry (one pass at a time; a slider moved meanwhile triggers one more pass afterwards)
+  var active = false, busy = false, pending = false, timer = 0;
+  function apply(restore) {
+    var meshes = {i: [], j: [], k: []}, meshIds = [], points = {x: [], y: [], z: []}, pointIds = [];
+    traces.forEach(function (t) {
+      if (t.kind === 'mesh') {
+        var ni = t.i, nj = t.j, nk = t.k;
+        if (!restore) {
+          var keep = [];
+          for (var f = 0; f < t.i.length; f++) {
+            var a = t.i[f], b = t.j[f], c = t.k[f];
+            if (!cutAway((t.x[a] + t.x[b] + t.x[c]) / 3, (t.y[a] + t.y[b] + t.y[c]) / 3, (t.z[a] + t.z[b] + t.z[c]) / 3)) keep.push(f);
+          }
+          ni = new Int32Array(keep.length); nj = new Int32Array(keep.length); nk = new Int32Array(keep.length);
+          for (var m = 0; m < keep.length; m++) { ni[m] = t.i[keep[m]]; nj[m] = t.j[keep[m]]; nk[m] = t.k[keep[m]]; }
+        }
+        meshes.i.push(ni); meshes.j.push(nj); meshes.k.push(nk); meshIds.push(t.index);
+      } else {
+        var nx = t.x, ny = t.y, nz = t.z;
+        if (!restore) {
+          nx = new Array(t.x.length); ny = new Array(t.x.length); nz = new Array(t.x.length);
+          for (var q = 0; q < t.x.length; q++) {
+            var x = t.x[q], y = t.y[q], z = t.z[q];
+            var blank = x === null || y === null || z === null || cutAway(x, y, z);
+            nx[q] = blank ? null : x; ny[q] = blank ? null : y; nz[q] = blank ? null : z;
+          }
+        }
+        points.x.push(nx); points.y.push(ny); points.z.push(nz); pointIds.push(t.index);
+      }
+    });
+    gd.__sliceDrop = restore ? null : function (x, y, z) { return cutAway(x, y, z); };
+    busy = true;
+    syncCamera();
+    var jobs = [];
+    if (meshIds.length) jobs.push(Plotly.restyle(gd, meshes, meshIds));
+    if (pointIds.length) jobs.push(Plotly.restyle(gd, points, pointIds));
+    if (gd.__rebuildCells) gd.__rebuildCells();
+    function done() { busy = false; if (pending) { pending = false; request(); } }
+    Promise.all(jobs).then(done, done);
+  }
+  function run() { timer = 0; if (!active) return; if (busy) { pending = true; return; } apply(false); }
+  function request() { if (active && !timer) timer = setTimeout(run, 40); }
+
+  gd.on('plotly_relayout', function (e) {   // the camera moved: the far side of the sagittal plane may have changed
+    if (active && e && Object.keys(e).some(function (key) { return key.indexOf('scene.camera') === 0; })) {
+      [120, 600].forEach(function (delay) {   // (plotly updates its matrices just after the event, when it next paints)
+        setTimeout(function () { if (active && updateSide()) request(); }, delay);
+      });
+    }
+  });
+  checkbox.addEventListener('change', function () {
+    active = checkbox.checked;
+    if (active) updateSide();
+    sliderRows.style.display = active ? 'block' : 'none';
+    if (active) request(); else { clearTimeout(timer); timer = 0; apply(true); }
+  });
+  gd.style.position = 'relative';
+  gd.appendChild(box);
+})();
+"""
+
+
+# Opening settings of the browser view's two background controls. The Background opacity slider scales every background
+# trace (cloud, wall outlines, edges, shells) from its own 100% look; the Brain surface opacity slider below sets the
+# brain shell's own base, and the shell's opacity is that base x the Background slider's factor (so the defaults give
+# the shell 0.5 x 0.2 = 10%).
+THREED_WEB_BACKGROUND_DEFAULT = 0.2
+THREED_WEB_BRAIN_SURFACE_DEFAULT = 0.5
+THREED_WEB_SLIDER_ROW_PX = 36   # height of one slider row at the bottom of the page
+
+# A 0-100% slider for the brain shell's base opacity, drawn as a plain control that sits in the same stack as the two
+# plotly sliders, above them (the page layout reserves the room: see write_3d_group_html).
+THREED_WEB_BRAIN_SURFACE_SCRIPT = """
+(function () {
+  var gd = document.getElementById('{plot_id}');
+  var index = __BRAIN_INDEX__, base = __BASE__, factor = __FACTOR__;
+  var box = document.createElement('div');
+  box.style.cssText = 'position:absolute;left:calc(2% + 2px);bottom:__BOTTOM__px;z-index:20;color:#e6e8ee;' +
+    'font:11px sans-serif;';
   var text = document.createElement('div');
   var input = document.createElement('input');
   input.type = 'range'; input.min = 0; input.max = 100; input.step = 1; input.value = Math.round(base * 100);
-  input.style.width = '170px';
+  input.style.cssText = 'width:150px;margin:3px 0 0 0;display:block;';
   box.appendChild(text); box.appendChild(input);
+  function label() { text.textContent = 'Brain surface opacity: ' + Math.round(base * 100) + '%'; }
   function apply() {
-    text.textContent = 'Brain shell base opacity (temporary): ' + Math.round(base * 100) + '%';
+    label();
     Plotly.restyle(gd, {opacity: base * factor}, [index]);
   }
   input.addEventListener('input', function () { base = input.value / 100; apply(); });
@@ -1699,7 +1921,7 @@ THREED_WEB_SHELL_TEST_SCRIPT = """
     var prefix = e && e.slider && e.slider.currentvalue ? e.slider.currentvalue.prefix : '';
     if (prefix.indexOf('Background') === 0) { factor = parseFloat(e.step.label) / 100; setTimeout(apply, 80); }
   });
-  text.textContent = 'Brain shell base opacity (temporary): ' + Math.round(base * 100) + '%';
+  label();
   gd.style.position = 'relative';
   gd.appendChild(box);
 })();
@@ -2000,7 +2222,8 @@ def ccf_edges_missing(region_names, want_surfaces=True):
         have_skimage = True
     except ImportError:
         have_skimage = False
-    wanted = ['brain', 'ventricles'] + [('region', name) for name in region_names]
+    wanted = (['brain', 'ventricles'] + [('white', name) for name in CCF_WHITE_MATTER]
+              + [('region', name) for name in region_names])
     missing = [key for key in wanted
                if store.get(key) is None or (want_surfaces and have_skimage and not store[key]['has_skimage'])]
     return store, missing, have_skimage
@@ -2021,6 +2244,10 @@ def load_ccf_edges(abc_cache, parcel_names, region_names, want_surfaces=True):
             elif key == 'ventricles':
                 labels = parcel_names.index[parcel_names['division'].isin(CCF_VENTRICLE_DIVISIONS)]
                 geometry = region_edge_geometry(volume, labels, THREED_EDGE_SLICE_MM, 1, 2)
+            elif key[0] == 'white':
+                column, acronyms, _color = CCF_WHITE_MATTER[key[1]]
+                labels = parcel_names.index[parcel_names[column].isin(acronyms)]
+                geometry = region_edge_geometry(volume, labels, THREED_EDGE_SLICE_MM, 1, 2)
             else:
                 labels = parcel_names.index[parcel_names['structure'] == key[1]]
                 geometry = region_edge_geometry(volume, labels, THREED_EDGE_REGION_SLICE_MM, 1, 2)
@@ -2031,6 +2258,8 @@ def load_ccf_edges(abc_cache, parcel_names, region_names, want_surfaces=True):
         except Exception as e:
             print(f"Could not save the CCF edges cache ({e}).")
     return {'brain': store['brain'], 'ventricles': store['ventricles'],
+            'white_matter': {name: store[('white', name)] for name in CCF_WHITE_MATTER
+                             if len(store[('white', name)]['lines'][0])},
             'regions': {name: store[('region', name)] for name in region_names if len(store[('region', name)]['lines'][0])}}
 
 
@@ -2249,13 +2478,14 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
     # The page opens on Surfaces when there are shells (scikit-image was available), else Lines, else the cloud.
     default_mode = 'cloud'
     if edges:
-        geometries = [edges['brain'], edges['ventricles'], *edges['regions'].values()]
+        geometries = [edges['brain'], edges['ventricles'], *edges['white_matter'].values(), *edges['regions'].values()]
         if any(g['surface'] is not None for g in geometries):
             default_mode = 'surfaces'
         elif any(len(g['lines'][0]) for g in geometries):
             default_mode = 'lines'
     roles = {'cloud': [], 'walls': [], 'lines': [], 'surfaces': []}  # trace indices the Background radio group switches
     background_base = {}  # background trace index -> its own opacity at 100% on the Background opacity slider
+    legend_off = []       # background traces that start switched off (shown by a click on their legend entry)
     if outline:
         xs, ys, zs = [], [], []
         low_high = np.asarray(shell_xyz) if shell_xyz is not None and len(shell_xyz) else np.vstack([p for p, _h in cleaned])
@@ -2290,8 +2520,11 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
         def break_at_nan(values):  # plotly breaks a line at None, not NaN
             return [None if np.isnan(v) else float(v) for v in np.round(np.asarray(values, dtype=float), 3)]
 
-        edge_sets = [('brain', THREED_EDGE_BRAIN_COLOR, 0.10, edges['brain']),
+        edge_sets = [('brain', THREED_EDGE_BRAIN_COLOR, THREED_WEB_BRAIN_SURFACE_DEFAULT, edges['brain']),
                      ('ventricles', THREED_EDGE_VENTRICLE_COLOR, 0.35, edges['ventricles'])]
+        for name, geometry in edges['white_matter'].items():
+            edge_sets.append((name, CCF_WHITE_MATTER[name][2], 0.35, geometry))
+        off_names = set(edges['white_matter'])   # the white-matter objects start switched off (a legend click shows them)
         for region_index, (name, geometry) in enumerate(edges['regions'].items()):
             edge_sets.append((name, THREED_EDGE_REGION_COLORS[region_index % len(THREED_EDGE_REGION_COLORS)], 0.30,
                               geometry))
@@ -2304,7 +2537,10 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
                 figure.add_trace(go.Scatter3d(
                     x=break_at_nan(xs), y=break_at_nan(ys), z=break_at_nan(zs), mode='lines',
                     line=dict(color=color, width=2), opacity=line_opacity,
-                    name=f"{name} edges", visible=default_mode == 'lines', hoverinfo='skip'))
+                    name=f"{name} edges", hoverinfo='skip',
+                    visible=('legendonly' if name in off_names else True) if default_mode == 'lines' else False))
+                if name in off_names:
+                    legend_off.append(len(figure.data) - 1)
         for name, color, shell_opacity, geometry in edge_sets:
             if geometry['surface'] is not None:
                 vertices, faces = geometry['surface']
@@ -2314,8 +2550,10 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
                     x=vertices[:, 0], y=vertices[:, 1], z=vertices[:, 2], i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
                     color=color, opacity=shell_opacity, flatshading=False,
                     lighting=dict(ambient=0.6, diffuse=0.7, specular=0.1, roughness=0.8),
-                    name=f"{name} surface", showlegend=True, visible=default_mode == 'surfaces',
-                    hoverinfo='skip'))
+                    name=f"{name} surface", showlegend=True, hoverinfo='skip',
+                    visible=('legendonly' if name in off_names else True) if default_mode == 'surfaces' else False))
+                if name in off_names:
+                    legend_off.append(len(figure.data) - 1)
     planned = sum(keep.values())
     # Hover text on a mesh is per vertex, so it is repeated for every vertex of every sphere: with it, smoother
     # (more-vertex) spheres would multiply the file size, so they are only used when no group carries hover text.
@@ -2398,36 +2636,51 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
     # Both sliders hang from the bottom edge of the plot at fixed pixel sizes and offsets (not paper fractions, which
     # stretch with the window height): a short track with few steps, the second one pushed down by one slider's height.
     slider_values = (1.0, 0.8, 0.6, 0.4, 0.25, 0.1)
+    background_values = (1.0, 0.8, 0.6, 0.4, THREED_WEB_BACKGROUND_DEFAULT, 0.1)
+    brain_surface_index = (roles['surfaces'][0] if edges and edges['brain']['surface'] is not None and roles['surfaces']
+                           else None)  # the brain's own surface is always the first one added
+    # The stack of controls at the bottom-left, top to bottom: Brain surface opacity (the plain control added by
+    # THREED_WEB_BRAIN_SURFACE_SCRIPT), Background opacity, Cell opacity: one row each. Every row hangs from the plot's
+    # bottom edge at a fixed pixel size (not paper fractions, which stretch with the window height).
+    row = THREED_WEB_SLIDER_ROW_PX
+    rows_above = 1 if brain_surface_index is not None else 0
     slider_style = dict(active=0, x=0.02, len=150, lenmode='pixels', y=0, yanchor='top',
                         tickwidth=0, minorticklen=0,
                         font=dict(size=1, color=THREED_BACKGROUND))  # step labels hidden: the title shows the value
     opacity_steps = [dict(label=f"{value:.0%}", method='restyle', args=[{'opacity': value}, group_traces])
                      for value in slider_values]
-    sliders = [dict(slider_style, steps=opacity_steps, pad=dict(t=8, b=0),
+    sliders = [dict(slider_style, steps=opacity_steps, pad=dict(t=8 + row * rows_above, b=0),
                     currentvalue=dict(prefix='Cell opacity: ', font=dict(size=11, color='#e6e8ee')))]
     if background_base:
-        # Above the cell slider: scales every background trace (cloud, wall outlines, edges, shells) from its own
-        # 100% look down to 10%, never to nothing, which is what the radio group's other modes are for.
+        # Scales every background trace (cloud, wall outlines, edges, shells) from its own 100% look down to 10%,
+        # never to nothing, which is what the radio group's other modes are for. It opens at its default, so the
+        # traces start at that fraction of their own opacity.
         indices = list(background_base)
+        for index in indices:
+            figure.data[index].opacity = round(THREED_WEB_BACKGROUND_DEFAULT * background_base[index], 3)
         background_steps = [
             dict(label=f"{value:.0%}", method='restyle',
                  args=[{'opacity': [round(value * background_base[i], 3) for i in indices]}, indices])
-            for value in slider_values]
-        sliders[0]['pad'] = dict(t=44, b=0)
-        sliders.insert(0, dict(slider_style, steps=background_steps, pad=dict(t=8, b=0),
+            for value in background_values]
+        sliders[0]['pad'] = dict(t=8 + row * (rows_above + 1), b=0)
+        sliders.insert(0, dict(slider_style, active=background_values.index(THREED_WEB_BACKGROUND_DEFAULT),
+                               steps=background_steps, pad=dict(t=8 + row * rows_above, b=0),
                                currentvalue=dict(prefix='Background opacity: ', font=dict(size=11, color='#e6e8ee'))))
+    bottom_margin = (8 + row * (len(sliders) + rows_above) + 12) if background_base else 50
     figure.update_layout(
         sliders=sliders,
-        template='plotly_dark', scene=scene, margin=dict(l=0, r=0, t=50, b=92 if background_base else 50),
+        template='plotly_dark', scene=scene, margin=dict(l=0, r=0, t=50, b=bottom_margin),
         title=title if shown >= total else f"{title}  (showing {shown:,} of {total:,} cells)",
         legend=dict(itemsizing='constant'))
     scripts = [post_script] if post_script else []
     if roles['lines'] or roles['surfaces']:
-        scripts.append(THREED_WEB_EDGE_SCRIPT.replace('__ROLES__', json.dumps(roles)).replace('__DEFAULT__', default_mode))
-    if edges and edges['brain']['surface'] is not None and roles['surfaces']:  # TEMPORARY: see THREED_WEB_SHELL_TEST_SCRIPT
-        brain_shell = roles['surfaces'][0]  # the brain's own surface is always the first one added
-        scripts.append(THREED_WEB_SHELL_TEST_SCRIPT.replace('__BRAIN_INDEX__', str(brain_shell))
-                       .replace('__BASE__', str(background_base[brain_shell])))
+        scripts.append(THREED_WEB_EDGE_SCRIPT.replace('__ROLES__', json.dumps(roles)).replace('__OFF__', json.dumps(legend_off)).replace('__DEFAULT__', default_mode))
+    if brain_surface_index is not None:
+        scripts.append(THREED_WEB_BRAIN_SURFACE_SCRIPT.replace('__BRAIN_INDEX__', str(brain_surface_index))
+                       .replace('__BASE__', str(background_base[brain_surface_index]))
+                       .replace('__FACTOR__', str(THREED_WEB_BACKGROUND_DEFAULT))
+                       .replace('__BOTTOM__', str(bottom_margin - 8 - row + 4)))
+    scripts.append(THREED_WEB_SLICE_SCRIPT.replace('__MESH_INDEX__', str(mesh_index if mesh_groups else -1)))
     figure.write_html(str(path), include_plotlyjs=True, full_html=True, config={'displaylogo': False},
                       post_script='\n'.join(scripts) or None)
     return Path(path)
@@ -5559,6 +5812,235 @@ def get_cached_raw_backed_adata(raw_backed_cache, abc_cache):
     return raw_backed_cache['adata_backed']
 
 
+def build_3d_edges(abc_cache, structures, parent=None):
+    """The browser view's edge geometry (brain surface, ventricles, white-matter tracts, and the region(s) holding most of the shown cells'
+    `structures`, none if there are none) from the CCF annotation volume, or None (the view then just has its cloud).
+    Asks before the one-time download of that volume; the first build takes about half a minute, and is cached after
+    that. Runs behind a loading window, so call it from the thread that owns the Tk windows."""
+    names = load_parcellation_names(abc_cache)
+    if names is None:
+        return None
+    regions = choose_cell_regions(structures) if structures is not None and len(structures) else []
+    _store, missing, have_skimage = ccf_edges_missing(regions)
+    if missing:
+        _path, size, present = metadata_file_status(abc_cache, CCF_VOLUME_DIRECTORY, CCF_VOLUME_FILE_NAME)
+        if present is not True:
+            try:
+                from tkinter import messagebox
+                size_text = f"{size / 1e6:.1f} MB" if size else "a small file"
+                if not messagebox.askyesno(
+                        "Download the CCF annotation volume?",
+                        f"The brain edges need the Allen CCF annotation volume, a one-time download of {size_text} "
+                        f"into your atlas cache folder. Download it now?", parent=parent):
+                    return None
+            except Exception as e:
+                print(f"Could not ask about the CCF volume download ({e}); no edges.")
+                return None
+    try:
+        return run_with_loading_window(
+            "Building the brain edges (the first time takes about half a minute; they are cached after that).",
+            lambda: load_ccf_edges(abc_cache, names, regions, want_surfaces=have_skimage))
+    except Exception as e:
+        print(f"Could not build the brain edges ({e}); the view has its cloud only.")
+        return None
+
+
+# ---- the standalone 3D viewer (opening screen -> "Open 3D Viewer…") ------------------------------------------------
+THREED_VIEWER_DIR = CACHE_DIR / '3d_viewer'   # where its pages are written
+COORDINATE_LEVEL_NAMES = {'class': 'Class', 'subclass': 'Subclass', 'supertype': 'Supertype', 'cluster': 'Cluster'}
+
+
+def read_coordinates_for_3d(path):
+    """A coordinates_*.csv (the viewer's "Export coordinates" file) arranged for the 3D page: {'groups', 'structures',
+    'axis_labels', 'have_ccf', 'title', 'n_cells'}. One group per group_id (named after the level in the file name, e.g.
+    coordinates_subclass_268-270.csv, else the taxonomy column the ids come from); a file without group_id is one
+    group. Uses the CCF positions when the file has them, else the section positions (which look like stacked
+    slices). Raises ValueError for a file that has neither."""
+    path = Path(path)
+    table = pd.read_csv(path, dtype={'cell_label': str})
+    ccf_columns, section_columns = ('ccf_z_mm', 'ccf_x_mm', 'ccf_y_mm'), ('section_x_mm', 'section_z_mm', 'section_y_mm')
+    if all(c in table.columns for c in ccf_columns):
+        columns, have_ccf = ccf_columns, True   # left-right, front-back, up-down
+        axis_labels = ('left - right (CCF z, mm)', 'anterior - posterior (CCF x, mm)', 'dorsal - ventral (CCF y, mm)')
+    elif all(c in table.columns for c in section_columns):
+        columns, have_ccf = section_columns, False
+        axis_labels = ('section x (mm)', 'section position (mm)', 'section y (mm)')
+    else:
+        raise ValueError("this file has no ccf_x_mm / ccf_y_mm / ccf_z_mm columns (nor section_x_mm / section_y_mm / "
+                         "section_z_mm): is it a coordinates_*.csv from the viewer's Export coordinates button?")
+    if table.empty:
+        raise ValueError("this file has no cells")
+    level = None
+    named = re.match(r'coordinates_(class|subclass|supertype|cluster)_', path.name)
+    if named:
+        level = named.group(1)
+    elif 'group_id' in table.columns:
+        for candidate in COORDINATE_LEVEL_NAMES:
+            if candidate in table.columns and set(
+                    extract_leading_numeric_id(table[candidate].dropna().drop_duplicates()).dropna().astype(int)
+            ) >= set(pd.to_numeric(table['group_id'], errors='coerce').dropna().astype(int)):
+                level = candidate
+                break
+    level_name = COORDINATE_LEVEL_NAMES.get(level, 'Cells')
+    hover = None
+    if have_ccf and 'ccf_structure' in table.columns:
+        section = (table['brain_section_label'].astype(str).str.rsplit('.', n=1).str[-1]
+                   if 'brain_section_label' in table.columns else '')
+        hover = (table['ccf_structure'].fillna('?').astype(str) + ' | section ' + section
+                 + ' | ' + table['cell_label'].astype(str)).to_numpy() if 'cell_label' in table.columns else None
+    if 'group_id' in table.columns:
+        ids = list(pd.unique(table['group_id'].dropna()))
+    else:
+        ids = [None]
+    groups = []
+    for rank, group_id in enumerate(ids):
+        rows = table.index[table['group_id'] == group_id] if group_id is not None else table.index
+        label = (f"{level_name} {group_id:g} ({len(rows):,})" if isinstance(group_id, (int, float, np.integer, np.floating))
+                 else f"{level_name} {group_id} ({len(rows):,})") if group_id is not None else f"{path.stem} ({len(rows):,})"
+        groups.append({'label': label, 'color': 'red' if len(ids) == 1 else category_rank_color(rank),
+                       'xyz': table.loc[rows, list(columns)].to_numpy(dtype=float),
+                       'hover': None if hover is None else hover[np.asarray(rows)]})
+    structures = table['ccf_structure'].to_numpy() if have_ccf and 'ccf_structure' in table.columns else None
+    return {'groups': groups, 'structures': structures, 'axis_labels': axis_labels, 'have_ccf': have_ccf,
+            'title': f"3D viewer: {path.name}", 'n_cells': len(table)}
+
+
+def build_3d_viewer_page(abc_cache, csv_path=None, parent=None):
+    """Writes the interactive 3D page for the cells in `csv_path` (none when it is None or empty: the brain alone) into
+    THREED_VIEWER_DIR and returns its path, or None if the CCF download it needs was declined. Raises on a bad file or
+    a missing plotly. Blocking and, the first time, slow: run it from the thread that owns the Tk windows."""
+    import plotly  # noqa: F401  (fail early, before any of the slow steps)
+    loaded = read_coordinates_for_3d(csv_path) if csv_path else None
+    have_ccf = loaded['have_ccf'] if loaded else True
+    groups = loaded['groups'] if loaded else []
+    axis_labels = loaded['axis_labels'] if loaded else (
+        'left - right (CCF z, mm)', 'anterior - posterior (CCF x, mm)', 'dorsal - ventral (CCF y, mm)')
+    shell_xyz, outline, edges = None, None, None
+    if have_ccf:
+        if not ensure_ccf_downloaded(abc_cache, parent=parent):
+            return None
+        _aligned, shell = run_with_loading_window(
+            "Reading the CCF coordinates (the first read of this 4-million-cell table takes about a minute).",
+            lambda: load_ccf_for_cells(abc_cache, [], THREED_SHELL_POINTS))
+        shell_xyz = shell[:, [2, 0, 1]]
+        outline = brain_outline_segments(shell_xyz)
+        edges = build_3d_edges(abc_cache, loaded['structures'] if loaded else None, parent)
+    THREED_VIEWER_DIR.mkdir(parents=True, exist_ok=True)
+    stem = f"3d_{Path(csv_path).stem}" if csv_path else "3d_brain"
+    path = unique_export_paths(THREED_VIEWER_DIR, stem, ('.html',))['.html']
+    title = loaded['title'] if loaded else "3D viewer: brain (no cells loaded)"
+    write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, edges=edges)
+    return path
+
+
+def open_3d_viewer_launcher(abc_cache):
+    """The window behind the opening screen's "Open 3D Viewer…" button: a box at the top for a coordinates_*.csv (drag
+    it in from Windows Explorer, paste its path, or Browse): dropping or browsing a file writes the interactive page
+    and opens it in the browser at once, and "Open brain only / reopen" does the same for whatever the box holds (the
+    brain alone when it is empty). Returns when the window is closed."""
+    import tkinter as tk
+    from tkinter import filedialog, ttk
+    dnd_files = None
+    try:
+        from tkinterdnd2 import DND_FILES, TkinterDnD
+        root = TkinterDnD.Tk()
+        dnd_files = DND_FILES
+    except Exception:
+        root = tk.Tk()   # no tkinterdnd2: choose the file with Browse or paste its path
+    root.title("3D viewer")
+    root.geometry("+120+120")
+    body = ttk.Frame(root, padding=12)
+    body.pack(fill='both', expand=True)
+    ttk.Label(body, text="Cells: a coordinates_*.csv from the viewer's Export coordinates").pack(anchor='w')
+    row = ttk.Frame(body)
+    row.pack(fill='x', pady=(4, 0))
+    path_var = tk.StringVar()
+    entry = ttk.Entry(row, textvariable=path_var, width=70)
+    entry.pack(side='left', fill='x', expand=True)
+    status_var = tk.StringVar(value="No cells loaded: the page will show the brain alone.")
+
+    def set_status(text):
+        status_var.set(text)
+        root.update_idletasks()
+
+    busy = {'on': False}
+
+    def open_view():
+        if busy['on']:
+            return
+        wanted = path_var.get().strip().strip('"')
+        if wanted and not Path(wanted).is_file():
+            set_status(f"Not a file: {wanted}")
+            return
+        busy['on'] = True
+        set_status("Preparing the 3D page… (the first time can take a minute or two)")
+        try:
+            page = build_3d_viewer_page(abc_cache, wanted or None, parent=root)
+            if page is None:
+                set_status("Cancelled: the CCF coordinates are needed for the brain background.")
+            else:
+                open_with_default_viewer(page)
+                set_status(f"Opened {page.name} in your browser (saved in {page.parent})."
+                           + ("" if wanted else " No cells: drop a coordinates_*.csv above to add them."))
+        except ImportError:
+            set_status("The 3D viewer needs plotly: run  python -m pip install plotly  and try again.")
+        except Exception as e:
+            set_status(f"Could not open the 3D view: {e}")
+            print(f"Could not open the 3D view: {e}")
+        finally:
+            busy['on'] = False
+
+    def browse():
+        current = path_var.get().strip().strip('"')
+        start = Path(current).parent if current and Path(current).parent.is_dir() else None
+        chosen = filedialog.askopenfilename(
+            title="Choose a coordinates CSV", parent=root, initialdir=str(start) if start else None,
+            filetypes=[("Coordinates CSV", "coordinates*.csv"), ("CSV files", "*.csv"), ("All files", "*.*")])
+        if chosen:
+            path_var.set(os.path.normpath(chosen))
+            open_view()
+
+    def on_drop(event):
+        paths = root.tk.splitlist(event.data)
+        if paths:
+            path_var.set(os.path.normpath(paths[0]))
+            set_status("Dropped " + Path(paths[0]).name + (" (the first of several: one file at a time)"
+                                                           if len(paths) > 1 else ""))
+            root.after(50, open_view)
+        return event.action
+
+    ttk.Button(row, text="Browse…", command=browse).pack(side='left', padx=(6, 0))
+    ttk.Button(row, text="Clear", command=lambda: (path_var.set(''), set_status(
+        "No cells loaded: the page will show the brain alone."))).pack(side='left', padx=(4, 0))
+    entry.bind('<Return>', lambda e: open_view())
+    if dnd_files is not None:
+        entry.drop_target_register(dnd_files)
+        entry.dnd_bind('<<Drop>>', on_drop)
+        root.drop_target_register(dnd_files)
+        root.dnd_bind('<<Drop>>', on_drop)
+        hint = "Drag a coordinates_*.csv from Explorer into the box above (or anywhere on this window)."
+    else:
+        hint = "Choose the file with Browse… or paste its path (drag and drop needs the tkinterdnd2 package)."
+    ttk.Label(body, text=hint, foreground='#555555').pack(anchor='w', pady=(6, 0))
+    ttk.Label(body, textvariable=status_var, foreground='#7a3b00', wraplength=640, justify='left').pack(
+        anchor='w', pady=(10, 0))
+    buttons = ttk.Frame(body)
+    buttons.pack(fill='x', pady=(12, 0))
+    ttk.Button(buttons, text="Close", command=root.destroy).pack(side='right')
+    ttk.Button(buttons, text="Open brain only / reopen", command=open_view).pack(side='right', padx=(0, 6))
+    entry.focus_set()
+    root.lift()
+    try:
+        root.mainloop()
+    except Exception as e:
+        print(f"The 3D viewer window stopped: {e}")
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
 def prompt_startup_panel(out_folder):
     """First screen shown at launch: pick a cell-type subset, then either
     open the section/ROI picker (today's full pipeline, Step 0 onward) or
@@ -5784,7 +6266,11 @@ def prompt_startup_panel(out_folder):
     load_existing_button = Button(load_existing_ax, 'Load Existing ROI Dataset…', hovercolor='0.85')
     load_existing_button.label.set_fontsize(UI_BUTTON_FONTSIZE)
 
-    cancel_ax = fig.add_axes([button_left, 0.115, button_width, button_height])
+    viewer3d_ax = fig.add_axes([button_left, 0.22, button_width, button_height])
+    viewer3d_button = Button(viewer3d_ax, 'Open 3D Viewer…', hovercolor='0.85')
+    viewer3d_button.label.set_fontsize(UI_BUTTON_FONTSIZE)
+
+    cancel_ax = fig.add_axes([button_left, 0.105, button_width, button_height])   # same gap as above it
     cancel_button = Button(cancel_ax, 'Exit', hovercolor='0.85')
     cancel_button.label.set_fontsize(UI_BUTTON_FONTSIZE)
 
@@ -5849,8 +6335,14 @@ def prompt_startup_panel(out_folder):
         remember_recent_output_folder(folder)
         plt.close(fig)
 
+    def on_3d_viewer(event):
+        hide_recent_dropdown()
+        open_3d_viewer_launcher(abc_cache)   # returns when its window is closed; the panel is still here
+        fig.canvas.draw_idle()
+
     new_run_button.on_clicked(on_new_run)
     load_existing_button.on_clicked(on_load_existing)
+    viewer3d_button.on_clicked(on_3d_viewer)
     cancel_button.on_clicked(on_cancel)
 
     center_figure_window(fig)
@@ -17547,37 +18039,12 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         blit_hover_overlays()
 
     def prepare_3d_edges(prepared):
-        """The browser view's edge geometry (brain surface, ventricles, and the region(s) holding most of the shown
-        cells) from the CCF annotation volume, or None (the view then just has its cloud). Asks before the one-time
-        download of that volume; the first build takes about half a minute, and is cached after that."""
-        names = load_parcellation_names(abc_cache)
-        if names is None or prepared['structures'] is None:
-            return None
-        regions = choose_cell_regions(prepared['structures'])
-        _store, missing, have_skimage = ccf_edges_missing(regions)
-        if missing:
-            _path, size, present = metadata_file_status(abc_cache, CCF_VOLUME_DIRECTORY, CCF_VOLUME_FILE_NAME)
-            if present is not True:
-                parent = tk_widget.winfo_toplevel() if tk_widget is not None else None
-                try:
-                    from tkinter import messagebox
-                    size_text = f"{size / 1e6:.1f} MB" if size else "a small file"
-                    if not messagebox.askyesno(
-                            "Download the CCF annotation volume?",
-                            f"The brain edges need the Allen CCF annotation volume, a one-time download of {size_text} "
-                            f"into your atlas cache folder. Download it now?", parent=parent):
-                        return None
-                except Exception as e:
-                    print(f"Could not ask about the CCF volume download ({e}); no edges.")
-                    return None
-        unblock_input = block_viewer_input()  # the loading window pumps Tk events; keep the viewer still
+        """The browser view's edge geometry for the shown cells (see build_3d_edges); the viewer sits still meanwhile,
+        since the loading window pumps Tk events."""
+        parent = tk_widget.winfo_toplevel() if tk_widget is not None else None
+        unblock_input = block_viewer_input()
         try:
-            return run_with_loading_window(
-                "Building the brain edges (the first time takes about half a minute; they are cached after that).",
-                lambda: load_ccf_edges(abc_cache, names, regions, want_surfaces=have_skimage))
-        except Exception as e:
-            print(f"Could not build the brain edges ({e}); the view has its cloud only.")
-            return None
+            return build_3d_edges(abc_cache, prepared['structures'], parent)
         finally:
             unblock_input()
 

@@ -22,3 +22,6 @@ pause
 
 REM Interactive 3D view in the browser
 python -m pip install plotly
+
+REM Drag-and-drop of CSV files into the 3D viewer and CCF browser windows
+python -m pip install tkinterdnd2

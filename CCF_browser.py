@@ -1647,6 +1647,7 @@ class CCFBrowser:
         if error is not None:
             self.reference = None
             self.message.configure(text=f"Could not load the standard CCF for comparison: {error}")
+            self.load_next_saved()
             return
         volume, table, lut = result
         self.reference = {'volume': volume, 'table': table, 'lut': lut}
@@ -1655,6 +1656,7 @@ class CCFBrowser:
         self.sync_panes()
         self.refresh_all()
         self.on_leave()
+        self.load_next_saved()   # the remembered CSVs wait while this load is busy (see atlas_ready)
 
     def diff_state(self):
         """(alt_lut, ref_lut, basis) for comparing the atlas on screen with the standard one, or None while the
