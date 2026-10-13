@@ -180,10 +180,18 @@ def load_atlas(base, download):
             frames[kind] = frame.set_index('parcellation_index')
         table = frames['acronym'].add_prefix('acronym_').join(frames['name'].add_prefix('name_')).join(
             frames['color'][['substructure_color']])
+        table['detail'] = ('structure: ' + table['acronym_structure'].astype(str) + '   division: '
+                           + table['acronym_division'].astype(str))
     except Exception as e:
         print(f"Region names and colours unavailable ({e}); regions are coloured by label number only.")
 
-    top = int(max(volume.max(), table.index.max() if table is not None else 0))
+    return volume, table, region_colors(volume, table)
+
+
+def region_colors(volume, table):
+    """Colour lookup (label -> RGB uint8) for the labels present in the volume: the table's colours (hex strings in
+    its `substructure_color` column) where known, otherwise a fixed random colour."""
+    top = int(volume.max())
     lut = np.zeros((top + 1, 3), dtype=np.uint8)
     rng = np.random.default_rng(3)
     lut[1:] = rng.integers(60, 256, size=(top, 3))
@@ -192,7 +200,101 @@ def load_atlas(base, download):
             if isinstance(color, str) and color.startswith('#') and len(color) == 7 and 0 <= index <= top:
                 lut[index] = [int(color[i:i + 2], 16) for i in (1, 3, 5)]
     lut[0] = (0, 0, 0)
-    return volume, table, lut
+    return lut
+
+
+NRRD_TYPES = {'unsigned short': 'u2', 'uint16': 'u2', 'ushort': 'u2', 'uint16_t': 'u2', 'unsigned char': 'u1',
+              'uint8': 'u1', 'uchar': 'u1', 'uint8_t': 'u1', 'short': 'i2', 'int16': 'i2', 'signed short': 'i2',
+              'int': 'i4', 'int32': 'i4', 'signed int': 'i4', 'unsigned int': 'u4', 'uint32': 'u4', 'float': 'f4',
+              'double': 'f8'}
+
+
+def read_nrrd_volume(path):
+    """The voxel array of a NRRD file (raw or gzip encoded) as [slowest axis, ..., fastest axis], without pynrrd."""
+    import zlib
+    with open(path, 'rb') as handle:
+        raw = handle.read()
+    end = raw.find(b'\n\n')
+    if not raw.startswith(b'NRRD') or end < 0:
+        raise ValueError("not a NRRD file")
+    fields = {}
+    for line in raw[:end].decode('latin-1').splitlines()[1:]:
+        if line.startswith('#') or ':' not in line:
+            continue
+        key, value = line.split(':', 1)
+        fields[key.strip().lower()] = value.strip()
+    kind = NRRD_TYPES.get(fields.get('type', '').lower())
+    if kind is None:
+        raise ValueError(f"unsupported NRRD data type {fields.get('type')!r}")
+    dtype = np.dtype(('>' if fields.get('endian', 'little').lower() == 'big' else '<') + kind)
+    encoding = fields.get('encoding', 'raw').lower()
+    body = raw[end + 2:]
+    if encoding in ('gzip', 'gz'):
+        body = zlib.decompress(body, 31)
+    elif encoding != 'raw':
+        raise ValueError(f"unsupported NRRD encoding {encoding!r}")
+    sizes = tuple(int(n) for n in fields['sizes'].split())
+    return np.frombuffer(body, dtype=dtype, count=int(np.prod(sizes))).reshape(sizes[::-1])
+
+
+def read_ontology(path, top):
+    """A region table from an Allen ontology CSV (id, name, acronym, color_hex_triplet, structure_id_path), for the ids
+    up to `top`: same columns as the ABC table, with the lineage of acronyms as the detail line."""
+    frame = pd.read_csv(path)
+    acronyms = frame.drop_duplicates('id').set_index('id')['acronym']
+    frame = frame[frame['id'] <= top].drop_duplicates('id').set_index('id')
+
+    def lineage(id_path):
+        ids = [int(part) for part in str(id_path).split('/') if part.strip().isdigit()]
+        return ' > '.join(str(acronyms.get(i, i)) for i in ids if i not in (997, 8))
+
+    return pd.DataFrame({'acronym_substructure': frame['acronym'], 'name_substructure': frame['name'],
+                         'detail': 'lineage: ' + frame['structure_id_path'].map(lineage),
+                         'substructure_color': '#' + frame['color_hex_triplet'].astype(str).str.zfill(6)})
+
+
+def load_custom_atlas(path):
+    """(volume [AP, DV, ML], region table or None, colour lookup) from a .nrrd / .nii / .nii.gz annotation volume on
+    the same 25 um grid, with names and colours from an ontology*.csv beside it when there is one."""
+    path = Path(path)
+    volume = read_nrrd_volume(path) if path.suffix.lower() == '.nrrd' else read_nifti_volume(path)
+    if sorted(volume.shape) != sorted(VOLUME_SHAPE):
+        raise ValueError(f"expected a {N_AP} x {N_DV} x {N_ML} volume (25 um), got {volume.shape}")
+    volume = np.transpose(volume, [volume.shape.index(n) for n in VOLUME_SHAPE])   # to [AP, DV, ML]
+    if volume.dtype.kind == 'f':
+        if not np.array_equal(volume, np.round(volume)):
+            raise ValueError("this is an intensity image, not an annotation volume (region labels are whole numbers)")
+        volume = volume.astype(np.int64)
+    if volume.min() < 0:
+        raise ValueError("region labels cannot be negative")
+    ids = None
+    if volume.max() > 65535:
+        # Ids too large to index a colour table (the full 2017 ontology has ids up to ~6e8): number the labels that
+        # occur 0..n-1 for display, and keep the real ids to show and to look up in the ontology.
+        ids, inverse = np.unique(volume, return_inverse=True)
+        if len(ids) > 65535:
+            raise ValueError("more than 65535 distinct labels: this is not an annotation volume")
+        volume = inverse.reshape(volume.shape).astype(np.uint16)
+    else:
+        volume = volume.astype(np.uint16)
+    volume = np.ascontiguousarray(volume)
+    top = int(ids[-1]) if ids is not None else int(volume.max())
+    ontology = None
+    for candidate in sorted(path.parent.glob('*ontology*.csv')):
+        try:
+            ontology = read_ontology(candidate, top)
+            break
+        except Exception as e:
+            print(f"Could not use {candidate.name} as an ontology ({e}).")
+    table = ontology
+    if ids is not None:
+        table = (ontology.reindex(ids) if ontology is not None else pd.DataFrame(index=range(len(ids))))
+        table.insert(0, 'region_id', ids)
+        table.index = pd.RangeIndex(len(ids))
+        for column in ('acronym_substructure', 'name_substructure', 'detail'):
+            if column in table:
+                table[column] = table[column].fillna('')
+    return volume, table, region_colors(volume, table)
 
 
 # ---- cells from a CSV ------------------------------------------------------------------------------------------
@@ -484,8 +586,11 @@ class InfoWindow:
         self.app.root.update_idletasks()
         x = self.app.root.winfo_x() + self.app.root.winfo_width() + 8
         self.window.geometry(f"+{x}+{self.app.root.winfo_y()}")
+        self.app.last_root_pos = (self.app.root.winfo_x(), self.app.root.winfo_y())
 
     def show(self):
+        if self.window.state() == 'withdrawn' and self.app.follow_var.get():
+            self.place_beside()
         self.window.deiconify()
         self.window.lift()
 
@@ -565,6 +670,14 @@ class CCFBrowser:
         saved_slices = self.settings.get('slices', {})
         self.slices = {name: int(saved_slices.get(name, VOLUME_SHAPE[VIEW_AXIS[name]] // 2)) for name in VIEWS}
         self.lut_view = None           # the region colours at the chosen saturation
+        self.follow_var = tk.BooleanVar(value=bool(self.settings.get('follow_info', True)))
+        self.atlas_path = self.settings.get('atlas_path', '')   # '' = the CCF from the ABC atlas cache
+        self.alt_atlas_path = self.settings.get('alt_atlas_path', '') or self.atlas_path   # remembered for switching back
+        self.loaded_atlas_path = ''    # the atlas now on screen
+        self.settings_status = tk.StringVar()
+        self.atlas_loaded_once = False
+        self.last_root_pos = None
+        self.settings_window = None
         self.view = [1.0, 0.0, 0.0]   # scale, ox, oy
         self.fit = True
         self.drag = None
@@ -577,6 +690,7 @@ class CCFBrowser:
         self.info = InfoWindow(self)
         self.refresh_info_slice()
         self.root.after(150, self.info.place_beside)
+        self.root.bind('<Configure>', self.on_root_configure)
         self.root.after(100, self.poll_work)
         self.root.after(200, self.start_atlas)
         self.root.protocol('WM_DELETE_WINDOW', self.close)
@@ -616,6 +730,7 @@ class CCFBrowser:
         for name in VIEWS:
             ttk.Radiobutton(views, text=name, value=name, variable=self.view_var,
                             command=self.change_view).pack(side='left', padx=(6, 0))
+        ttk.Button(views, text="\u2699 Settings", command=self.open_settings).pack(side='right')
         ttk.Label(views, text="Atlas colour saturation").pack(side='left', padx=(24, 4))
         self.sat_var = tk.IntVar(value=int(self.settings.get('saturation', 100)))
         self.sat_label = ttk.Label(views, text="", width=5)
@@ -679,6 +794,90 @@ class CCFBrowser:
                 widget.drop_target_register(self.dnd_files)
                 widget.dnd_bind('<<Drop>>', lambda e: self.on_drop(e, None))
 
+    # ---- settings
+    def on_root_configure(self, event):
+        """Move the info window by as much as the main window moved, when that option is on."""
+        if event.widget is not self.root or self.last_root_pos is None:
+            return
+        position = (self.root.winfo_x(), self.root.winfo_y())
+        if position == self.last_root_pos:
+            return
+        dx, dy = position[0] - self.last_root_pos[0], position[1] - self.last_root_pos[1]
+        self.last_root_pos = position
+        window = self.info.window
+        if self.follow_var.get() and window.winfo_viewable():
+            window.geometry(f"+{window.winfo_x() + dx}+{window.winfo_y() + dy}")
+
+    def open_settings(self):
+        if self.settings_window is not None and self.settings_window.winfo_exists():
+            self.settings_window.lift()
+            return
+        window = self.settings_window = tk.Toplevel(self.root)
+        window.title("CCF browser: settings")
+        window.transient(self.root)
+        body = ttk.Frame(window, padding=12)
+        body.pack(fill='both', expand=True)
+        ttk.Checkbutton(body, text="Move the info window along when the main window is moved",
+                        variable=self.follow_var).pack(anchor='w')
+
+        box = ttk.LabelFrame(body, text="Atlas", padding=8)
+        box.pack(fill='x', pady=(12, 0))
+        mode = tk.StringVar(value='custom' if self.atlas_path else 'abc')
+        path_var = tk.StringVar(value=self.alt_atlas_path)
+        self.settings_status.set('')
+        ttk.Radiobutton(box, text="Allen CCF 2020, from the ABC atlas cache (default)", value='abc',
+                        variable=mode).pack(anchor='w')
+        ttk.Radiobutton(box, text="Another annotation volume (.nrrd, .nii or .nii.gz, 25 um, same grid):",
+                        value='custom', variable=mode).pack(anchor='w', pady=(6, 0))
+        row = ttk.Frame(box)
+        row.pack(fill='x', padx=(20, 0))
+        entry = ttk.Entry(row, textvariable=path_var, width=60)
+        entry.pack(side='left', fill='x', expand=True)
+
+        def browse():
+            current = path_var.get().strip().strip('"')
+            start = Path(current).parent if current else None
+            chosen = filedialog.askopenfilename(
+                title="Choose an annotation volume", parent=window,
+                initialdir=str(start) if start and start.is_dir() else None,
+                filetypes=[("Annotation volumes", "*.nrrd *.nii *.nii.gz"), ("All files", "*.*")])
+            if chosen:
+                path_var.set(chosen)
+                mode.set('custom')
+        ttk.Button(row, text="Browse…", command=browse).pack(side='left', padx=(4, 0))
+        ttk.Label(box, foreground='#555555', justify='left', wraplength=520, text=(
+            "Region names and colours come from an ontology*.csv in the same folder, if there is one (the Allen2017 "
+            "folder has ontology_api_2017.csv). Label numbers differ between the 2017 and ABC atlases.")).pack(
+            anchor='w', pady=(6, 0))
+        status = ttk.Label(body, textvariable=self.settings_status, foreground='#7a3b00')
+        status.pack(anchor='w', pady=(8, 0))
+
+        def apply_atlas():
+            wanted = path_var.get().strip().strip('"') if mode.get() == 'custom' else ''
+            if mode.get() == 'custom' and not Path(wanted).is_file():
+                self.settings_status.set("Choose an existing atlas file first.")
+                return
+            if wanted == self.atlas_path:
+                self.settings_status.set("That atlas is already in use.")
+                return
+            if self.busy_label:
+                self.settings_status.set("Busy loading; try again when it finishes.")
+                return
+            self.atlas_path = wanted
+            if wanted:
+                self.alt_atlas_path = wanted
+            self.settings.update({'atlas_path': wanted, 'alt_atlas_path': self.alt_atlas_path})
+            save_settings(self.settings)
+            self.start_atlas()
+            self.settings_status.set("Loading the atlas…")
+
+        buttons = ttk.Frame(body)
+        buttons.pack(fill='x', pady=(10, 0))
+        ttk.Button(buttons, text="Close", command=window.destroy).pack(side='right')
+        ttk.Button(buttons, text="Apply atlas", command=apply_atlas).pack(side='right', padx=(0, 6))
+        x = self.root.winfo_x() + 80
+        window.geometry(f"+{x}+{self.root.winfo_y() + 80}")
+
     # ---- background work
     def run_in_thread(self, label, function, on_done):
         """Run `function()` on a thread; `on_done(result, error)` runs on the main thread when it finishes."""
@@ -708,6 +907,10 @@ class CCFBrowser:
 
     # ---- the atlas
     def start_atlas(self):
+        if self.atlas_path:
+            name = Path(self.atlas_path).name
+            self.run_in_thread(f"Loading {name}…", lambda: load_custom_atlas(self.atlas_path), self.atlas_ready)
+            return
         base = find_atlas_cache_dir()
         if base is None:
             self.message.configure(text="No atlas folder chosen.")
@@ -728,12 +931,26 @@ class CCFBrowser:
 
     def atlas_ready(self, result, error):
         if error is not None:
-            messagebox.showerror("CCF atlas", f"Could not load the CCF annotation volume:\n{error}", parent=self.root)
+            messagebox.showerror("CCF atlas", f"Could not load the annotation volume:\n{error}", parent=self.root)
+            self.settings_status.set("Could not load that atlas.")
+            if self.volume is not None:   # a switch that failed: the previous atlas is still the one on screen
+                self.atlas_path = self.loaded_atlas_path
+                self.settings['atlas_path'] = self.atlas_path
+            if self.atlas_path and self.volume is None:   # a bad custom file at startup: fall back to the default
+                self.atlas_path = ''
+                self.start_atlas()
             return
         self.volume, self.region_table, self.lut = result
+        self.loaded_atlas_path = self.atlas_path
+        self.settings_status.set("Atlas loaded: " + (Path(self.atlas_path).name if self.atlas_path else "default CCF"))
+        self.root.title("CCF browser" + (f" - {Path(self.atlas_path).name}" if self.atlas_path else ""))
         self.apply_saturation()
         self.fit_to_window()
         self.refresh_all()
+        self.on_leave()
+        if self.atlas_loaded_once:   # the atlas was swapped; the CSVs stay as they are
+            return
+        self.atlas_loaded_once = True
         self.autoload = [(s, s.start_text.strip().strip('"')) for s in self.slots
                          if s.start_text.strip() and Path(s.start_text.strip().strip('"')).is_file()]
         self.load_next_saved()
@@ -1010,8 +1227,10 @@ class CCFBrowser:
         if self.region_table is None or label not in self.region_table.index:
             return f"{label}"
         row = self.region_table.loc[label]
-        return (f"{label}  {row['acronym_substructure']}  ({row['name_substructure']})\n"
-                f"    structure: {row['acronym_structure']}   division: {row['acronym_division']}")
+        text = str(int(row['region_id'])) if 'region_id' in row.index else str(label)
+        if row.get('acronym_substructure'):
+            text += f"  {row['acronym_substructure']}  ({row.get('name_substructure', '')})"
+        return text + (f"\n    {row['detail']}" if row.get('detail') else '')
 
     def refresh_info_slice(self):
         lines = [(f"{self.view_name} slice {self.slice + 1} of {self.n_slices}   "
@@ -1103,7 +1322,8 @@ class CCFBrowser:
 
     # ---- lifecycle
     def close(self):
-        self.settings.update({'view': self.view_name, 'slices': self.slices,
+        self.settings.update({'follow_info': bool(self.follow_var.get()), 'atlas_path': self.atlas_path,
+                              'alt_atlas_path': self.alt_atlas_path, 'view': self.view_name, 'slices': self.slices,
                               'saturation': int(round(float(self.sat_var.get()))), 'slab': int(self.slab_var.get() or 0),
                               'dot': int(self.dot_var.get() or 1), 'mode': self.mode_var.get()})
         for slot in self.slots:
