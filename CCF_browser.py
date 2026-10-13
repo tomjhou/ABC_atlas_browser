@@ -14,7 +14,8 @@ Each group of cells (the group_id, or the marker) gets its own colour and marker
 the image shows the slice, the cursor's coordinates and region, and the cell nearest the cursor.
 
 Run:  python CCF_browser.py
-Mouse: wheel = next/previous slice (shift: 10 slices); ctrl+wheel or +/- = zoom; drag = pan; 0 = fit to window.
+Mouse: shift+wheel = next/previous slice (ctrl+shift: 10 slices); wheel = zoom about the cursor (Settings can swap it
+with ctrl+wheel); +/- also zoom; drag = pan; 0 = fit to window.
 """
 import json
 import queue
@@ -53,6 +54,17 @@ GROUP_SHAPES = ('circle', 'plus', 'square', 'triangle', 'diamond', 'x')
 SHAPE_SYMBOLS = {'circle': '●', 'plus': '+', 'square': '■', 'triangle': '▲', 'diamond': '◆',
                  'x': '×'}
 ATLAS_MODES = ('Regions', 'Regions (dim)', 'Boundaries')
+DIFF_MODE = 'Differences from CCF 2020'   # offered only while another atlas is loaded
+DIFF_MODE_MERGED = 'Differences (X-unassigned = X)'   # the same, ignoring a trailing '-unassigned' on region names
+DIFF_MODES = (DIFF_MODE, DIFF_MODE_MERGED)
+UNASSIGNED_SUFFIX = '-unassigned'
+PANE_GAP = 2                 # pixels between the two panes of the Differences view
+# Bregma in CCF coordinates (mm: AP from the anterior edge, DV from the dorsal edge, ML from the left). The CCF does not
+# define bregma, so this is a convention; the default is, as far as I know, the one used by the International Brain
+# Laboratory's atlas tools, and sources differ by a few hundred um. Editable in Settings.
+BREGMA_DEFAULT_MM = (5.400, 0.332, 5.739)
+TIP_DELAY_MS = 350           # how long the pointer rests before the region tool tip appears
+DIFF_DIM_PERCENT = 18        # brightness of the regions that do not differ, in the Differences view
 VIEWS = ('Coronal', 'Sagittal', 'Horizontal')
 VIEW_AXIS = {'Coronal': 0, 'Sagittal': 2, 'Horizontal': 1}        # volume axis [AP, DV, ML] stepped through
 VIEW_CELL_AXES = {'Coronal': (2, 1), 'Sagittal': (0, 1), 'Horizontal': (2, 0)}   # axes drawn across (u) and down (v)
@@ -188,6 +200,69 @@ def load_atlas(base, download):
         print(f"Region names and colours unavailable ({e}); regions are coloured by label number only.")
 
     return volume, table, region_colors(volume, table)
+
+
+def quiet_atlas_cache_dir():
+    """Like find_atlas_cache_dir, but never asks: the saved or default ABC atlas folder, else None."""
+    try:
+        saved = json.loads(ATLAS_CACHE_LOCATION_FILE.read_text(encoding='utf-8')).get('path')
+    except (OSError, ValueError, AttributeError):
+        saved = None
+    if saved and Path(saved).is_dir():
+        return Path(saved)
+    return DEFAULT_ATLAS_CACHE_DIR if DEFAULT_ATLAS_CACHE_DIR.is_dir() else None
+
+
+def comparison_luts(alt_table, alt_size, alt_ids, ref_table, ref_size, merge_unassigned=False):
+    """(alt_lut, ref_lut, basis): label -> comparison code for the alternate and the standard atlas, so two voxels have
+    the same code exactly when they are the same region. Regions are matched by substructure acronym when both atlases
+    name their regions that way (the label numbers of two atlases need not agree), else by region number: the real id
+    of a remapped atlas, or the label itself. Code 0 is outside the brain. With `merge_unassigned`, a name ending in
+    '-unassigned' counts as the same region as the name without it (e.g. MB-unassigned = MB): it only applies when
+    regions are matched by name."""
+    def acronyms(table):
+        if table is None or 'acronym_substructure' not in table.columns:
+            return None
+        names = table['acronym_substructure'].fillna('').astype(str)
+        if merge_unassigned:
+            names = names.where(~names.str.endswith(UNASSIGNED_SUFFIX), names.str[:-len(UNASSIGNED_SUFFIX)])
+        return names.to_dict() if names.str.len().gt(0).any() else None
+
+    alt_names, ref_names = acronyms(alt_table), acronyms(ref_table)
+    by_name = alt_names is not None and ref_names is not None
+    codes = {}
+
+    def build(names, size, ids):
+        lut = np.zeros(size, dtype=np.int32)
+        for label in range(size):
+            real = int(ids[label]) if ids is not None and label < len(ids) else label
+            if real == 0:
+                continue
+            key = (names.get(label) or f"#{real}") if by_name else real
+            lut[label] = codes.setdefault(key, len(codes) + 1)
+        return lut
+
+    return (build(alt_names, alt_size, alt_ids), build(ref_names, ref_size, None),
+            ("region acronym" + (", X-unassigned = X" if merge_unassigned else "")) if by_name else "region number")
+
+
+def diff_panes(labels, lut, ref_labels, ref_lut, alt_codes, ref_codes):
+    """(left_rgb, right_rgb, counts) for the Differences view: the standard atlas's slice and the alternate atlas's
+    slice, both with their own region colours markedly dimmed except where the two differ, which keep their normal
+    brightness. `counts` = voxels (both have tissue but different regions, tissue only in the alternate, tissue only
+    in the standard)."""
+    alt, ref = alt_codes[labels], ref_codes[ref_labels]
+    changed = alt != ref
+
+    def pane(slice_labels, colors):
+        rgb = colors[slice_labels]
+        dimmed = (rgb.astype(np.uint16) * DIFF_DIM_PERCENT // 100).astype(np.uint8)
+        dimmed[changed] = rgb[changed]
+        return dimmed
+
+    counts = (int((changed & (alt > 0) & (ref > 0)).sum()), int((changed & (ref == 0)).sum()),
+              int((changed & (alt == 0)).sum()))
+    return pane(ref_labels, ref_lut), pane(labels, lut), counts
 
 
 def region_colors(volume, table):
@@ -611,7 +686,16 @@ def atlas_rgb(labels, lut, mode):
     return rgb
 
 
-def render_frame(labels, lut, mode, view, size, layers=(), radius=3, overlay=None):
+def outline_edges(labels):
+    """Boolean mask of the pixels whose region differs from the pixel to their left or above: a one-pixel line along
+    every region boundary."""
+    edge = np.zeros(labels.shape, dtype=bool)
+    edge[:, 1:] |= labels[:, 1:] != labels[:, :-1]
+    edge[1:, :] |= labels[1:, :] != labels[:-1, :]
+    return edge
+
+
+def render_frame(labels, lut, mode, view, size, layers=(), radius=3, overlay=None, base_rgb=None, outlines=None):
     """The picture of one slice as an (H, W, 3) uint8 array. `view` = (scale, ox, oy) maps image coordinates (voxel
     edges) to canvas pixels as ox + u * scale. `layers` = [(u_um, v_um, group_codes, styles)], one
     per CSV, of the cells to stamp on it (later layers on top); `styles` = [(colour, shape)] per group."""
@@ -619,7 +703,7 @@ def render_frame(labels, lut, mode, view, size, layers=(), radius=3, overlay=Non
     scale, ox, oy = view
     canvas = np.empty((height, width, 3), dtype=np.uint8)
     canvas[:] = BACKGROUND
-    rgb = atlas_rgb(labels, lut, mode)
+    rgb = base_rgb if base_rgb is not None else atlas_rgb(labels, lut, mode)
     if overlay is not None and overlay.any():   # the painted voxels not yet applied, in red
         rgb = rgb.copy()
         rgb[overlay] = (rgb[overlay] * 0.35 + np.array([255, 0, 0]) * 0.65).astype(np.uint8)
@@ -630,6 +714,15 @@ def render_frame(labels, lut, mode, view, size, layers=(), radius=3, overlay=Non
         dest_x, dest_y = int(round(ox + u0 * scale)), int(round(oy + v0 * scale))
         dest_w, dest_h = max(1, int(round((u1 - u0) * scale))), max(1, int(round((v1 - v0) * scale)))
         piece = np.asarray(Image.fromarray(rgb).resize((dest_w, dest_h), Image.NEAREST, box=(u0, v0, u1, v1)))
+        if outlines is not None:
+            # One screen pixel wide whatever the zoom: found on the picture as drawn (each screen pixel takes the region
+            # of its nearest voxel, as the resize above does), not on the voxel grid.
+            cols = np.clip(np.floor(u0 + (np.arange(dest_w) + 0.5) * (u1 - u0) / dest_w).astype(np.int64), 0, image_w - 1)
+            rows = np.clip(np.floor(v0 + (np.arange(dest_h) + 0.5) * (v1 - v0) / dest_h).astype(np.int64), 0, image_h - 1)
+            edge = outline_edges(labels[rows][:, cols])
+            color, alpha = outlines
+            piece = piece.copy()
+            piece[edge] = (piece[edge] * (1.0 - alpha) + np.array(color) * alpha).astype(np.uint8)
         x0, y0 = max(0, dest_x), max(0, dest_y)
         x1, y1 = min(width, dest_x + dest_w), min(height, dest_y + dest_h)
         if x1 > x0 and y1 > y0:
@@ -777,6 +870,13 @@ class CCFBrowser:
         self.root.geometry("1100x800+60+40")
         self.settings = load_settings()
         self.volume = self.region_table = self.lut = None
+        self.reference = None          # the standard CCF (volume, table, lut) while another atlas is on screen
+        self.reference_loading = False
+        self.diff_cache = None         # (key, alt_lut, ref_lut, basis, totals or None)
+        self.ref_lut_view = None       # the standard atlas's colours at the chosen saturation
+        self.panes_shown = 1           # 2 in the Differences view: standard atlas left, the alternate right
+        self.tip_job = None            # pending after() that shows the region tool tip
+        self.tip_active = False        # once a tool tip has appeared it stays up and follows the pointer
         self.slots = [Slot(i) for i in range(self.SLOTS)]
         self.photo = None
         self.view_name = self.settings.get('view', VIEWS[0]) if self.settings.get('view') in VIEWS else VIEWS[0]
@@ -793,6 +893,11 @@ class CCFBrowser:
         self.zoom_goal = None          # scale the smooth zoom is heading for, None when not zooming
         self.zoom_anchor = None        # (canvas x, canvas y, image u, image v) kept fixed during the zoom
         self.wheel_zoom_var = tk.BooleanVar(value=bool(self.settings.get('wheel_zoom', True)))
+        try:
+            self.bregma = [float(v) for v in self.settings['bregma_mm']][:3]
+            assert len(self.bregma) == 3
+        except Exception:
+            self.bregma = list(BREGMA_DEFAULT_MM)
         self.settings_window = None
         self.label_ids = None          # real ids of a remapped atlas (volume holds 0..n-1), else None
         self.overlay = None            # bool volume of the red painted voxels, made on first use
@@ -810,7 +915,10 @@ class CCFBrowser:
         self.paint_value_var = tk.StringVar(value=self.settings.get('paint_value', ''))
         self.paint_warning = tk.StringVar()
         self.paint_status = tk.StringVar()
-        self.brush_var = tk.IntVar(value=int(self.settings.get('brush', 5)))
+        # The paint dialog's brush radius counts from 1 (1 = just the voxel under the pointer); an older settings file
+        # stored it from 0 under 'brush'.
+        self.brush_var = tk.IntVar(value=int(self.settings['brush_radius']) if 'brush_radius' in self.settings
+                                   else int(self.settings.get('brush', 5)) + 1)
         self.view = [1.0, 0.0, 0.0]   # scale, ox, oy
         self.fit = True
         self.drag = None
@@ -883,9 +991,13 @@ class CCFBrowser:
                     command=self.refresh_all).pack(side='left', padx=(3, 10))
         ttk.Label(controls, text="Atlas").pack(side='left')
         self.mode_var = tk.StringVar(value=self.settings.get('mode', ATLAS_MODES[0]))
-        mode_box = ttk.Combobox(controls, textvariable=self.mode_var, state='readonly', width=14, values=ATLAS_MODES)
+        mode_box = self.mode_box = ttk.Combobox(controls, textvariable=self.mode_var, state='readonly', width=28,
+                                               values=ATLAS_MODES)
         mode_box.pack(side='left', padx=3)
-        mode_box.bind('<<ComboboxSelected>>', lambda e: self.refresh_all())
+        mode_box.bind('<<ComboboxSelected>>', lambda e: self.mode_changed())
+        self.outline_var = tk.BooleanVar(value=bool(self.settings.get('outlines', True)))
+        ttk.Checkbutton(controls, text="Region outlines", variable=self.outline_var,
+                        command=self.request_render).pack(side='left', padx=(8, 0))
         ttk.Button(controls, text="Info window", command=lambda: self.info.show()).pack(side='left', padx=(10, 0))
         ttk.Button(controls, text="Paint panel", command=self.open_paint).pack(side='left', padx=(4, 0))
         for variable in (self.slab_var, self.dot_var):
@@ -895,7 +1007,7 @@ class CCFBrowser:
 
         bottom = ttk.Frame(root, padding=(6, 2, 6, 6))
         bottom.pack(side='bottom', fill='x')
-        self.slice_label = ttk.Label(bottom, text="", width=34)
+        self.slice_label = ttk.Label(bottom, text="", width=52)
         self.slice_label.pack(side='left')
         self.scrollbar = tk.Scrollbar(bottom, orient='horizontal', command=self.on_scrollbar)
         self.scrollbar.pack(side='left', fill='x', expand=True)
@@ -933,7 +1045,7 @@ class CCFBrowser:
     def paint_to(self, x, y):
         """Draw or erase the brush disk (and the stretch since the last mouse position) on the overlay."""
         scale, ox, oy = self.view
-        u, v = int(np.floor((x - ox) / scale)), int(np.floor((y - oy) / scale))
+        u, v = int(np.floor((self.pane_x(x) - ox) / scale)), int(np.floor((y - oy) / scale))
         previous, self.last_paint = self.last_paint, (u, v)
         if previous is None:
             centers = np.array([[u, v]])
@@ -941,7 +1053,7 @@ class CCFBrowser:
             steps = max(1, abs(u - previous[0]), abs(v - previous[1]))
             fractions = np.linspace(0, 1, steps + 1)[:, None]
             centers = np.rint(np.array(previous) + (np.array([u, v]) - np.array(previous)) * fractions).astype(np.int64)
-        dx, dy = disk_offsets(self.brush_var.get() or 0)
+        dx, dy = disk_offsets(self.brush_radius())
         us = (centers[:, 0, None] + dx[None, :]).ravel()
         vs = (centers[:, 1, None] + dy[None, :]).ravel()
         image_w, image_h = VIEW_IMAGE_SIZE[self.view_name]
@@ -968,8 +1080,10 @@ class CCFBrowser:
         """With the paint panel open: a menu to add the region under the cursor to the drawing, or remove it."""
         if self.volume is None or self.paint_window is None or not self.paint_window.winfo_exists():
             return
+        if not self.in_paint_pane(event.x):
+            return   # the standard atlas at the left is never edited
         scale, ox, oy = self.view
-        u_idx, v_idx = int(np.floor((event.x - ox) / scale)), int(np.floor((event.y - oy) / scale))
+        u_idx, v_idx = int(np.floor((self.pane_x(event.x) - ox) / scale)), int(np.floor((event.y - oy) / scale))
         image_w, image_h = VIEW_IMAGE_SIZE[self.view_name]
         if not (0 <= u_idx < image_w and 0 <= v_idx < image_h):
             return
@@ -1005,18 +1119,39 @@ class CCFBrowser:
         self.refresh_all()
         self.update_paint_status()
 
+    def brush_radius(self):
+        """How many voxels the brush reaches beyond the one under the pointer: the dialog's one-based radius minus 1."""
+        try:
+            return max(0, int(self.brush_var.get()) - 1)
+        except (tk.TclError, ValueError):   # the box is empty while it is being retyped
+            return 0
+
     def draw_brush(self):
-        """The brush outline following the cursor while a paint tool is on."""
+        """The brush outline following the cursor while a paint tool is on. In the Differences view it is shown on both
+        maps at the same place: solid on the alternate atlas at the right (where painting happens), dashed on the
+        standard atlas at the left, to show which voxels there the painting has to match."""
         self.canvas.delete('brush')
         if self.tool == 'none' or self.mouse is None:
             return
-        radius = ((self.brush_var.get() or 0) + 0.5) * self.view[0]
+        paintable = self.in_paint_pane(self.mouse[0])
+        if not self.busy_label:
+            self.canvas.configure(cursor='pencil' if paintable else 'crosshair')
+        radius = (self.brush_radius() + 0.5) * self.view[0]
         x, y = self.mouse
-        self.canvas.create_oval(x - radius, y - radius, x + radius, y + radius, outline='#ff4040', tags='brush')
+        if self.pane_count() == 2:
+            x_in_pane = self.pane_x(x)
+            right_start = self.pane_width() + PANE_GAP
+            for origin, solid in ((0, False), (right_start, True)):
+                cx = origin + x_in_pane
+                self.canvas.create_oval(cx - radius, y - radius, cx + radius, y + radius, outline='#ff4040',
+                                        dash=() if solid else (4, 3), tags='brush')
+        else:
+            self.canvas.create_oval(x - radius, y - radius, x + radius, y + radius, outline='#ff4040', tags='brush')
 
     def set_tool(self, tool):
         """Switch the paint tool on (draw / erase), or off (the same tool again, or 'none'): dragging pans when off."""
         self.tool = 'none' if tool == self.tool else tool
+        self.deactivate_tip()
         self.update_cursors()
         for name, button in self.paint_buttons.items():
             if button.winfo_exists():
@@ -1151,7 +1286,7 @@ class CCFBrowser:
         grid = ttk.Frame(body)
         grid.pack(fill='x')
         ttk.Label(grid, text="Brush radius (voxels)").grid(row=0, column=0, sticky='w')
-        ttk.Spinbox(grid, from_=0, to=100, width=6, textvariable=self.brush_var).grid(row=0, column=1, padx=(8, 0),
+        ttk.Spinbox(grid, from_=1, to=101, width=6, textvariable=self.brush_var).grid(row=0, column=1, padx=(8, 0),
                                                                                     sticky='w')
         ttk.Label(grid, text="Pixel value").grid(row=1, column=0, sticky='w', pady=(6, 0))
         entry = ttk.Entry(grid, textvariable=self.paint_value_var, width=14)
@@ -1306,7 +1441,7 @@ class CCFBrowser:
         body.pack(fill='both', expand=True)
         ttk.Checkbutton(body, text="Move the info window along when the main window is moved",
                         variable=self.follow_var).pack(anchor='w')
-        ttk.Checkbutton(body, text="Mouse wheel zooms (Ctrl+wheel steps through slices; off: the other way round)",
+        ttk.Checkbutton(body, text="Mouse wheel zooms (Ctrl+wheel steps through slices; off: the other way round; Shift+wheel always steps)",
                         variable=self.wheel_zoom_var).pack(anchor='w', pady=(4, 0))
 
         box = ttk.LabelFrame(body, text="Atlas", padding=8)
@@ -1338,6 +1473,35 @@ class CCFBrowser:
             "Region names and colours come from an ontology*.csv in the same folder, if there is one (the Allen2017 "
             "folder has ontology_api_2017.csv). Label numbers differ between the 2017 and ABC atlases.")).pack(
             anchor='w', pady=(6, 0))
+        bregma_box = ttk.LabelFrame(body, text="Bregma (CCF mm)", padding=8)
+        bregma_box.pack(fill='x', pady=(12, 0))
+        bregma_vars = [tk.StringVar(value=f"{value:g}") for value in self.bregma]
+
+        def bregma_edited(*_args):
+            try:
+                values = [float(v.get()) for v in bregma_vars]
+            except ValueError:
+                return   # half-typed: keep the last good position
+            self.bregma = values
+            if self.volume is not None:
+                self.refresh_all()
+                self.on_leave()
+
+        for column, (name, var) in enumerate(zip(("AP", "DV", "ML"), bregma_vars)):
+            ttk.Label(bregma_box, text=name).grid(row=0, column=2 * column, padx=(0 if column == 0 else 12, 4))
+            ttk.Entry(bregma_box, textvariable=var, width=8).grid(row=0, column=2 * column + 1)
+            var.trace_add('write', bregma_edited)
+
+        def reset_bregma():
+            for var, value in zip(bregma_vars, BREGMA_DEFAULT_MM):
+                var.set(f"{value:g}")
+
+        ttk.Button(bregma_box, text="Reset", command=reset_bregma).grid(row=0, column=6, padx=(14, 0))
+        ttk.Label(bregma_box, foreground='#555555', justify='left', wraplength=520, text=(
+            "Where bregma lies in the CCF (AP from the anterior edge, DV from the dorsal edge, ML from the left edge). "
+            "The CCF does not define it; the default follows the IBL atlas convention, and sources differ by a few "
+            "hundred um, so enter your lab's values. The info window then also gives positions relative to bregma "
+            "(AP + anterior, DV + dorsal).")).grid(row=1, column=0, columnspan=7, sticky='w', pady=(6, 0))
         status = ttk.Label(body, textvariable=self.settings_status, foreground='#7a3b00')
         status.pack(anchor='w', pady=(8, 0))
 
@@ -1435,6 +1599,7 @@ class CCFBrowser:
             return
         self.volume, self.region_table, self.lut = result
         self.loaded_atlas_path = self.atlas_path
+        self.update_comparison_mode()
         self.label_ids = (self.region_table['region_id'].to_numpy()
                           if self.region_table is not None and 'region_id' in self.region_table else None)
         self.overlay, self.overlay_count, self.edit_count, self.undo_stack = None, 0, 0, []
@@ -1454,11 +1619,90 @@ class CCFBrowser:
                          if s.start_text.strip() and Path(s.start_text.strip().strip('"')).is_file()]
         self.load_next_saved()
 
+    def update_comparison_mode(self):
+        """Offer the Differences mode (and load the standard CCF to compare with) while an alternate atlas is on
+        screen; take both away when the standard atlas itself is."""
+        alternate = bool(self.loaded_atlas_path)
+        self.diff_cache = None
+        if alternate:
+            self.mode_box.configure(values=ATLAS_MODES + DIFF_MODES)
+            if self.reference is None and not self.reference_loading:
+                base = quiet_atlas_cache_dir()
+                _path, _size, present = volume_status(base) if base is not None else (None, None, False)
+                if present:
+                    self.reference_loading = True
+                    self.run_in_thread("Loading the standard CCF to compare with…",
+                                       lambda: load_atlas(base, False), self.reference_ready)
+                else:
+                    self.message.configure(text="The standard CCF is not in the atlas cache, so differences cannot be shown.")
+        else:
+            self.reference = None
+            self.mode_box.configure(values=ATLAS_MODES)
+            if self.mode_var.get() in DIFF_MODES:
+                self.mode_var.set(ATLAS_MODES[0])
+        self.sync_panes()
+
+    def reference_ready(self, result, error):
+        self.reference_loading = False
+        if error is not None:
+            self.reference = None
+            self.message.configure(text=f"Could not load the standard CCF for comparison: {error}")
+            return
+        volume, table, lut = result
+        self.reference = {'volume': volume, 'table': table, 'lut': lut}
+        self.diff_cache = None
+        self.apply_saturation()
+        self.sync_panes()
+        self.refresh_all()
+        self.on_leave()
+
+    def diff_state(self):
+        """(alt_lut, ref_lut, basis) for comparing the atlas on screen with the standard one, or None while the
+        standard one is not loaded. Rebuilt when the volume's regions change (painting adds labels)."""
+        if self.reference is None or self.volume is None or not self.loaded_atlas_path:
+            return None
+        merge = self.mode_var.get() == DIFF_MODE_MERGED
+        key = (id(self.region_table), len(self.lut), self.edit_version, id(self.reference), merge)
+        if self.diff_cache is None or self.diff_cache[0] != key:
+            alt_lut, ref_lut, basis = comparison_luts(
+                self.region_table, len(self.lut), self.label_ids, self.reference['table'], len(self.reference['lut']),
+                merge_unassigned=merge)
+            self.diff_cache = (key, alt_lut, ref_lut, basis, None)
+        return self.diff_cache[1:4]
+
+    def diff_totals(self):
+        """Whole-volume voxel counts (changed, only alternate, only standard), computed once per state of the volume."""
+        if self.diff_state() is None:
+            return None
+        if self.diff_cache[4] is None:
+            alt_lut, ref_lut = self.diff_cache[1], self.diff_cache[2]
+            totals = np.zeros(3, dtype=np.int64)
+            for start in range(0, self.volume.shape[0], 16):
+                alt = alt_lut[self.volume[start:start + 16]]
+                ref = ref_lut[self.reference['volume'][start:start + 16]]
+                changed = alt != ref
+                totals += (int((changed & (alt > 0) & (ref > 0)).sum()), int((changed & (ref == 0)).sum()),
+                           int((changed & (alt == 0)).sum()))
+            self.diff_cache = self.diff_cache[:4] + (tuple(int(t) for t in totals),)
+        return self.diff_cache[4]
+
+    def diff_slice(self):
+        """(left_rgb, right_rgb, counts) of the Differences view of the current slice, or None while it cannot be made."""
+        state = self.diff_state()
+        if state is None or self.ref_lut_view is None:
+            return None
+        return diff_panes(view_slice(self.volume, self.view_name, self.slice), self.lut_view,
+                          view_slice(self.reference['volume'], self.view_name, self.slice), self.ref_lut_view,
+                          state[0], state[1])
+
     def apply_saturation(self):
         value = int(round(float(self.sat_var.get())))
         self.sat_label.configure(text=f"{value}%")
         if self.lut is not None:
             self.lut_view = desaturated(self.lut.astype(np.float32), value / 100.0) if value < 100 else self.lut
+        if self.reference is not None:
+            ref_lut = self.reference['lut']
+            self.ref_lut_view = desaturated(ref_lut.astype(np.float32), value / 100.0) if value < 100 else ref_lut
 
     def change_saturation(self):
         self.apply_saturation()
@@ -1645,17 +1889,78 @@ class CCFBrowser:
             self.step(int(args[1]) * (10 if args[2] == 'pages' else 1))
 
     def on_wheel(self, event):
-        """The wheel zooms about the cursor (or steps through slices, shift: 10); Ctrl swaps the two."""
-        if bool(event.state & 0x4) == self.wheel_zoom_var.get():   # slices
-            self.step((10 if event.state & 0x1 else 1) * (-1 if event.delta > 0 else 1))
+        """Shift+wheel always steps through the slices one at a time (Ctrl+Shift+wheel: ten). Without Shift the wheel
+        zooms about the cursor or steps through slices, as set in Settings; Ctrl swaps the two."""
+        shift, ctrl = bool(event.state & 0x1), bool(event.state & 0x4)
+        direction = -1 if event.delta > 0 else 1
+        if shift:
+            self.step(direction * (10 if ctrl else 1))
+        elif ctrl == self.wheel_zoom_var.get():   # slices
+            self.step(direction)
         else:
-            self.zoom_at(1.2 ** (event.delta / 120.0), (event.x, event.y))
+            self.zoom_at(1.2 ** (event.delta / 120.0), (self.pane_x(event.x), event.y))
+
+    def pane_count(self):
+        """2 in the Differences view once the standard atlas to compare with is loaded, else 1."""
+        return 2 if (self.mode_var.get() in DIFF_MODES and self.reference is not None and self.loaded_atlas_path) else 1
+
+    def pane_width(self):
+        count = self.pane_count()
+        return max(50, (self.canvas.winfo_width() - PANE_GAP * (count - 1)) // count)
+
+    def pane_x(self, x):
+        """A canvas x position as an x position within the pane it is over (both panes show the same view)."""
+        if self.pane_count() == 2:
+            right_start = self.pane_width() + PANE_GAP
+            return x - right_start if x >= right_start else x
+        return x
+
+    def in_paint_pane(self, x):
+        """Whether painting is allowed at canvas x: always with one map, and in the Differences view only on the right
+        (the alternate atlas), never on the standard atlas at the left."""
+        return self.pane_count() == 1 or x >= self.pane_width() + PANE_GAP
+
+    def sync_panes(self):
+        """Refit the picture when the number of panes just changed."""
+        count = self.pane_count()
+        if count != self.panes_shown:
+            self.panes_shown = count
+            if self.volume is not None:
+                self.fit_to_window()
+
+    def mode_changed(self):
+        self.sync_panes()
+        self.refresh_all()
+
+    def canvas_size(self):
+        """(width of one pane, height): the area the picture is fitted into."""
+        return self.pane_width(), max(50, self.canvas.winfo_height())
+
+    def fit_scale(self):
+        """The scale at which the whole image just fits the window: the most zoomed-out view there is."""
+        width, height = self.canvas_size()
+        image_w, image_h = VIEW_IMAGE_SIZE[self.view_name]
+        return min(width / image_w, height / image_h) * 0.97
+
+    def clamp_view(self):
+        """Keep the picture covering the window: along an axis where it is larger than the window it cannot be panned
+        past its edge, and where it is smaller it stays centred. So no blank space beyond the image can be brought
+        into view by panning or zooming."""
+        scale, ox, oy = self.view
+        width, height = self.canvas_size()
+        image_w, image_h = VIEW_IMAGE_SIZE[self.view_name]
+
+        def limited(offset, extent, image_extent):
+            size = image_extent * scale
+            return (extent - size) / 2 if size <= extent else min(0.0, max(extent - size, offset))
+
+        self.view[1], self.view[2] = limited(ox, width, image_w), limited(oy, height, image_h)
 
     def fit_to_window(self):
         self.zoom_goal = None
-        width, height = max(50, self.canvas.winfo_width()), max(50, self.canvas.winfo_height())
+        width, height = self.canvas_size()
         image_w, image_h = VIEW_IMAGE_SIZE[self.view_name]
-        scale = min(width / image_w, height / image_h) * 0.97
+        scale = self.fit_scale()
         self.view = [scale, (width - image_w * scale) / 2, (height - image_h * scale) / 2]
         self.fit = True
         self.request_render()
@@ -1664,9 +1969,9 @@ class CCFBrowser:
         """Zoom by `factor` about a canvas point (default the centre), easing toward the new scale over a few frames;
         wheel notches arriving meanwhile add up."""
         scale, ox, oy = self.view
-        ax, ay = anchor if anchor else (self.canvas.winfo_width() / 2, self.canvas.winfo_height() / 2)
+        ax, ay = anchor if anchor else (self.canvas_size()[0] / 2, self.canvas_size()[1] / 2)
         base = self.zoom_goal if self.zoom_goal is not None else scale
-        self.zoom_goal = min(max(base * factor, 0.5), 60.0)
+        self.zoom_goal = min(max(base * factor, self.fit_scale()), 60.0)   # never further out than the full view
         self.zoom_anchor = (ax, ay, (ax - ox) / scale, (ay - oy) / scale)
         self.fit = False
         if base == scale or self.zoom_goal != base:
@@ -1681,6 +1986,7 @@ class CCFBrowser:
         new_scale = self.zoom_goal if done else scale * ratio ** 0.22
         ax, ay, u, v = self.zoom_anchor
         self.view = [new_scale, ax - u * new_scale, ay - v * new_scale]
+        self.clamp_view()
         self.request_render()
         if done:
             self.zoom_goal = None
@@ -1689,7 +1995,8 @@ class CCFBrowser:
 
     def on_press(self, event):
         self.zoom_goal = None
-        if self.tool != 'none' and self.volume is not None:
+        self.deactivate_tip()
+        if self.tool != 'none' and self.volume is not None and self.in_paint_pane(event.x):
             if self.overlay is None:
                 self.overlay = np.zeros(VOLUME_SHAPE, dtype=bool)
             self.stroke, self.last_paint = [], None
@@ -1708,21 +2015,27 @@ class CCFBrowser:
 
     def on_drag(self, event):
         if self.stroke is not None:
-            self.paint_to(event.x, event.y)
+            if self.in_paint_pane(event.x):
+                self.paint_to(event.x, event.y)
+            else:
+                self.last_paint = None   # the stroke wandered onto the standard atlas: nothing is painted there
             self.mouse = (event.x, event.y)
             self.draw_brush()
             return
+        self.deactivate_tip()
         if self.drag is None:
             return
         x0, y0, ox, oy = self.drag
         self.view[1], self.view[2] = ox + event.x - x0, oy + event.y - y0
+        self.clamp_view()
         self.fit = False
         self.request_render()
 
     def on_canvas_resize(self):
-        if self.fit and self.volume is not None:
-            self.fit_to_window()
+        if self.volume is not None and (self.fit or self.view[0] < self.fit_scale()):
+            self.fit_to_window()   # also when the window shrank below the current zoom: never smaller than the full view
         else:
+            self.clamp_view()
             self.request_render()
 
     # ---- drawing
@@ -1734,7 +2047,7 @@ class CCFBrowser:
         self.refresh_overall()
         self.scrollbar.set(self.slice / self.n_slices, (self.slice + 1) / self.n_slices)
         self.slice_label.configure(text=f"{self.view_name} {self.slice + 1} / {self.n_slices}   "
-                                        f"{AXIS_NAMES[self.axis]} {self.slice_um / 1000:.3f} mm")
+                                        f"{AXIS_NAMES[self.axis]} {self.slice_um / 1000:.3f} mm ({self.slice_bregma_text()})")
 
     def request_render(self):
         if not self.render_pending:
@@ -1755,8 +2068,27 @@ class CCFBrowser:
             return np.zeros(0, dtype=np.int64)
         return inside[slot.visible_mask[slot.points.codes[inside]]]
 
+    def outline_style(self, mode):
+        """(colour, opacity) of the region outlines for this display mode, or None for none: dark lines over the bright
+        regions, light ones over the dimmed views, and nothing in Boundaries (which is outlines already)."""
+        if not self.outline_var.get() or mode == 'Boundaries':
+            return None
+        return ((190, 190, 190), 0.35) if mode in ('Regions (dim)',) + DIFF_MODES else ((0, 0, 0), 0.6)
+
+    def draw_edge_labels(self, origin, pane_width, height):
+        top, bottom, left, right = VIEW_EDGE_LABELS[self.view_name]
+        for text, x, y, anchor in ((top, origin + pane_width / 2, 10, 'n'), (bottom, origin + pane_width / 2, height - 8, 's'),
+                                   (left, origin + 8, height / 2, 'w'), (right, origin + pane_width - 8, height / 2, 'e')):
+            self.canvas.create_text(x, y, text=text, fill='#8a8a8a', anchor=anchor, tags='label', font=('Segoe UI', 9))
+
     def render(self):
+        self.render_picture()
+        if self.tip_active:
+            self.refresh_tip()
+
+    def render_picture(self):
         self.render_pending = False
+        self.sync_panes()
         width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
         if self.volume is None or width < 10 or height < 10:
             return
@@ -1768,23 +2100,160 @@ class CCFBrowser:
                 layers.append((slot.points.coords[across][shown], slot.points.coords[down][shown],
                                slot.points.codes[shown], slot.styles))
         overlay = view_slice(self.overlay, self.view_name, self.slice) if self.overlay_count > 0 else None
-        frame = render_frame(view_slice(self.volume, self.view_name, self.slice), self.lut_view, self.mode_var.get(),
-                             self.view, (width, height), layers, int(self.dot_var.get() or 1), overlay)
+        labels = view_slice(self.volume, self.view_name, self.slice)
+        radius = int(self.dot_var.get() or 1)
+        mode = self.mode_var.get()
+        compared = self.diff_slice() if self.pane_count() == 2 else None
+        self.canvas.delete('label')
+        if compared is not None:
+            # Differences: the standard atlas on the left, the alternate on the right, same view in both.
+            pane_w = self.pane_width()
+            ref_labels = view_slice(self.reference['volume'], self.view_name, self.slice)
+            outlines = self.outline_style('Regions (dim)')
+            left = render_frame(ref_labels, self.ref_lut_view, 'Regions', self.view, (pane_w, height), layers, radius,
+                                None, compared[0], outlines)
+            right = render_frame(labels, self.lut_view, 'Regions', self.view, (pane_w, height), layers, radius,
+                                 overlay, compared[1], outlines)
+            frame = np.empty((height, width, 3), dtype=np.uint8)
+            frame[:] = (90, 90, 90)
+            frame[:, :pane_w] = left
+            frame[:, pane_w + PANE_GAP:pane_w + PANE_GAP + pane_w] = right
+            self.photo = ImageTk.PhotoImage(Image.fromarray(frame))
+            self.canvas.itemconfigure(self.image_item, image=self.photo)
+            for origin, title in ((0, "CCF 2020"), (pane_w + PANE_GAP, Path(self.loaded_atlas_path).name)):
+                self.canvas.create_text(origin + 8, 8, text=title, fill='#d0d0d0', anchor='nw', tags='label',
+                                        font=('Segoe UI', 10, 'bold'))
+                self.draw_edge_labels(origin, pane_w, height)
+            return
+        if mode in DIFF_MODES:   # the standard atlas is still loading: just the dimmed alternate
+            mode = 'Regions (dim)'
+        frame = render_frame(labels, self.lut_view, mode, self.view, (width, height), layers, radius, overlay,
+                             None, self.outline_style(mode))
         self.photo = ImageTk.PhotoImage(Image.fromarray(frame))
         self.canvas.itemconfigure(self.image_item, image=self.photo)
-        self.canvas.delete('label')
-        top, bottom, left, right = VIEW_EDGE_LABELS[self.view_name]
-        for text, x, y, anchor in ((top, width / 2, 10, 'n'), (bottom, width / 2, height - 8, 's'),
-                                   (left, 8, height / 2, 'w'), (right, width - 8, height / 2, 'e')):
-            self.canvas.create_text(x, y, text=text, fill='#8a8a8a', anchor=anchor, tags='label', font=('Segoe UI', 9))
+        self.draw_edge_labels(0, width, height)
+
+    # ---- bregma
+    def bregma_mm(self, ap_um, dv_um, ml_um):
+        """(AP, DV, ML) in mm relative to bregma from CCF positions in um: AP is positive anterior of bregma, DV positive
+        dorsal (so negative below it), ML the distance from bregma's midline, positive toward the left hemisphere (the
+        side the info window already calls left)."""
+        return (self.bregma[0] - ap_um / 1000.0, self.bregma[1] - dv_um / 1000.0, ml_um / 1000.0 - self.bregma[2])
+
+    def bregma_text(self, ap_um, dv_um, ml_um):
+        ap, dv, ml = self.bregma_mm(ap_um, dv_um, ml_um)
+        return f"Bregma mm: AP {ap:+.3f}   DV {dv:+.3f}   ML {abs(ml):.3f} {'left' if ml >= 0 else 'right'}"
+
+    def slice_bregma_text(self):
+        """The current slice's position relative to bregma along its own axis, e.g. 'bregma -1.250 mm'."""
+        value = self.slice_um / 1000.0
+        relative = (self.bregma[0] - value, self.bregma[1] - value, value - self.bregma[2])[self.axis]
+        return f"bregma {relative:+.3f} mm"
+
+    # ---- region tool tips
+    def tip_text(self, label, table):
+        """Region number and name for a tool tip."""
+        if label == 0:
+            return "0\noutside the brain"
+        if table is None or label not in table.index:
+            return f"{label}"
+        row = table.loc[label]
+        number = str(int(row['region_id'])) if 'region_id' in row.index and pd.notna(row['region_id']) else str(label)
+        acronym, name = row.get('acronym_substructure'), row.get('name_substructure')
+        head = number + (f"  {acronym}" if isinstance(acronym, str) and acronym else '')
+        return head + (f"\n{name}" if isinstance(name, str) and name else '')
+
+    def hide_tip(self):
+        if self.tip_job is not None:
+            self.root.after_cancel(self.tip_job)
+            self.tip_job = None
+        self.canvas.delete('tip')
+
+    def schedule_tip(self):
+        if self.tip_job is None and self.mouse is not None and self.tool == 'none':
+            self.tip_job = self.root.after(TIP_DELAY_MS, self.show_tip)
+
+    def voxel_under_mouse(self):
+        """(AP, DV, ML) voxel index under the pointer, or None when it is outside the image."""
+        if self.mouse is None or self.volume is None:
+            return None
+        u, v = self.cursor_image_coords()
+        image_w, image_h = VIEW_IMAGE_SIZE[self.view_name]
+        u_idx, v_idx = int(np.floor(u)), int(np.floor(v))
+        if not (0 <= u_idx < image_w and 0 <= v_idx < image_h):
+            return None
+        across, down = VIEW_CELL_AXES[self.view_name]
+        voxel = [0, 0, 0]
+        voxel[self.axis], voxel[across], voxel[down] = self.slice, u_idx, v_idx
+        return tuple(voxel)
+
+    def draw_tip(self, x, y, origin, pane_width, text, ring=False):
+        """A note with `text` beside canvas point (x, y), kept inside the pane [origin, origin + pane_width)."""
+        if ring:   # marks the same place on the other map
+            self.canvas.create_oval(x - 5, y - 5, x + 5, y + 5, outline='#ffe000', width=2, tags='tip')
+        item = self.canvas.create_text(x + 14, y + 18, text=text, anchor='nw', fill='black', tags='tip',
+                                       font=('Segoe UI', 10))
+        x0, y0, x1, y1 = self.canvas.bbox(item)
+        pad = 4
+        dx = min(0, origin + pane_width - 2 - (x1 + pad)) if x1 + pad > origin + pane_width - 2 else 0
+        dy = min(0, self.canvas.winfo_height() - 2 - (y1 + pad)) if y1 + pad > self.canvas.winfo_height() - 2 else 0
+        if dy:   # no room below: put it above the pointer
+            dy = -(y1 - y0) - 36
+        self.canvas.move(item, dx, dy)
+        x0, y0, x1, y1 = self.canvas.bbox(item)
+        box = self.canvas.create_rectangle(x0 - pad, y0 - pad, x1 + pad, y1 + pad, fill='#ffffe0', outline='#555555',
+                                           tags='tip')
+        self.canvas.tag_raise(item, box)
+
+    def show_tip(self):
+        """The first appearance, after the pointer has rested: from here on the tip follows the pointer."""
+        self.tip_job = None
+        self.tip_active = self.draw_tips()
+
+    def refresh_tip(self):
+        """Redraw the tip for wherever the pointer (or the picture under it) is now; nothing while it is off the image."""
+        self.canvas.delete('tip')
+        self.draw_tips()
+
+    def deactivate_tip(self):
+        self.tip_active = False
+        self.hide_tip()
+
+    def draw_tips(self):
+        """Draw the region under the pointer (in the Differences view also the region at the same place of the other
+        map). False if there is nothing to show: the pointer is off the image or outside the brain (in the Differences
+        view: outside the brain in both atlases)."""
+        voxel = self.voxel_under_mouse()
+        if voxel is None or self.tool != 'none':
+            return False
+        x, y = self.mouse
+        if self.pane_count() == 2 and self.reference is not None:
+            standard, alternate = int(self.reference['volume'][voxel]), int(self.volume[voxel])
+            if standard == 0 and alternate == 0:
+                return False
+            pane_w = self.pane_width()
+            right_start = pane_w + PANE_GAP
+            hovering_right = x >= right_start
+            x_in_pane = x - right_start if hovering_right else x
+            for is_right, origin, label, table in ((False, 0, standard, self.reference['table']),
+                                                   (True, right_start, alternate, self.region_table)):
+                self.draw_tip(origin + x_in_pane, y, origin, pane_w, self.tip_text(label, table),
+                              ring=(is_right != hovering_right))
+            return True
+        label = int(self.volume[voxel])
+        if label == 0:
+            return False
+        self.draw_tip(x, y, 0, self.canvas.winfo_width(), self.tip_text(label, self.region_table))
+        return True
 
     # ---- info
-    def region_text(self, label):
+    def region_text(self, label, table=None):
+        table = self.region_table if table is None else table
         if label == 0:
             return "0  outside the brain"
-        if self.region_table is None or label not in self.region_table.index:
+        if table is None or label not in table.index:
             return f"{label}"
-        row = self.region_table.loc[label]
+        row = table.loc[label]
         text = str(int(row['region_id'])) if 'region_id' in row.index else str(label)
         if row.get('acronym_substructure'):
             text += f"  {row['acronym_substructure']}  ({row.get('name_substructure', '')})"
@@ -1792,7 +2261,20 @@ class CCFBrowser:
 
     def refresh_info_slice(self):
         lines = [(f"{self.view_name} slice {self.slice + 1} of {self.n_slices}   "
-                  f"{AXIS_NAMES[self.axis]} {self.slice_um / 1000:.3f} mm", None)]
+                  f"{AXIS_NAMES[self.axis]} {self.slice_um / 1000:.3f} mm   ({self.slice_bregma_text()})", None),
+                 (f"Bregma at CCF mm AP {self.bregma[0]:.3f}, DV {self.bregma[1]:.3f}, ML {self.bregma[2]:.3f} "
+                  "(change in Settings); AP + is anterior, DV + is dorsal", 'dim')]
+        if self.mode_var.get() in DIFF_MODES:
+            compared = self.diff_slice()
+            if compared is None:
+                lines.append(("Differences from CCF 2020: loading the standard atlas to compare with…", 'dim'))
+            else:
+                totals = self.diff_totals()
+                lines.append((f"Differences from CCF 2020 (regions compared by {self.diff_state()[2]}); left: CCF 2020, "
+                              f"right: {Path(self.loaded_atlas_path).name}; regions that agree are dimmed:", None))
+                lines.append((f"  different region (both have tissue)   {compared[2][0]:,} voxels in this slice, {totals[0]:,} in all", None))
+                lines.append((f"  tissue only in this atlas   {compared[2][1]:,} here, {totals[1]:,} in all", None))
+                lines.append((f"  tissue only in CCF 2020   {compared[2][2]:,} here, {totals[2]:,} in all", None))
         if all(s.points is None for s in self.slots):
             lines.append(("No CSV loaded: choose, paste or drop one above.", 'dim'))
         for slot in self.slots:
@@ -1817,10 +2299,11 @@ class CCFBrowser:
         if self.mouse is None:
             return None
         scale, ox, oy = self.view
-        return (self.mouse[0] - ox) / scale, (self.mouse[1] - oy) / scale
+        return (self.pane_x(self.mouse[0]) - ox) / scale, (self.mouse[1] - oy) / scale
 
     def on_leave(self):
         self.mouse = None
+        self.deactivate_tip()
         self.canvas.delete('brush')
         self.info.set_sections(cursor_lines=[("(cursor outside the image)", 'dim')],
                                nearest_lines=[("", 'dim')])
@@ -1830,6 +2313,11 @@ class CCFBrowser:
             return
         self.mouse = (event.x, event.y)
         self.draw_brush()
+        if self.tip_active:
+            self.refresh_tip()   # already showing: it follows the pointer and updates at once
+        else:
+            self.hide_tip()
+            self.schedule_tip()
         u, v = self.cursor_image_coords()
         image_w, image_h = VIEW_IMAGE_SIZE[self.view_name]
         u_idx, v_idx = int(np.floor(u)), int(np.floor(v))
@@ -1847,7 +2335,14 @@ class CCFBrowser:
                 (f"voxel (AP, DV, ML) = ({voxel[0]}, {voxel[1]}, {voxel[2]})   {side} hemisphere", None),
                 (f"CCF mm: AP {position[0] / 1000:.3f}   DV {position[1] / 1000:.3f}   ML {position[2] / 1000:.3f}",
                  None),
+                (self.bregma_text(*position), None),
                 (f"Region {self.region_text(label)}", None)]
+            if self.reference is not None and self.loaded_atlas_path:
+                standard = int(self.reference['volume'][voxel[0], voxel[1], voxel[2]])
+                state = self.diff_state()
+                differs = state is not None and state[0][label] != state[1][standard]
+                cursor_lines.append((f"CCF 2020: {self.region_text(standard, self.reference['table'])}"
+                                     + ("   <- differs" if differs else ""), None))
             for slot in self.slots:
                 nearest_lines += self.nearest_lines(slot, u, v)
         else:
@@ -1876,7 +2371,8 @@ class CCFBrowser:
         close = int((distance <= reach * reach).sum())
         lines = [(f"CSV {slot.index + 1}  {SHAPE_SYMBOLS[shape]} {points.group_labels[group]}   "
                   f"({close} cell{'s' if close != 1 else ''} within {reach} px)", tag),
-                 (f"plane offset {(points.coords[self.axis][index] - self.slice_um):+.0f} um", None)]
+                 (f"plane offset {(points.coords[self.axis][index] - self.slice_um):+.0f} um", None),
+                 (f"  {self.bregma_text(points.coords[0][index], points.coords[1][index], points.coords[2][index])}", None)]
         lines += [(f"  {key}: {value}", None) for key, value in points.describe(index)]
         return lines
 
@@ -1887,14 +2383,17 @@ class CCFBrowser:
                 "(Paint panel > Save volume).{0}{0}Close without saving?".format(chr(10)), icon='warning', default='no',
                 parent=self.root):
             return
+        self.settings['bregma_mm'] = list(self.bregma)
         self.settings.update({'follow_info': bool(self.follow_var.get()), 'wheel_zoom': bool(self.wheel_zoom_var.get()), 'atlas_path': self.atlas_path,
                               'alt_atlas_path': self.alt_atlas_path,
-                              'brush': int(self.brush_var.get() or 0), 'paint_value': self.paint_value_var.get().strip(), 'view': self.view_name, 'slices': self.slices,
+                              'brush_radius': self.brush_radius() + 1, 'paint_value': self.paint_value_var.get().strip(), 'view': self.view_name, 'slices': self.slices,
                               'saturation': int(round(float(self.sat_var.get()))), 'slab': int(self.slab_var.get() or 0),
-                              'dot': int(self.dot_var.get() or 1), 'mode': self.mode_var.get()})
+                              'dot': int(self.dot_var.get() or 1), 'mode': self.mode_var.get(),
+                              'outlines': bool(self.outline_var.get())})
         for slot in self.slots:
             self.settings[f'csv{slot.index}'] = str(slot.points.path) if slot.points is not None else ''
         self.settings.pop('csv', None)
+        self.settings.pop('brush', None)
         self.settings.pop('slice', None)
         save_settings(self.settings)
         self.root.destroy()
