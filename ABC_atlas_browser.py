@@ -10214,7 +10214,13 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     # 1.4x-fontsize comfortable-line-height convention as STATUS_PANEL_
     # LINE_HEIGHT_IN above.
     UMAP_XLABEL_PAD_PT = 4.0  # matplotlib's own rcParams['axes.labelpad'] default
-    STATUS_PANEL_TOP_MARGIN_IN = (UMAP_XLABEL_PAD_PT + SIDEBAR_FONTSIZE * 1.4) / 72
+    # The same strip also holds the Save section maps / Save UMAP button row (see
+    # umap_button_row_geometry), at the pane's left edge where the centred xlabel is not; if the
+    # buttons need more height than the label does, the strip grows to fit them.
+    UMAP_BUTTON_ROW_HEIGHT_IN = SIDEBAR_FONTSIZE * 1.7 / 72
+    UMAP_BUTTON_ROW_GAP_IN = 0.03
+    STATUS_PANEL_TOP_MARGIN_IN = max((UMAP_XLABEL_PAD_PT + SIDEBAR_FONTSIZE * 1.4) / 72,
+                                     UMAP_BUTTON_ROW_HEIGHT_IN + 2 * UMAP_BUTTON_ROW_GAP_IN)
     # Fixed ratios of the panel's own height (not the figure's) — by
     # construction (STATUS_PANEL_HEIGHT_IN's own definition above),
     # 2*LINE_FRAC + GAP_FRAC == 1.0 exactly, so the two rows plus the gap
@@ -12551,6 +12557,10 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         fig.canvas.restore_region(blit_bg['data'])
         draw_animated_overlays()
         fig.canvas.blit(figure_fraction_bbox(SIDEBAR_LEFT, 0.0, SIDEBAR_RIGHT, 1.0))
+        # The Save section maps / Save UMAP row lives under the UMAP, outside the sidebar column, but
+        # is stamped by draw_animated_overlays like the rest, so its pixels must be pushed too (busy
+        # dimming goes through here).
+        fig.canvas.blit(Bbox.union([save_section_maps_ax.bbox, save_ax.bbox]).expanded(1.04, 1.25))
         force_repaint()
 
     def hide_group_highlight():
@@ -13635,36 +13645,82 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     show_button = Button(show_ax, 'Refresh', hovercolor='0.85')
     show_button.label.set_fontsize(SIDEBAR_FONTSIZE)
 
-    save_section_maps_ax = fig.add_axes(
-        [SIDEBAR_LEFT, BUTTON_BLOCK_TOP_Y0 - 2 * BUTTON_BLOCK_STEP, SIDEBAR_WIDTH, BUTTON_BLOCK_HEIGHT])
+    # Save section maps / Save UMAP: not in the sidebar stack but in a row under the UMAP pane, at its
+    # left edge by the divider, in the strip the UMAP1 label shares (section maps left, UMAP right,
+    # matching where the things they save are on screen). Positioned by position_umap_button_row, which
+    # also runs on every layout change since the widths are in inches.
+    def umap_button_row_geometry():
+        fig_w_in, fig_h_in = fig.get_size_inches()
+
+        def width_frac(text):
+            return (len(text) * 0.62 * SIDEBAR_FONTSIZE / 72 + 0.3) / fig_w_in
+
+        y0 = (STATUS_PANEL_BOTTOM_MARGIN_IN + STATUS_PANEL_HEIGHT_IN + UMAP_BUTTON_ROW_GAP_IN) / fig_h_in
+        height = UMAP_BUTTON_ROW_HEIGHT_IN / fig_h_in
+        w_maps, w_umap, gap = width_frac('Save section maps'), width_frac('Save UMAP'), 0.1 / fig_w_in
+        # Stay clear of the centred "UMAP1" label: only the part of the row left of it is usable.
+        ax_width = (UMAP_RIGHT - UMAP_LEFT) - CBAR_WIDTH - CBAR_GAP - CBAR_LABEL_MARGIN
+        room = ax_width / 2 - (len('UMAP1') * 0.62 * SIDEBAR_FONTSIZE / 72 / 2 + 0.1) / fig_w_in
+        total = w_maps + gap + w_umap
+        if total > room > 0:  # a narrow window: shrink the buttons rather than run into the label
+            scale = room / total
+            w_maps, w_umap, gap = w_maps * scale, w_umap * scale, gap * scale
+        return y0, height, w_maps, w_umap, gap
+
+    save_section_maps_ax = fig.add_axes([0.0, 0.0, 0.1, 0.03])
     save_section_maps_button = Button(save_section_maps_ax, 'Save section maps', hovercolor='0.85')
     save_section_maps_button.label.set_fontsize(SIDEBAR_FONTSIZE)
 
-    save_ax = fig.add_axes(
-        [SIDEBAR_LEFT, BUTTON_BLOCK_TOP_Y0 - 3 * BUTTON_BLOCK_STEP, SIDEBAR_WIDTH, BUTTON_BLOCK_HEIGHT])
+    save_ax = fig.add_axes([0.0, 0.0, 0.1, 0.03])
     save_button = Button(save_ax, 'Save UMAP', hovercolor='0.85')
     save_button.label.set_fontsize(SIDEBAR_FONTSIZE)
+
+    def position_umap_button_row():
+        y0, height, w_maps, w_umap, gap = umap_button_row_geometry()
+        save_section_maps_ax.set_position([UMAP_LEFT, y0, w_maps, height])
+        save_ax.set_position([UMAP_LEFT + w_maps + gap, y0, w_umap, height])
+
+    position_umap_button_row()
 
     # export_degs_ax/export_expr_ax: only meaningful in 'Specified
     # <level>(s)' mode — hidden the rest of the time by on_mode_change,
     # same show/hide convention as query_ax.
     export_degs_ax = fig.add_axes(
-        [SIDEBAR_LEFT, BUTTON_BLOCK_TOP_Y0 - 4 * BUTTON_BLOCK_STEP, SIDEBAR_WIDTH, BUTTON_BLOCK_HEIGHT])
+        [SIDEBAR_LEFT, BUTTON_BLOCK_TOP_Y0 - 2 * BUTTON_BLOCK_STEP, SIDEBAR_WIDTH, BUTTON_BLOCK_HEIGHT])
     export_degs_button = Button(export_degs_ax, 'Export DEGs', hovercolor='0.85')
     export_degs_button.label.set_fontsize(SIDEBAR_FONTSIZE)
     export_degs_ax.set_visible(False)
 
     export_expr_ax = fig.add_axes(
-        [SIDEBAR_LEFT, BUTTON_BLOCK_TOP_Y0 - 5 * BUTTON_BLOCK_STEP, SIDEBAR_WIDTH, BUTTON_BLOCK_HEIGHT])
+        [SIDEBAR_LEFT, BUTTON_BLOCK_TOP_Y0 - 3 * BUTTON_BLOCK_STEP, SIDEBAR_WIDTH, BUTTON_BLOCK_HEIGHT])
     export_expr_button = Button(export_expr_ax, 'Export expression', hovercolor='0.85')
     export_expr_button.label.set_fontsize(SIDEBAR_FONTSIZE)
     export_expr_ax.set_visible(False)
 
     close_ax = fig.add_axes(
-        [SIDEBAR_LEFT, BUTTON_BLOCK_TOP_Y0 - 6 * BUTTON_BLOCK_STEP, SIDEBAR_WIDTH, BUTTON_BLOCK_HEIGHT])
+        [SIDEBAR_LEFT, BUTTON_BLOCK_TOP_Y0 - 4 * BUTTON_BLOCK_STEP, SIDEBAR_WIDTH, BUTTON_BLOCK_HEIGHT])
     close_button = Button(close_ax, 'Close', hovercolor='0.85')
     close_button.label.set_fontsize(SIDEBAR_FONTSIZE)
     close_button.on_clicked(lambda event: plt.close(fig))
+
+    # The sidebar's button stack, listed bottom to top: Close is anchored at the bottom right and the
+    # rest sit directly on top of it with no gaps, skipping any that are hidden (the Export buttons
+    # only show in 'Specified <level>(s)' mode). To add a button, create its axes/Button above and put
+    # its axes in this list where it should sit; layout_sidebar_buttons does the rest.
+    SIDEBAR_BUTTON_STACK_BOTTOM_UP = (close_ax, export_expr_ax, export_degs_ax, show_ax, open_data_folder_ax)
+    SIDEBAR_BUTTON_STACK_Y0 = 0.06  # Close's bottom edge, just above the "Working…" text at the sidebar's foot
+
+    def layout_sidebar_buttons(left=None, width=None):
+        left = SIDEBAR_LEFT if left is None else left
+        width = SIDEBAR_WIDTH if width is None else width
+        y = SIDEBAR_BUTTON_STACK_Y0
+        for button_ax in SIDEBAR_BUTTON_STACK_BOTTOM_UP:
+            if not button_ax.get_visible():
+                continue
+            button_ax.set_position([left, y, width, BUTTON_BLOCK_HEIGHT])
+            y += BUTTON_BLOCK_STEP
+
+    layout_sidebar_buttons()
 
     # "Working..." indicator — shown right before any operation that's
     # about to block the UI with a real, synchronous, non-interruptible
@@ -16311,6 +16367,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         query_label.set_visible(show_query)
         export_degs_ax.set_visible(label == 'Single Subclass')
         export_expr_ax.set_visible(label == 'Single Subclass')
+        layout_sidebar_buttons()  # the stack closes up around whichever of these just appeared/vanished
         gene_dropdown_ax.set_visible(False)
         gene_suggestion_state['matches'] = []
         if label == 'Imputed Gene':
@@ -16402,6 +16459,91 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     export_degs_button.on_clicked(export_de_genes)
     export_expr_button.on_clicked(export_expression)
 
+    # --- Tool tips for the buttons -------------------------------------------
+    # Hover a button for TOOLTIP_DELAY_MS and a small yellow note appears beside the pointer. A real
+    # Tk window (not a matplotlib artist), so it never goes through the blit/zoom-preview machinery.
+    # Add or change a message with set_tooltip(button, text); `text` may also be a no-argument
+    # function, called when the tip is shown, for messages that quote current values.
+    TOOLTIP_DELAY_MS = 600
+    button_tooltips = {}  # button axes -> text or function returning text
+    tooltip_state = {'ax': None, 'timer_id': None, 'window': None}
+
+    def set_tooltip(button, text):
+        button_tooltips[getattr(button, 'ax', button)] = text
+
+    def hide_tooltip():
+        if tooltip_state['timer_id'] is not None and tk_widget is not None:
+            try:
+                tk_widget.after_cancel(tooltip_state['timer_id'])
+            except Exception:
+                pass
+        tooltip_state['timer_id'] = None
+        if tooltip_state['window'] is not None:
+            try:
+                tooltip_state['window'].destroy()
+            except Exception:
+                pass
+        tooltip_state['window'] = None
+
+    def show_tooltip(target):
+        tooltip_state['timer_id'] = None
+        if busy_state['active'] or tooltip_state['ax'] is not target or tk_widget is None:
+            return
+        text = button_tooltips.get(target)
+        text = text() if callable(text) else text
+        if not text:
+            return
+        import tkinter as tk
+        window = tk.Toplevel(tk_widget)
+        window.wm_overrideredirect(True)
+        try:
+            window.attributes('-topmost', True)
+        except Exception:
+            pass
+        tk.Label(window, text=text, justify='left', background='#ffffe0', foreground='black',
+                 relief='solid', borderwidth=1, padx=6, pady=3, wraplength=420,
+                 font=('TkDefaultFont', max(9, int(SIDEBAR_FONTSIZE * 0.85)))).pack()
+        window.update_idletasks()
+        pointer_x, pointer_y = tk_widget.winfo_pointerxy()
+        x, y = pointer_x + 14, pointer_y + 18
+        if y + window.winfo_reqheight() > tk_widget.winfo_screenheight():
+            y = pointer_y - window.winfo_reqheight() - 10  # near the bottom edge: put it above
+        window.geometry(f'+{x}+{y}')
+        tooltip_state['window'] = window
+
+    def on_tooltip_motion(event):
+        target = event.inaxes if event.inaxes in button_tooltips else None
+        if target is tooltip_state['ax']:
+            return
+        hide_tooltip()
+        tooltip_state['ax'] = target
+        if target is not None and tk_widget is not None:
+            tooltip_state['timer_id'] = tk_widget.after(TOOLTIP_DELAY_MS, lambda: show_tooltip(target))
+
+    fig.canvas.mpl_connect('motion_notify_event', on_tooltip_motion)
+    # A click, scroll or keystroke dismisses the tip; it stays dismissed until the pointer leaves
+    # that button (tooltip_state['ax'] is left alone, so moving within it doesn't bring it back).
+    for _tooltip_dismiss_event in ('button_press_event', 'scroll_event', 'key_press_event'):
+        fig.canvas.mpl_connect(_tooltip_dismiss_event, lambda event: hide_tooltip())
+    fig.canvas.mpl_connect('figure_leave_event',
+                           lambda event: (hide_tooltip(), tooltip_state.update(ax=None)))
+
+    set_tooltip(settings_button, "Viewer settings: hover highlighting, marker shapes, circle size, "
+                                 "and the UMAP's n_neighbors / min_dist / n_pcs.")
+    set_tooltip(open_data_folder_button, "Open this run's output folder in the file explorer.")
+    set_tooltip(show_button, "Redraw the view with the current mode, level and query.")
+    set_tooltip(save_section_maps_button, lambda: (
+        f"Save the section maps as currently shown (zoom and colors) as a PNG at {SECTION_MAPS_SAVE_DPI} dpi "
+        "and an SVG, in this run's folder."))
+    set_tooltip(save_button, lambda: (
+        f"Save the UMAP as a PNG (plot area {EXPORT_AXES_TARGET_PX} x {EXPORT_AXES_TARGET_PX} px, "
+        f"{UMAP_SAVE_DPI} dpi, plus labels and legend) and an SVG, in this run's folder. "
+        "ID and category views also get a separate legend PNG."))
+    set_tooltip(export_degs_button, "Export differentially expressed genes for the specified IDs as CSV "
+                                    "(standard gene panel and imputed gene set).")
+    set_tooltip(export_expr_button, "Export each specified ID's mean log2 expression per gene as CSV.")
+    set_tooltip(close_button, "Close the viewer.")
+
     # --- Resize handles between the three panels -----------------------
     # Two thin draggable bars, at boundary1 (grid/UMAP) and boundary2
     # (UMAP/sidebar) — dragging one only ever trades width between the two
@@ -16470,19 +16612,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # change here.
         cur_pos = gene_dropdown_ax.get_position()
         gene_dropdown_ax.set_position([new_left, cur_pos.y0, new_width, cur_pos.height])
-        open_data_folder_ax.set_position([new_left, BUTTON_BLOCK_TOP_Y0, new_width, BUTTON_BLOCK_HEIGHT])
-        show_ax.set_position(
-            [new_left, BUTTON_BLOCK_TOP_Y0 - BUTTON_BLOCK_STEP, new_width, BUTTON_BLOCK_HEIGHT])
-        save_section_maps_ax.set_position(
-            [new_left, BUTTON_BLOCK_TOP_Y0 - 2 * BUTTON_BLOCK_STEP, new_width, BUTTON_BLOCK_HEIGHT])
-        save_ax.set_position(
-            [new_left, BUTTON_BLOCK_TOP_Y0 - 3 * BUTTON_BLOCK_STEP, new_width, BUTTON_BLOCK_HEIGHT])
-        export_degs_ax.set_position(
-            [new_left, BUTTON_BLOCK_TOP_Y0 - 4 * BUTTON_BLOCK_STEP, new_width, BUTTON_BLOCK_HEIGHT])
-        export_expr_ax.set_position(
-            [new_left, BUTTON_BLOCK_TOP_Y0 - 5 * BUTTON_BLOCK_STEP, new_width, BUTTON_BLOCK_HEIGHT])
-        close_ax.set_position(
-            [new_left, BUTTON_BLOCK_TOP_Y0 - 6 * BUTTON_BLOCK_STEP, new_width, BUTTON_BLOCK_HEIGHT])
+        layout_sidebar_buttons(new_left, new_width)
         working_text.set_x(new_left)
 
     def apply_region_layout():
@@ -16505,6 +16635,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
                                AREA_TOP - AREA_BOTTOM])
         reposition_grid(GRID_RIGHT)
         reposition_sidebar(SIDEBAR_LEFT, SIDEBAR_WIDTH)
+        position_umap_button_row()
         panel_bottom, panel_height = status_panel_geometry()
         status_panel_ax.set_position([GRID_LEFT, panel_bottom, UMAP_RIGHT - GRID_LEFT, panel_height])
         hover_status_ax.set_position([
