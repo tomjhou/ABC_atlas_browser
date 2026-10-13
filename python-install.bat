@@ -19,3 +19,6 @@ REM Parquet file support
 python -m pip install pyarrow
 
 pause
+
+REM Interactive 3D view in the browser
+python -m pip install plotly

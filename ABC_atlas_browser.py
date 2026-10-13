@@ -100,6 +100,7 @@ REQUIRED_LIBRARIES = {
 OPTIONAL_LIBRARIES = {
     'igraph': ('igraph', 'Leiden clustering of new UMAP runs'),
     'pyarrow': ('pyarrow', 'Parquet file support'),
+    'plotly': ('plotly', 'the 3D view in the browser'),
 }
 # Install anything missing automatically (into the interpreter running this
 # script) instead of just listing the commands and quitting. Set False to get
@@ -1340,7 +1341,7 @@ def prompt_section_selection(section_series):
 
 
 SPATIAL_CSV_CHUNK_SIZE = 200_000  # see the chunked read in load_section_spatial_coords()
-SPATIAL_CSV_CACHE_VERSION = 1
+SPATIAL_CSV_CACHE_VERSION = 2  # v2: adds the section 'z' column
 
 
 def _spatial_csv_cache_path(cell_metadata_path):
@@ -1377,7 +1378,7 @@ def load_section_spatial_coords(adata, abc_cache, progress_callback=None):
                   "GUI section picker unavailable.")
             return None
         index_col_name = header_cols[0]
-        wanted_cols = [c for c in ['x', 'y', 'class', 'subclass', 'supertype', 'cluster'] if c in header_cols]
+        wanted_cols = [c for c in ['x', 'y', 'z', 'class', 'subclass', 'supertype', 'cluster'] if c in header_cols]
 
         cache_path = None
         try:
@@ -1477,6 +1478,407 @@ def ensure_spatial_load_started(spatial_cache, adata, abc_cache):
     thread = threading.Thread(target=worker, daemon=True)
     spatial_cache['load_thread'] = thread
     thread.start()
+
+
+# ---------------------------------------------------------------------------
+# CCF coordinates (Allen common coordinate framework positions) and the 3D view
+# ---------------------------------------------------------------------------
+# The cell metadata's own x/y/z are in each section's imaging frame: z is just the section's position
+# (about 59 discrete planes, 0.2 mm apart), so a 3D plot of them looks like stacked slices. The CCF
+# file registers every cell into the Allen reference brain: continuous x (anterior -> posterior),
+# y (dorsal -> ventral) and z (left -> right), all in mm, plus a parcellation index naming the region.
+# Not part of the normal cache; downloaded (with a confirmation) the first time it is needed.
+CCF_DIRECTORY = 'MERFISH-C57BL6J-638850-CCF'
+CCF_COORDS_FILE_NAME = 'ccf_coordinates'
+CCF_PARCELLATION_DIRECTORY = 'Allen-CCF-2020'
+CCF_PARCELLATION_FILE_NAME = 'parcellation_to_parcellation_term_membership_acronym'
+CCF_CACHE_VERSION = 1
+CCF_FILES = ((CCF_DIRECTORY, CCF_COORDS_FILE_NAME), (CCF_PARCELLATION_DIRECTORY, CCF_PARCELLATION_FILE_NAME))
+THREED_MAX_POINTS = 60000     # points drawn across all groups in the in-app window; more are randomly thinned
+THREED_WEB_MAX_POINTS = 300000  # the browser (WebGL) view copes with far more
+THREED_SHELL_POINTS = 60000   # whole-brain sample: its silhouette is the outline, a subset is the faint cloud
+THREED_CLOUD_POINTS = 25000
+THREED_BACKGROUND = '#12141a'
+
+
+def metadata_file_status(abc_cache, directory, file_name):
+    """(local_path, expected_size_bytes, is_present) for an atlas metadata file, without downloading
+    it; (None, None, None) if abc_atlas_access's internals no longer answer this (same private-API
+    reach as is_data_file_cached)."""
+    try:
+        attributes = abc_cache.cache._manifest.get_file_attributes(directory=directory, file_name=file_name)
+        return Path(attributes.local_path), int(attributes.file_size), bool(abc_cache.cache._file_exists(attributes))
+    except Exception:
+        return None, None, None
+
+
+def ccf_files_missing(abc_cache):
+    """[(directory, file_name, expected_bytes, local_path)] of the CCF files not yet in the local cache."""
+    missing = []
+    for directory, file_name in CCF_FILES:
+        local_path, size, present = metadata_file_status(abc_cache, directory, file_name)
+        if present is not True:
+            missing.append((directory, file_name, size, local_path))
+    return missing
+
+
+def ensure_ccf_downloaded(abc_cache, parent=None):
+    """True once every CCF file is in the local cache, downloading them first if need be: asks (naming
+    the size) before downloading, then shows a progress window fed by the bytes landing on disk.
+    False if the user declined or cancelled, or the download failed."""
+    missing = ccf_files_missing(abc_cache)
+    if not missing:
+        return True
+    total_bytes = sum(size or 0 for _d, _f, size, _p in missing)
+    size_text = f"{total_bytes / 1e6:.0f} MB" if total_bytes else "a large file"
+    try:
+        from tkinter import messagebox
+        if not messagebox.askyesno(
+                "Download CCF coordinates?",
+                f"The 3D coordinates need the Allen CCF registration of every cell, a one-time download of "
+                f"{size_text} into your atlas cache folder. Download it now?", parent=parent):
+            return False
+    except Exception as e:
+        print(f"Could not ask about the CCF download ({e}); not downloading.")
+        return False
+
+    outcome = {'error': None, 'done': False}
+
+    def worker():
+        try:
+            for directory, file_name, _size, _path in missing:
+                abc_cache.get_metadata_path(directory=directory, file_name=file_name)
+        except Exception as e:
+            outcome['error'] = e
+        finally:
+            outcome['done'] = True
+
+    threading.Thread(target=worker, daemon=True).start()
+    restore_cursors = set_wait_cursor_on_open_figures()
+    proc_fig, cancel_flag, set_progress = show_processing_dialog(
+        f"Downloading the CCF coordinates ({size_text}); a one-time download.")
+    started = time.perf_counter()
+    try:
+        set_progress(0.0)
+        while not outcome['done'] and not cancel_flag['cancelled']:
+            got = 0
+            for _d, _f, _size, local_path in missing:
+                try:
+                    got += local_path.stat().st_size if local_path is not None else 0
+                except OSError:
+                    pass
+            if total_bytes:
+                set_progress(min(1.0, got / total_bytes))
+                proc_fig._set_status(f"{got / 1e6:.0f} of {total_bytes / 1e6:.0f} MB  "
+                                     f"({time.perf_counter() - started:.0f} s)")
+            proc_fig.canvas.flush_events()
+            time.sleep(0.05)
+    finally:
+        plt.close(proc_fig)
+        restore_cursors()
+    if cancel_flag['cancelled']:
+        print("CCF download cancelled; it continues in the background and will be there next time.")
+        return False
+    if outcome['error'] is not None:
+        print(f"CCF download failed: {outcome['error']}")
+        return False
+    return not ccf_files_missing(abc_cache)
+
+
+def load_ccf_for_cells(abc_cache, cell_labels, shell_points=0):
+    """(table, shell): `table` is a DataFrame aligned to `cell_labels` with float32 x_ccf/y_ccf/z_ccf and
+    parcellation_index (NaN for a cell the CCF file lacks); `shell` is a (shell_points, 3) float32 array
+    of x/y/z for a random sample of cells across the whole brain (empty when shell_points is 0). Reads
+    the big CSV once, then a pickle cache next to the spatial cache. Blocking and slow the first time:
+    call it from a worker thread."""
+    csv_path = abc_cache.get_metadata_path(directory=CCF_DIRECTORY, file_name=CCF_COORDS_FILE_NAME)
+    status = os.stat(csv_path)
+    key = f"{csv_path}|{status.st_mtime_ns}|{status.st_size}"
+    cache_path = CACHE_DIR / f"ccf_coords_v{CCF_CACHE_VERSION}_{hashlib.md5(key.encode('utf-8')).hexdigest()[:16]}.pkl"
+    table = None
+    if cache_path.exists():
+        try:
+            table = pd.read_pickle(cache_path)
+        except Exception as e:
+            print(f"CCF cache unreadable ({e}); re-reading the CSV.")
+    if table is None:
+        chunks = []
+        for chunk in pd.read_csv(csv_path, index_col=0, dtype={'cell_label': str}, chunksize=SPATIAL_CSV_CHUNK_SIZE):
+            chunks.append(chunk)
+        table = pd.concat(chunks, copy=False)
+        table = table.rename(columns={'x': 'x_ccf', 'y': 'y_ccf', 'z': 'z_ccf'})
+        for column in ('x_ccf', 'y_ccf', 'z_ccf'):
+            table[column] = table[column].astype(np.float32)
+        table['parcellation_index'] = table['parcellation_index'].astype(np.float32)
+        try:
+            table.to_pickle(cache_path)
+        except Exception as e:
+            print(f"Could not save the CCF cache ({e}).")
+    aligned = table.reindex(pd.Index(cell_labels))
+    shell = np.empty((0, 3), dtype=np.float32)
+    if shell_points:
+        coords_all = table[['x_ccf', 'y_ccf', 'z_ccf']].to_numpy()
+        keep = np.flatnonzero(np.isfinite(coords_all).all(axis=1))
+        pick = np.random.default_rng(0).choice(keep, size=min(shell_points, len(keep)), replace=False)
+        shell = coords_all[pick]
+    return aligned, shell
+
+
+def load_parcellation_names(abc_cache):
+    """DataFrame indexed by parcellation_index with the CCF region names (division / structure /
+    substructure acronyms), or None if the lookup can't be read."""
+    try:
+        path = abc_cache.get_metadata_path(directory=CCF_PARCELLATION_DIRECTORY,
+                                           file_name=CCF_PARCELLATION_FILE_NAME)
+        return pd.read_csv(path).set_index('parcellation_index')[['division', 'structure', 'substructure']]
+    except Exception as e:
+        print(f"Could not read the CCF region names ({e}).")
+        return None
+
+
+def brain_outline_segments(shell_xyz, bins=80):
+    """The whole brain's silhouette seen along each axis, from a (n, 3) sample of cells: {'z': [(m, 2) arrays in
+    (x, y)], 'x': [... in (y, z)], 'y': [... in (x, z)]}, each array one closed outline. Built from an occupancy
+    image of the projected points (closed, filled and smoothed), then contoured."""
+    from scipy import ndimage
+    from matplotlib.figure import Figure
+    shell = np.asarray(shell_xyz, dtype=float)
+    outlines = {}
+    for normal, (a, b) in {'z': (0, 1), 'x': (1, 2), 'y': (0, 2)}.items():
+        histogram, edges_a, edges_b = np.histogram2d(shell[:, a], shell[:, b], bins=bins)
+        occupied = ndimage.binary_fill_holes(ndimage.binary_closing(histogram > 0, iterations=2))
+        smooth = ndimage.gaussian_filter(occupied.astype(float), 1.0)
+        centers_a = (edges_a[:-1] + edges_a[1:]) / 2
+        centers_b = (edges_b[:-1] + edges_b[1:]) / 2
+        contour_axes = Figure().subplots()  # a throwaway Agg figure: only its contour paths are wanted
+        contours = contour_axes.contour(centers_a, centers_b, smooth.T, levels=[0.5])
+        outlines[normal] = [np.asarray(segment) for segment in contours.allsegs[0] if len(segment) > 3]
+    return outlines
+
+
+def fair_keep_counts(sizes, budget):
+    """How many points each group may keep so the total stays within `budget`: small groups keep everything, and
+    only the groups bigger than their share are thinned (a 500-cell group is not cut because another has 200k)."""
+    keep, remaining_budget = {}, budget
+    order = sorted(range(len(sizes)), key=lambda i: sizes[i])
+    for position, index in enumerate(order):
+        keep[index] = min(sizes[index], int(remaining_budget / (len(order) - position)))
+        remaining_budget -= keep[index]
+    return keep
+
+
+def open_3d_group_view(groups, shell_xyz, outline, axis_labels, title, invert_z=True, max_points=THREED_MAX_POINTS):
+    """A rotatable 3D scatter window on a dark panel (drag with the left mouse button to rotate, right button or
+    wheel to zoom). `groups`: list of {'label', 'color', 'xyz'} with xyz an (n, 3) array in plotting order
+    (x, y, z); `shell_xyz`: optional whole-brain sample drawn as a faint cloud; `outline`: optional
+    brain_outline_segments() result drawn on the three back walls. Click a legend entry to hide or show that
+    item ('wall projections' is off until clicked and drops each group's shadow onto the walls). Buttons along the
+    bottom jump to standard views and change the dot size. Groups are thinned fairly to `max_points` in total.
+    Returns the figure, already shown without blocking."""
+    import mpl_toolkits.mplot3d  # noqa: F401  (registers the '3d' projection)
+    from matplotlib.lines import Line2D
+    from matplotlib.widgets import Button
+    background = THREED_BACKGROUND
+    rng = np.random.default_rng(0)
+    cleaned = []
+    for group in groups:
+        points = np.asarray(group['xyz'], dtype=float)
+        cleaned.append(points[np.isfinite(points).all(axis=1)])
+    total = sum(len(points) for points in cleaned)
+    keep = fair_keep_counts([len(points) for points in cleaned], max_points)
+
+    fig = plt.figure(figsize=(10, 9), facecolor=background)
+    ax3 = fig.add_subplot(111, projection='3d', facecolor=background)
+    items = []  # [(label, color, [artists])] in legend order
+    size_scale = {'value': 1.0}
+    group_artists = []  # (artist, base size)
+
+    cloud = None
+    if shell_xyz is not None and len(shell_xyz):
+        cloud_points = np.asarray(shell_xyz)[:THREED_CLOUD_POINTS]
+        cloud = ax3.scatter(cloud_points[:, 0], cloud_points[:, 1], cloud_points[:, 2], s=2, c='#aeb4c0',
+                            alpha=0.16, linewidths=0, depthshade=False)
+    # Limits from everything drawn, so the outline walls sit exactly at the data's own extent.
+    drawn = [np.asarray(shell_xyz)] if shell_xyz is not None and len(shell_xyz) else []
+    drawn += [points for points in cleaned if len(points)]
+    everything = np.vstack(drawn) if drawn else np.zeros((1, 3))
+    low, high = everything.min(axis=0), everything.max(axis=0)
+    spans = np.maximum(high - low, 1e-6)
+    wall_x = low[0]
+    wall_y = high[1]
+    wall_z = high[2] if invert_z else low[2]  # the floor is the ventral side when z is inverted
+
+    outline_artists = []
+    if outline:
+        for normal, segments in outline.items():
+            for segment in segments:
+                if normal == 'z':
+                    line = ax3.plot(segment[:, 0], segment[:, 1], zs=wall_z, zdir='z')
+                elif normal == 'x':
+                    line = ax3.plot(segment[:, 0], segment[:, 1], zs=wall_x, zdir='x')
+                else:
+                    line = ax3.plot(segment[:, 0], segment[:, 1], zs=wall_y, zdir='y')
+                line[0].set_color('#8a93a6')
+                line[0].set_linewidth(1.0)
+                outline_artists.append(line[0])
+    if outline_artists:
+        items.append(('brain outline', '#8a93a6', outline_artists))
+    if cloud is not None:
+        items.append(('whole brain (cloud)', '#aeb4c0', [cloud]))
+
+    shadow_artists = []
+    shown = 0
+    for index, (group, points) in enumerate(zip(groups, cleaned)):
+        if keep[index] < len(points):
+            points = points[rng.choice(len(points), size=max(1, keep[index]), replace=False)]
+        shown += len(points)
+        artist = ax3.scatter(points[:, 0], points[:, 1], points[:, 2], s=7, color=group['color'], alpha=0.9,
+                             linewidths=0, depthshade=True)
+        group_artists.append((artist, 7))
+        items.append((group['label'], group['color'], [artist]))
+        if len(points):
+            for xs, ys, zs, zdir in ((points[:, 0], points[:, 1], wall_z, 'z'), (points[:, 0], points[:, 2], wall_y, 'y'),
+                                     (points[:, 1], points[:, 2], wall_x, 'x')):
+                shadow = ax3.scatter(xs, ys, zs=zs, zdir=zdir, s=2, color=group['color'], alpha=0.25, linewidths=0,
+                                     depthshade=False)
+                shadow.set_visible(False)
+                shadow_artists.append(shadow)
+    if shadow_artists:
+        items.append(('wall projections', '0.85', shadow_artists))
+
+    light = '0.85'
+    for axis, label in zip((ax3.xaxis, ax3.yaxis, ax3.zaxis), axis_labels):
+        axis.set_pane_color((0.07, 0.08, 0.10, 1.0))
+        axis._axinfo['grid']['color'] = (1.0, 1.0, 1.0, 0.10)
+        axis.set_tick_params(colors='0.65')
+        axis.label.set_color(light)
+        axis.set_label_text(label)
+    if invert_z:
+        ax3.invert_zaxis()
+    ax3.set_box_aspect(tuple(spans))  # equal scale on all three axes: no distortion of the brain
+    ax3.set_title(title if shown >= total else f"{title}  (showing {shown:,} of {total:,} cells)", color='white')
+
+    handles = [Line2D([0], [0], marker='o', linestyle='', color=color, markersize=7) for _l, color, _a in items]
+    legend = ax3.legend(handles, [label for label, _c, _a in items], loc='upper left', title='click to hide/show',
+                        facecolor='#1d2029', edgecolor='#3a3f4d', labelcolor=light)
+    legend.get_title().set_color(light)
+    pick_targets = {}
+    for index, (text, handle) in enumerate(zip(legend.get_texts(), legend.legend_handles)):
+        for part in (text, handle):
+            part.set_picker(6)
+            pick_targets[part] = (index, text, handle)
+    for index, (label, _color, artists) in enumerate(items):
+        if label == 'wall projections':  # starts off, so its entry starts dimmed
+            legend.get_texts()[index].set_alpha(0.35)
+            legend.legend_handles[index].set_alpha(0.35)
+
+    def on_pick(event):
+        entry = pick_targets.get(event.artist)
+        if entry is None:
+            return
+        index, text, handle = entry
+        artists = items[index][2]
+        visible = not artists[0].get_visible()
+        for artist in artists:
+            artist.set_visible(visible)
+        text.set_alpha(1.0 if visible else 0.35)
+        handle.set_alpha(1.0 if visible else 0.35)
+        fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect('pick_event', on_pick)
+
+    # Standard viewpoints and dot size; the axes are x = left/right, y = front/back, z = up/down.
+    def resize_dots(factor):
+        size_scale['value'] *= factor
+        for artist, base in group_artists:
+            artist.set_sizes([base * size_scale['value']])
+        fig.canvas.draw_idle()
+
+    actions = (('Front', lambda: ax3.view_init(elev=0, azim=-90)), ('Side', lambda: ax3.view_init(elev=0, azim=0)),
+               ('Top', lambda: ax3.view_init(elev=90, azim=-90)), ('Default', lambda: ax3.view_init(elev=30, azim=-60)),
+               ('Dots -', lambda: resize_dots(0.8)), ('Dots +', lambda: resize_dots(1.25)))
+    fig._view_buttons = []
+    for i, (name, action) in enumerate(actions):
+        button_ax = fig.add_axes([0.03 + i * 0.105, 0.015, 0.095, 0.04])
+        button = Button(button_ax, name, color='#2a2e3a', hovercolor='#454b5c')
+        button.label.set_color('white')
+        button.on_clicked(lambda event, a=action: (a(), fig.canvas.draw_idle()))
+        fig._view_buttons.append(button)  # kept alive: a Button with no reference stops responding
+    try:
+        fig.canvas.manager.set_window_title(title)
+    except Exception:
+        pass
+    fig.show()
+    return fig
+
+
+def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, invert_z=True,
+                        max_points=THREED_WEB_MAX_POINTS):
+    """The same view as open_3d_group_view as one self-contained interactive HTML file (plotly, WebGL), written to
+    `path`: true depth handling, smooth with hundreds of thousands of points, hover text per cell where a group
+    gives 'hover' strings, and the legend toggles each group. Raises ImportError if plotly is not installed."""
+    import plotly.graph_objects as go
+    from matplotlib.colors import to_hex
+    rng = np.random.default_rng(0)
+    cleaned = []
+    for group in groups:
+        points = np.asarray(group['xyz'], dtype=float)
+        finite = np.isfinite(points).all(axis=1)
+        hover = group.get('hover')
+        cleaned.append((points[finite], None if hover is None else np.asarray(hover, dtype=object)[finite]))
+    total = sum(len(points) for points, _h in cleaned)
+    keep = fair_keep_counts([len(points) for points, _h in cleaned], max_points)
+
+    figure = go.Figure()
+    if outline:
+        xs, ys, zs = [], [], []
+        low_high = np.asarray(shell_xyz) if shell_xyz is not None and len(shell_xyz) else np.vstack([p for p, _h in cleaned])
+        wall_x, wall_y = low_high[:, 0].min(), low_high[:, 1].max()
+        wall_z = low_high[:, 2].max() if invert_z else low_high[:, 2].min()
+        for normal, segments in outline.items():
+            for segment in segments:
+                n = len(segment)
+                if normal == 'z':
+                    cx, cy, cz = segment[:, 0], segment[:, 1], np.full(n, wall_z)
+                elif normal == 'x':
+                    cx, cy, cz = np.full(n, wall_x), segment[:, 0], segment[:, 1]
+                else:
+                    cx, cy, cz = segment[:, 0], np.full(n, wall_y), segment[:, 1]
+                xs += list(cx) + [None]
+                ys += list(cy) + [None]
+                zs += list(cz) + [None]
+        figure.add_trace(go.Scatter3d(x=xs, y=ys, z=zs, mode='lines', line=dict(color='#8a93a6', width=2),
+                                      name='brain outline', hoverinfo='skip'))
+    if shell_xyz is not None and len(shell_xyz):
+        cloud = np.asarray(shell_xyz)[:THREED_CLOUD_POINTS * 2]
+        figure.add_trace(go.Scatter3d(
+            x=np.round(cloud[:, 0], 3), y=np.round(cloud[:, 1], 3), z=np.round(cloud[:, 2], 3), mode='markers',
+            marker=dict(size=1.2, color='#aeb4c0', opacity=0.12), name='whole brain (cloud)', hoverinfo='skip'))
+    shown = 0
+    for index, (group, (points, hover)) in enumerate(zip(groups, cleaned)):
+        if keep[index] < len(points):
+            chosen = rng.choice(len(points), size=max(1, keep[index]), replace=False)
+            points = points[chosen]
+            hover = None if hover is None else hover[chosen]
+        shown += len(points)
+        text = hover if hover is not None and len(points) <= 50000 else None
+        try:
+            color = to_hex(group['color'])
+        except Exception:
+            color = 'red'
+        figure.add_trace(go.Scatter3d(
+            x=np.round(points[:, 0], 3), y=np.round(points[:, 1], 3), z=np.round(points[:, 2], 3), mode='markers',
+            marker=dict(size=2.6, color=color, opacity=0.85), name=group['label'],
+            text=None if text is None else list(text), hoverinfo='name+text' if text is not None else 'name'))
+    scene = dict(aspectmode='data', xaxis_title=axis_labels[0], yaxis_title=axis_labels[1], zaxis_title=axis_labels[2])
+    if invert_z:
+        scene['zaxis'] = dict(autorange='reversed', title=axis_labels[2])
+    figure.update_layout(
+        template='plotly_dark', scene=scene, margin=dict(l=0, r=0, t=50, b=0),
+        title=title if shown >= total else f"{title}  (showing {shown:,} of {total:,} cells)",
+        legend=dict(itemsizing='constant'))
+    figure.write_html(str(path), include_plotlyjs=True, full_html=True, config={'displaylogo': False})
+    return Path(path)
 
 
 IMPUTED_DATASET_DIRECTORY = 'MERFISH-C57BL6J-638850-imputed'
@@ -13697,6 +14099,21 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     export_expr_button.label.set_fontsize(SIDEBAR_FONTSIZE)
     export_expr_ax.set_visible(False)
 
+    export_coords_ax = fig.add_axes([SIDEBAR_LEFT, 0.2, SIDEBAR_WIDTH, BUTTON_BLOCK_HEIGHT])
+    export_coords_button = Button(export_coords_ax, 'Export coordinates', hovercolor='0.85')
+    export_coords_button.label.set_fontsize(SIDEBAR_FONTSIZE)
+    export_coords_ax.set_visible(False)
+
+    view3d_ax = fig.add_axes([SIDEBAR_LEFT, 0.25, SIDEBAR_WIDTH, BUTTON_BLOCK_HEIGHT])
+    view3d_button = Button(view3d_ax, '3D view', hovercolor='0.85')
+    view3d_button.label.set_fontsize(SIDEBAR_FONTSIZE)
+    view3d_ax.set_visible(False)
+
+    view3d_web_ax = fig.add_axes([SIDEBAR_LEFT, 0.3, SIDEBAR_WIDTH, BUTTON_BLOCK_HEIGHT])
+    view3d_web_button = Button(view3d_web_ax, '3D in browser', hovercolor='0.85')
+    view3d_web_button.label.set_fontsize(SIDEBAR_FONTSIZE)
+    view3d_web_ax.set_visible(False)
+
     close_ax = fig.add_axes(
         [SIDEBAR_LEFT, BUTTON_BLOCK_TOP_Y0 - 4 * BUTTON_BLOCK_STEP, SIDEBAR_WIDTH, BUTTON_BLOCK_HEIGHT])
     close_button = Button(close_ax, 'Close', hovercolor='0.85')
@@ -13707,7 +14124,8 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     # rest sit directly on top of it with no gaps, skipping any that are hidden (the Export buttons
     # only show in 'Specified <level>(s)' mode). To add a button, create its axes/Button above and put
     # its axes in this list where it should sit; layout_sidebar_buttons does the rest.
-    SIDEBAR_BUTTON_STACK_BOTTOM_UP = (close_ax, export_expr_ax, export_degs_ax, show_ax, open_data_folder_ax)
+    SIDEBAR_BUTTON_STACK_BOTTOM_UP = (close_ax, export_expr_ax, export_degs_ax, export_coords_ax, view3d_web_ax,
+                                      view3d_ax, show_ax, open_data_folder_ax)
     SIDEBAR_BUTTON_STACK_Y0 = 0.06  # Close's bottom edge, just above the "Working…" text at the sidebar's foot
 
     def layout_sidebar_buttons(left=None, width=None):
@@ -13769,7 +14187,8 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     DISABLED_TEXT_COLOR = DISABLED_CONTROL_COLOR
     ENABLED_TEXT_COLOR = 'black'
     BUSY_GATED_BUTTONS = (open_data_folder_button, show_button, save_section_maps_button, save_button,
-                          export_degs_button, export_expr_button, close_button)
+                          export_degs_button, export_expr_button, export_coords_button, view3d_button,
+                          view3d_web_button, close_button)
 
     def set_sidebar_controls_busy(is_busy):
         # Only touches Python-side widget state (Button.active gates its
@@ -16355,6 +16774,206 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         hide_working_indicator()
         blit_hover_overlays()
 
+    # --- Export coordinates / 3D view of the specified IDs --------------------------------------
+    view3d_figures = []  # open 3D windows; closed together with the viewer (nothing would pump their events)
+
+    def selected_group_cells(level, targets):
+        """(table, scope): one row per cell of the specified IDs. Whole brain when the all-cell background
+        table is loaded (every cell of those groups, not just the ones in this run), else only this run's
+        cells. Section-frame x/y/z, the four taxonomy levels, and, for cells that are in this run, their
+        UMAP position."""
+        frames = []
+        use_background = (has_background and background_level_ids_arrays.get(level) is not None
+                          and background_section_arr is not None)
+        if use_background:
+            ids = background_level_ids_arrays[level]
+            labels = background_spatial.index
+            spatial_columns = [(c, n) for c, n in (('x', 'section_x_mm'), ('y', 'section_y_mm'), ('z', 'section_z_mm'))
+                               if c in background_spatial.columns]
+            for target in targets:
+                rows = np.flatnonzero(ids == target)
+                if rows.size == 0:
+                    continue
+                frame = pd.DataFrame({'cell_label': labels[rows], 'group_id': target,
+                                      'brain_section_label': background_section_arr[rows]})
+                for taxonomy_level in ('class', 'subclass', 'supertype', 'cluster'):
+                    values = background_level_arrays.get(taxonomy_level)
+                    if values is not None:
+                        frame[taxonomy_level] = values[rows]
+                for column, name in spatial_columns:
+                    frame[name] = background_spatial[column].to_numpy()[rows]
+                frames.append(frame)
+        else:
+            ids = np.asarray(level_ids_arrays[level])
+            for target in targets:
+                rows = np.flatnonzero(ids == target)
+                if rows.size == 0:
+                    continue
+                frame = pd.DataFrame({'cell_label': adata.obs_names[rows], 'group_id': target})
+                if cell_section is not None:
+                    frame['brain_section_label'] = cell_section[rows]
+                for taxonomy_level in ('class', 'subclass', 'supertype', 'cluster'):
+                    values = cell_level_arrays.get(taxonomy_level)
+                    if values is not None:
+                        frame[taxonomy_level] = values[rows]
+                if cell_x is not None:
+                    frame['section_x_mm'] = cell_x[rows]
+                    frame['section_y_mm'] = cell_y[rows]
+                if section_spatial is not None and 'z' in section_spatial.columns:
+                    frame['section_z_mm'] = pd.to_numeric(section_spatial['z'], errors='coerce').to_numpy()[rows]
+                frames.append(frame)
+        table = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=['cell_label', 'group_id'])
+        umap_rows = np.array([cell_id_to_umap_idx.get(label, -1) for label in table['cell_label']], dtype=int)
+        in_run = umap_rows >= 0
+        table['in_run'] = in_run
+        table['umap1'] = np.where(in_run, coords[np.maximum(umap_rows, 0), 0], np.nan)
+        table['umap2'] = np.where(in_run, coords[np.maximum(umap_rows, 0), 1], np.nan)
+        return table, ('whole brain' if use_background else 'this run only')
+
+    def attach_ccf(table, shell_points=0):
+        """Adds the Allen CCF position and region to `table` (downloading the CCF files first, after
+        asking, if they are not in the cache). Returns (shell_xyz or None, have_ccf)."""
+        parent = tk_widget.winfo_toplevel() if tk_widget is not None else None
+        if not ensure_ccf_downloaded(abc_cache, parent=parent):
+            return None, False
+        unblock_input = block_viewer_input()  # the loading window pumps Tk events; keep the viewer still
+        try:
+            aligned, shell = run_with_loading_window(
+                "Reading the CCF coordinates (the first read of this 4-million-cell table takes about a minute).",
+                lambda: load_ccf_for_cells(abc_cache, table['cell_label'].tolist(), shell_points))
+        finally:
+            unblock_input()
+        for source, name in (('x_ccf', 'ccf_x_mm'), ('y_ccf', 'ccf_y_mm'), ('z_ccf', 'ccf_z_mm')):
+            table[name] = aligned[source].to_numpy()
+        names = load_parcellation_names(abc_cache)
+        if names is not None:
+            parcel = aligned['parcellation_index'].to_numpy()
+            parcel = np.where(np.isfinite(parcel), parcel, -1).astype(int)
+            for column in ('division', 'structure', 'substructure'):
+                table[f'ccf_{column}'] = names[column].reindex(parcel).to_numpy()
+        return shell, True
+
+    def ids_for_group_actions(action_name):
+        """(level, targets) of the IDs currently highlighted, or None (after saying why in the status line)."""
+        level = last_id_selection['level']
+        targets = [t for t in last_id_selection['targets'] if last_id_selection['counts'].get(t, 0) > 0]
+        if level is None or not targets:
+            status_text.set_text(f"Enter at least one ID that exists in this run before {action_name}.")
+            blit_hover_overlays()
+            return None
+        return level, targets
+
+    def export_coordinates(event=None):
+        chosen = ids_for_group_actions('exporting coordinates')
+        if chosen is None:
+            return
+        level, targets = chosen
+        target_dir = Path(run_folder) if run_folder is not None else CACHE_DIR
+        show_working_indicator('Gathering cells…')
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            table, scope = selected_group_cells(level, targets)
+            if table.empty:
+                status_text.set_text("None of those IDs has any cells to export.")
+            else:
+                _shell, have_ccf = attach_ccf(table)
+                front = ['cell_label', 'group_id', 'brain_section_label', 'class', 'subclass', 'supertype', 'cluster',
+                         'section_x_mm', 'section_y_mm', 'section_z_mm', 'ccf_x_mm', 'ccf_y_mm', 'ccf_z_mm',
+                         'ccf_division', 'ccf_structure', 'ccf_substructure', 'in_run', 'umap1', 'umap2']
+                table = table[[c for c in front if c in table.columns]]
+                path = unique_export_paths(
+                    target_dir, f"coordinates_{level}_{'-'.join(str(t) for t in targets)}", ('.csv',))['.csv']
+                table.to_csv(path, index=False)
+                note = '' if have_ccf else ' (no CCF columns: that download was declined)'
+                status_text.set_text(f"Saved {len(table):,} cells ({scope}){note} to {path}.")
+                print(f"Saved coordinates to {path}.")
+        except Exception as e:
+            status_text.set_text(f"Could not export coordinates: {e}")
+            print(f"Could not export coordinates: {e}")
+        hide_working_indicator()
+        blit_hover_overlays()
+
+    def prepare_3d_inputs(action_name):
+        """The shared first half of both 3D buttons: the specified IDs' cells with their CCF positions, arranged
+        for plotting. Returns None (after saying why in the status line) or a dict of what the viewers need."""
+        chosen = ids_for_group_actions(action_name)
+        if chosen is None:
+            return None
+        level, targets = chosen
+        table, scope = selected_group_cells(level, targets)
+        if table.empty:
+            status_text.set_text("None of those IDs has any cells to show.")
+            return None
+        shell, have_ccf = attach_ccf(table, shell_points=THREED_SHELL_POINTS)
+        if have_ccf:
+            columns = ('ccf_z_mm', 'ccf_x_mm', 'ccf_y_mm')  # left-right, front-back, up-down
+            axis_labels = ('left - right (CCF z, mm)', 'anterior - posterior (CCF x, mm)', 'dorsal - ventral (CCF y, mm)')
+            shell_xyz = shell[:, [2, 0, 1]]
+            outline = brain_outline_segments(shell_xyz)
+        else:
+            columns = ('section_x_mm', 'section_z_mm', 'section_y_mm')
+            axis_labels = ('section x (mm)', 'section position (mm)', 'section y (mm)')
+            shell_xyz, outline = None, None
+        level_name = LEVEL_DISPLAY_NAMES[level]
+        groups = []
+        for target in targets:
+            rows = table[table['group_id'] == target]
+            hover = None
+            if have_ccf and 'ccf_structure' in rows.columns:
+                hover = (rows['ccf_structure'].fillna('?').astype(str) + ' | section '
+                         + rows['brain_section_label'].astype(str).str.rsplit('.', n=1).str[-1]
+                         + ' | ' + rows['cell_label'].astype(str)).to_numpy()
+            groups.append({'label': f"{level_name} {target} ({len(rows):,})",
+                           'color': last_id_selection['colors'].get(target, 'red'),
+                           'xyz': rows[list(columns)].to_numpy(dtype=float), 'hover': hover})
+        return {'groups': groups, 'shell_xyz': shell_xyz, 'outline': outline, 'axis_labels': axis_labels,
+                'title': f"3D view: {level_name.lower()} {', '.join(str(t) for t in targets)} ({scope})",
+                'have_ccf': have_ccf, 'level': level, 'targets': targets}
+
+    def show_3d_view(event=None):
+        show_working_indicator('Preparing 3D view…')
+        try:
+            prepared = prepare_3d_inputs('opening the 3D view')
+            if prepared is not None:
+                view3d_figures.append(open_3d_group_view(
+                    prepared['groups'], prepared['shell_xyz'], prepared['outline'], prepared['axis_labels'],
+                    prepared['title']))
+                status_text.set_text("3D view opened: drag to rotate, click legend entries to hide/show a group."
+                                     + ('' if prepared['have_ccf'] else " (CCF unavailable: section coordinates, "
+                                        "so the sections look stacked.)"))
+        except Exception as e:
+            status_text.set_text(f"Could not open the 3D view: {e}")
+            print(f"Could not open the 3D view: {e}")
+        hide_working_indicator()
+        blit_hover_overlays()
+
+    def show_3d_in_browser(event=None):
+        try:
+            import plotly  # noqa: F401
+        except ImportError:
+            status_text.set_text("The browser 3D view needs plotly: run  python -m pip install plotly  and restart.")
+            blit_hover_overlays()
+            return
+        show_working_indicator('Preparing 3D view…')
+        try:
+            prepared = prepare_3d_inputs('opening the 3D view')
+            if prepared is not None:
+                target_dir = Path(run_folder) if run_folder is not None else CACHE_DIR
+                target_dir.mkdir(parents=True, exist_ok=True)
+                path = unique_export_paths(
+                    target_dir, f"3d_{prepared['level']}_{'-'.join(str(t) for t in prepared['targets'])}",
+                    ('.html',))['.html']
+                show_working_indicator('Writing the 3D page…')
+                write_3d_group_html(prepared['groups'], prepared['shell_xyz'], prepared['outline'],
+                                    prepared['axis_labels'], prepared['title'], path)
+                open_with_default_viewer(path)
+                status_text.set_text(f"Opened {path.name} in your browser (saved in {target_dir}).")
+        except Exception as e:
+            status_text.set_text(f"Could not open the 3D view in the browser: {e}")
+            print(f"Could not open the 3D view in the browser: {e}")
+        hide_working_indicator()
+        blit_hover_overlays()
+
     def on_mode_change(label):
         previous_mode = mode_state['mode']
         if previous_mode != 'All Subclasses':
@@ -16367,6 +16986,9 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         query_label.set_visible(show_query)
         export_degs_ax.set_visible(label == 'Single Subclass')
         export_expr_ax.set_visible(label == 'Single Subclass')
+        export_coords_ax.set_visible(label == 'Single Subclass')
+        view3d_ax.set_visible(label == 'Single Subclass')
+        view3d_web_ax.set_visible(label == 'Single Subclass')
         layout_sidebar_buttons()  # the stack closes up around whichever of these just appeared/vanished
         gene_dropdown_ax.set_visible(False)
         gene_suggestion_state['matches'] = []
@@ -16458,6 +17080,9 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     save_button.on_clicked(save_current_umap)
     export_degs_button.on_clicked(export_de_genes)
     export_expr_button.on_clicked(export_expression)
+    export_coords_button.on_clicked(export_coordinates)
+    view3d_button.on_clicked(show_3d_view)
+    view3d_web_button.on_clicked(show_3d_in_browser)
 
     # --- Tool tips for the buttons -------------------------------------------
     # Hover a button for TOOLTIP_DELAY_MS and a small yellow note appears beside the pointer. A real
@@ -16542,6 +17167,14 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     set_tooltip(export_degs_button, "Export differentially expressed genes for the specified IDs as CSV "
                                     "(standard gene panel and imputed gene set).")
     set_tooltip(export_expr_button, "Export each specified ID's mean log2 expression per gene as CSV.")
+    set_tooltip(export_coords_button, "Export every cell of the specified IDs across the whole brain as CSV: section "
+                                      "x/y/z, Allen CCF x/y/z and region, taxonomy, and UMAP position for cells in "
+                                      "this run. The CCF positions need a one-time 296 MB download.")
+    set_tooltip(view3d_button, "Open a rotatable 3D view of the specified IDs in Allen CCF coordinates (drag to "
+                               "rotate). Click a legend entry to hide or show that group.")
+    set_tooltip(view3d_web_button, "Open the same 3D view as an interactive page in your web browser (needs the plotly "
+                                   "package): real depth, smooth with hundreds of thousands of cells, hover for the "
+                                   "region of each cell. Saved as an HTML file in the run folder.")
     set_tooltip(close_button, "Close the viewer.")
 
     # --- Resize handles between the three panels -----------------------
@@ -16884,6 +17517,8 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     try:
         show_figure_blocking(fig)
     finally:
+        for figure_3d in view3d_figures:  # nothing would service their events once this window is gone
+            plt.close(figure_3d)
         # Re-enable and run one real collection now that the window (and
         # its many thousands of cyclic-referencing Artists) is closed and
         # can actually be reclaimed, rather than leaving gc permanently
