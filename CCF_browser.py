@@ -96,7 +96,9 @@ def read_nifti_volume(path):
     """The voxel array of a (gzipped) NIfTI-1 file as [i, j, k] (the file's own axis order), without nibabel."""
     import gzip
     import struct
-    with gzip.open(path, 'rb') as handle:
+    with open(path, 'rb') as plain:
+        gzipped = plain.read(2) == bytes([0x1f, 0x8b])   # .nii.gz, or an uncompressed .nii
+    with (gzip.open if gzipped else open)(path, 'rb') as handle:
         raw = handle.read()
     header = raw[:348]
     dims = struct.unpack('<8h', header[40:56])
@@ -235,6 +237,63 @@ def read_nrrd_volume(path):
         raise ValueError(f"unsupported NRRD encoding {encoding!r}")
     sizes = tuple(int(n) for n in fields['sizes'].split())
     return np.frombuffer(body, dtype=dtype, count=int(np.prod(sizes))).reshape(sizes[::-1])
+
+
+SAVE_FORMATS = {'.nrrd': "NRRD (.nrrd)", '.nii.gz': "NIfTI-1, gzipped (.nii.gz)", '.nii': "NIfTI-1 (.nii)"}
+
+
+def volume_format(path):
+    """'.nrrd', '.nii.gz' or '.nii' for a file name, or None."""
+    name = str(path).lower()
+    return next((ext for ext in ('.nii.gz', '.nii', '.nrrd') if name.endswith(ext)), None)
+
+
+def nifti_header(shape, dtype):
+    """A 352-byte NIfTI-1 header (single file, millimetres) with the orientation of the ABC CCF annotation volume."""
+    import struct
+    code, bits = {'uint16': (512, 16), 'uint32': (768, 32)}[np.dtype(dtype).name]
+    header = bytearray(352)
+    struct.pack_into('<i', header, 0, 348)
+    struct.pack_into('<8h', header, 40, 3, *shape, 1, 1, 1, 1)
+    struct.pack_into('<2h', header, 70, code, bits)
+    struct.pack_into('<8f', header, 76, 1.0, VOXEL_UM / 1000, VOXEL_UM / 1000, VOXEL_UM / 1000, 0, 0, 0, 0)
+    struct.pack_into('<2f', header, 108, 352.0, 1.0)   # vox_offset, scl_slope
+    header[123] = 2                                  # xyzt_units: millimetres
+    struct.pack_into('<2h', header, 252, 1, 1)       # qform_code, sform_code
+    struct.pack_into('<6f', header, 256, -0.5, 0.5, -0.5, -5.695, 5.35, 5.22)
+    struct.pack_into('<12f', header, 280, 0, 0, 0.025, -5.695, -0.025, 0, 0, 5.35, 0, -0.025, 0, 5.22)
+    header[344:348] = b'n+1\0'
+    return bytes(header)
+
+
+def write_volume(path, values, progress=None):
+    """Write a [AP, DV, ML] array of uint16/uint32 region values as .nrrd, .nii or .nii.gz (chosen by the name)."""
+    import gzip
+    import zlib
+    fmt = volume_format(path)
+    if progress:
+        progress("compressing" if fmt != '.nii' else "writing")
+    if fmt == '.nrrd':
+        kind = {'uint16': 'unsigned short', 'uint32': 'unsigned int'}[values.dtype.name]
+        header = (f"NRRD0004\n# Written by CCF_browser.py\ntype: {kind}\ndimension: 3\nspace: left-posterior-superior\n"
+                  f"sizes: {values.shape[2]} {values.shape[1]} {values.shape[0]}\n"
+                  f"space directions: ({VOXEL_UM:g},0,0) (0,{VOXEL_UM:g},0) (0,0,{VOXEL_UM:g})\n"
+                  "kinds: domain domain domain\nendian: little\nencoding: gzip\nspace origin: (0,0,0)\n\n")
+        compressor = zlib.compressobj(6, zlib.DEFLATED, 31)
+        with open(path, 'wb') as handle:
+            handle.write(header.encode('ascii'))
+            for start in range(0, values.shape[0], 16):   # in slabs, to keep the temporary copies small
+                handle.write(compressor.compress(np.ascontiguousarray(values[start:start + 16]).tobytes()))
+            handle.write(compressor.flush())
+    elif fmt in ('.nii', '.nii.gz'):
+        opener = gzip.open(path, 'wb', compresslevel=5) if fmt == '.nii.gz' else open(path, 'wb')
+        with opener as handle:
+            handle.write(nifti_header(values.shape, values.dtype))
+            transposed = values.T   # NIfTI stores the first axis (AP) fastest
+            for start in range(0, transposed.shape[0], 16):
+                handle.write(np.ascontiguousarray(transposed[start:start + 16]).tobytes())
+    else:
+        raise ValueError("the file name must end in .nrrd, .nii or .nii.gz")
 
 
 def read_ontology(path, top):
@@ -492,6 +551,43 @@ def marker_offsets(shape, radius):
     return dx[mask], dy[mask]
 
 
+def plane_view(array, view, index):
+    """A writable (rows, columns) view, not a copy, of one slice of a volume-shaped array."""
+    if view == 'Coronal':
+        return array[index]
+    if view == 'Sagittal':
+        return array[:, :, index].T
+    return array[:, index, :]
+
+
+def value_ranges(values):
+    """'1-5, 9, 12-20' for a sorted array of distinct whole numbers."""
+    values = np.asarray(values, dtype=np.int64)
+    if not len(values):
+        return 'none'
+    breaks = np.flatnonzero(np.diff(values) != 1)
+    starts, ends = np.concatenate(([0], breaks + 1)), np.concatenate((breaks, [len(values) - 1]))
+    return ', '.join(str(values[a]) if a == b else f"{values[a]}\u2013{values[b]}" for a, b in zip(starts, ends))
+
+
+def lowest_unused(values, start=1):
+    """The smallest whole number >= `start` missing from a sorted array of distinct whole numbers."""
+    values = np.asarray(values, dtype=np.int64)
+    values = values[values >= start]
+    expected = np.arange(start, start + len(values))
+    mismatch = np.flatnonzero(values != expected)
+    return int(expected[mismatch[0]]) if len(mismatch) else start + len(values)
+
+
+def disk_offsets(radius):
+    """(dx, dy) voxel offsets of a filled disk; radius 0 is the single voxel."""
+    r = max(0, int(radius))
+    span = np.arange(-r, r + 1)
+    dx, dy = np.meshgrid(span, span)
+    keep = dx * dx + dy * dy <= r * r + 0.25
+    return dx[keep], dy[keep]
+
+
 def desaturated(lut, saturation):
     """The colour table with its colours pulled toward grey: saturation 1.0 = as is, 0.0 = pure grey."""
     if saturation >= 1.0:
@@ -515,7 +611,7 @@ def atlas_rgb(labels, lut, mode):
     return rgb
 
 
-def render_frame(labels, lut, mode, view, size, layers=(), radius=3):
+def render_frame(labels, lut, mode, view, size, layers=(), radius=3, overlay=None):
     """The picture of one slice as an (H, W, 3) uint8 array. `view` = (scale, ox, oy) maps image coordinates (voxel
     edges) to canvas pixels as ox + u * scale. `layers` = [(u_um, v_um, group_codes, styles)], one
     per CSV, of the cells to stamp on it (later layers on top); `styles` = [(colour, shape)] per group."""
@@ -524,6 +620,9 @@ def render_frame(labels, lut, mode, view, size, layers=(), radius=3):
     canvas = np.empty((height, width, 3), dtype=np.uint8)
     canvas[:] = BACKGROUND
     rgb = atlas_rgb(labels, lut, mode)
+    if overlay is not None and overlay.any():   # the painted voxels not yet applied, in red
+        rgb = rgb.copy()
+        rgb[overlay] = (rgb[overlay] * 0.35 + np.array([255, 0, 0]) * 0.65).astype(np.uint8)
     image_h, image_w = labels.shape
     u0, u1 = max(0.0, -ox / scale), min(float(image_w), (width - ox) / scale)
     v0, v1 = max(0.0, -oy / scale), min(float(image_h), (height - oy) / scale)
@@ -575,12 +674,26 @@ class InfoWindow:
         self.window.title("CCF browser: info")
         self.window.transient(app.root)
         self.window.protocol('WM_DELETE_WINDOW', self.window.withdraw)  # closing only hides it; the Info button reopens
-        self.text = tk.Text(self.window, width=62, height=36, font=('Consolas', 10), bg='#fbfbfb', wrap='none',
+        tabs = ttk.Notebook(self.window)
+        tabs.pack(fill='both', expand=True)
+        self.text = tk.Text(tabs, width=62, height=36, font=('Consolas', 10), bg='#fbfbfb', wrap='none',
                             state='disabled', cursor='arrow')
-        self.text.pack(fill='both', expand=True)
-        self.text.tag_configure('head', font=('Consolas', 10, 'bold'), foreground='#1a3d6d', spacing1=6)
-        self.text.tag_configure('dim', foreground='#777777')
+        self.overall = tk.Text(tabs, width=62, height=36, font=('Consolas', 10), bg='#fbfbfb', wrap='word',
+                               state='disabled', cursor='arrow')
+        tabs.add(self.text, text="Cursor")
+        tabs.add(self.overall, text="Overall")
+        for widget in (self.text, self.overall):
+            widget.tag_configure('head', font=('Consolas', 10, 'bold'), foreground='#1a3d6d', spacing1=6)
+            widget.tag_configure('dim', foreground='#777777')
         self.slice_lines, self.cursor_lines, self.nearest_lines = [], [], []
+
+    def set_overall(self, lines):
+        """Rows of (text, tag) for the Overall tab."""
+        self.overall.configure(state='normal')
+        self.overall.delete('1.0', 'end')
+        for line, tag in lines:
+            self.overall.insert('end', line + '\n', tag or ())
+        self.overall.configure(state='disabled')
 
     def place_beside(self):
         self.app.root.update_idletasks()
@@ -677,7 +790,25 @@ class CCFBrowser:
         self.settings_status = tk.StringVar()
         self.atlas_loaded_once = False
         self.last_root_pos = None
+        self.zoom_goal = None          # scale the smooth zoom is heading for, None when not zooming
+        self.zoom_anchor = None        # (canvas x, canvas y, image u, image v) kept fixed during the zoom
+        self.wheel_zoom_var = tk.BooleanVar(value=bool(self.settings.get('wheel_zoom', True)))
         self.settings_window = None
+        self.label_ids = None          # real ids of a remapped atlas (volume holds 0..n-1), else None
+        self.overlay = None            # bool volume of the red painted voxels, made on first use
+        self.overlay_count = 0
+        self.edit_count = 0            # voxels changed by Apply since the atlas was loaded
+        self.undo_stack = []           # ('stroke', flat voxel indices, drawn?) / ('apply', flat indices, old values)
+        self.tool = 'none'             # 'draw', 'erase' or 'none' (drag pans)
+        self.stroke = None             # flat voxel indices changed by the stroke in progress
+        self.last_paint = None
+        self.value_cache = None        # voxels per label, until the volume changes
+        self.paint_window = None
+        self.paint_buttons = {}
+        self.paint_value_var = tk.StringVar(value=self.settings.get('paint_value', ''))
+        self.paint_warning = tk.StringVar()
+        self.paint_status = tk.StringVar()
+        self.brush_var = tk.IntVar(value=int(self.settings.get('brush', 5)))
         self.view = [1.0, 0.0, 0.0]   # scale, ox, oy
         self.fit = True
         self.drag = None
@@ -754,6 +885,7 @@ class CCFBrowser:
         mode_box.pack(side='left', padx=3)
         mode_box.bind('<<ComboboxSelected>>', lambda e: self.refresh_all())
         ttk.Button(controls, text="Info window", command=lambda: self.info.show()).pack(side='left', padx=(10, 0))
+        ttk.Button(controls, text="Paint panel", command=self.open_paint).pack(side='left', padx=(4, 0))
         for variable in (self.slab_var, self.dot_var):
             variable.trace_add('write', lambda *a: self.refresh_all())
         self.message = ttk.Label(controls, text="", foreground='#7a3b00')
@@ -774,8 +906,9 @@ class CCFBrowser:
         self.canvas.bind('<Leave>', lambda e: self.on_leave())
         self.canvas.bind('<ButtonPress-1>', self.on_press)
         self.canvas.bind('<B1-Motion>', self.on_drag)
-        self.canvas.bind('<ButtonRelease-1>', lambda e: setattr(self, 'drag', None))
+        self.canvas.bind('<ButtonRelease-1>', self.on_release)
         self.canvas.bind('<MouseWheel>', self.on_wheel)
+        self.canvas.bind('<Button-3>', self.on_right_click)
         root.bind('<Left>', lambda e: self.step(-1))
         root.bind('<Right>', lambda e: self.step(1))
         root.bind('<Prior>', lambda e: self.step(-10))
@@ -794,6 +927,352 @@ class CCFBrowser:
                 widget.drop_target_register(self.dnd_files)
                 widget.dnd_bind('<<Drop>>', lambda e: self.on_drop(e, None))
 
+    # ---- painting
+    def paint_to(self, x, y):
+        """Draw or erase the brush disk (and the stretch since the last mouse position) on the overlay."""
+        scale, ox, oy = self.view
+        u, v = int(np.floor((x - ox) / scale)), int(np.floor((y - oy) / scale))
+        previous, self.last_paint = self.last_paint, (u, v)
+        if previous is None:
+            centers = np.array([[u, v]])
+        else:
+            steps = max(1, abs(u - previous[0]), abs(v - previous[1]))
+            fractions = np.linspace(0, 1, steps + 1)[:, None]
+            centers = np.rint(np.array(previous) + (np.array([u, v]) - np.array(previous)) * fractions).astype(np.int64)
+        dx, dy = disk_offsets(self.brush_var.get() or 0)
+        us = (centers[:, 0, None] + dx[None, :]).ravel()
+        vs = (centers[:, 1, None] + dy[None, :]).ravel()
+        image_w, image_h = VIEW_IMAGE_SIZE[self.view_name]
+        inside = (us >= 0) & (us < image_w) & (vs >= 0) & (vs < image_h)
+        us, vs = us[inside], vs[inside]
+        if not len(us):
+            return
+        plane = plane_view(self.overlay, self.view_name, self.slice)
+        target = self.tool == 'draw'
+        changed = plane[vs, us] != target
+        us, vs = us[changed], vs[changed]
+        if not len(us):
+            return
+        plane[vs, us] = target
+        across, down = VIEW_CELL_AXES[self.view_name]
+        voxel = [None, None, None]
+        voxel[self.axis], voxel[across], voxel[down] = np.full(len(us), self.slice), us, vs
+        flat = np.unique(np.ravel_multi_index(voxel, VOLUME_SHAPE))
+        self.stroke.append(flat)
+        self.overlay_count += len(flat) if target else -len(flat)
+        self.request_render()
+
+    def on_right_click(self, event):
+        """With the paint panel open: a menu to add the region under the cursor to the drawing, or remove it."""
+        if self.volume is None or self.paint_window is None or not self.paint_window.winfo_exists():
+            return
+        scale, ox, oy = self.view
+        u_idx, v_idx = int(np.floor((event.x - ox) / scale)), int(np.floor((event.y - oy) / scale))
+        image_w, image_h = VIEW_IMAGE_SIZE[self.view_name]
+        if not (0 <= u_idx < image_w and 0 <= v_idx < image_h):
+            return
+        across, down = VIEW_CELL_AXES[self.view_name]
+        voxel = [0, 0, 0]
+        voxel[self.axis], voxel[across], voxel[down] = self.slice, u_idx, v_idx
+        label = int(self.volume[voxel[0], voxel[1], voxel[2]])
+        value = int(self.label_ids[label]) if self.label_ids is not None else label
+        name = self.region_name(value)
+        shown = f"{name} ({value})" if name else str(value)
+        menu = tk.Menu(self.canvas, tearoff=0)
+        menu.add_command(label=f"Add region {shown} to drawing", command=lambda: self.region_to_drawing(label, True))
+        menu.add_command(label=f"Remove region {shown} from drawing",
+                         command=lambda: self.region_to_drawing(label, False))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def region_to_drawing(self, label, add):
+        """Add all of a region's voxels to the red drawing, or remove them from it (one undo step)."""
+        if self.overlay is None:
+            self.overlay = np.zeros(VOLUME_SHAPE, dtype=bool)
+        region = self.volume == label
+        changed = np.flatnonzero((region & ~self.overlay if add else region & self.overlay).reshape(-1))
+        if not len(changed):
+            self.paint_status.set("Nothing to " + ("add: the region is already all in the drawing."
+                                                   if add else "remove: none of it is in the drawing."))
+            return
+        self.overlay.reshape(-1)[changed] = add
+        self.undo_stack.append(('stroke', changed, add))
+        self.overlay_count += len(changed) if add else -len(changed)
+        self.refresh_all()
+        self.update_paint_status()
+
+    def draw_brush(self):
+        """The brush outline following the cursor while a paint tool is on."""
+        self.canvas.delete('brush')
+        if self.tool == 'none' or self.mouse is None:
+            return
+        radius = ((self.brush_var.get() or 0) + 0.5) * self.view[0]
+        x, y = self.mouse
+        self.canvas.create_oval(x - radius, y - radius, x + radius, y + radius, outline='#ff4040', tags='brush')
+
+    def set_tool(self, tool):
+        """Switch the paint tool on (draw / erase), or off (the same tool again, or 'none'): dragging pans when off."""
+        self.tool = 'none' if tool == self.tool else tool
+        self.update_cursors()
+        for name, button in self.paint_buttons.items():
+            if button.winfo_exists():
+                button.configure(relief='sunken' if name == self.tool else 'raised')
+        self.canvas.delete('brush')
+
+    def value_counts(self):
+        """Voxels per stored label (cached until the volume changes)."""
+        if self.value_cache is None:
+            counts = np.zeros(len(self.lut), dtype=np.int64)
+            for start in range(0, N_AP, 16):   # in slabs: bincount would copy the whole volume as 64-bit
+                counts += np.bincount(self.volume[start:start + 16].ravel(), minlength=len(self.lut))[:len(self.lut)]
+            self.value_cache = counts
+        return self.value_cache
+
+    def used_values(self):
+        """Sorted array of the region values (real ids) that occur in the volume."""
+        present = np.flatnonzero(self.value_counts() > 0)
+        if self.label_ids is not None:
+            return np.sort(self.label_ids[present[present < len(self.label_ids)]])
+        return present
+
+    def stored_label(self, value):
+        """The label stored in the volume for a region value, or None if the value is not in the atlas's list."""
+        if self.label_ids is None:
+            return value if value < len(self.lut) else None
+        found = np.flatnonzero(self.label_ids == value)
+        return int(found[0]) if len(found) else None
+
+    def ensure_label(self, value):
+        """The label to store for a region value, adding it (with a random colour and a table row) if it is new."""
+        label = self.stored_label(value)
+        if label is not None and (self.region_table is None or label in self.region_table.index):
+            return label
+        if label is None:
+            if self.label_ids is None:
+                if value > 65535:
+                    raise ValueError("this atlas stores 16-bit labels: the value must be 65535 or less")
+                label, new_size = value, value + 1
+            else:
+                label, new_size = len(self.label_ids), len(self.label_ids) + 1
+                if label > 65535:
+                    raise ValueError("no room for another label")
+                self.label_ids = np.append(self.label_ids, value)
+            rng = np.random.default_rng(value)
+            extra = rng.integers(60, 256, size=(max(0, new_size - len(self.lut)), 3)).astype(np.uint8)
+            self.lut = np.vstack([self.lut, extra])
+            if self.value_cache is not None:
+                self.value_cache = np.concatenate([self.value_cache, np.zeros(len(self.lut) - len(self.value_cache),
+                                                                              dtype=np.int64)])
+        if self.region_table is not None:
+            row = {column: np.nan for column in self.region_table.columns}
+            row.update({'acronym_substructure': '(painted)', 'name_substructure': f"painted region {value}",
+                        'detail': 'painted in the CCF browser'})
+            if 'region_id' in row:
+                row['region_id'] = value
+            self.region_table.loc[label] = pd.Series(row)
+        return label
+
+    def refresh_overall(self):
+        """The Overall tab of the info window: the atlas, the pixel values in use, the edits, the loaded CSVs."""
+        if self.volume is None:
+            return
+        used = self.used_values()
+        lines = [("ATLAS", 'head'),
+                 (Path(self.atlas_path).name if self.atlas_path else "Allen CCF 2020 (ABC atlas cache)", None),
+                 (f"{N_AP} x {N_DV} x {N_ML} voxels of {VOXEL_UM:g} um", None),
+                 ("PIXEL VALUES IN USE", 'head')]
+        if len(used):
+            lines += [(f"{len(used):,} distinct values, from {int(used.min())} to {int(used.max())}:", None),
+                      (value_ranges(used), None), (f"Lowest unused value: {lowest_unused(used)}", None)]
+        lines += [("EDITS", 'head'), (f"Red overlay (not applied): {self.overlay_count:,} voxels", None),
+                  (f"Applied to the volume: {self.edit_count:,} voxel changes ({len(self.undo_stack)} undo steps)",
+                   None), ("CSV FILES", 'head')]
+        loaded = [slot for slot in self.slots if slot.points is not None]
+        for slot in loaded:
+            lines.append((f"CSV {slot.index + 1}: {slot.points.path.name}, {len(slot.points.ap):,} cells", None))
+        if not loaded:
+            lines.append(("none loaded", 'dim'))
+        self.info.set_overall(lines)
+
+    def region_name(self, value):
+        label = self.stored_label(value)
+        if label is None or self.region_table is None or label not in self.region_table.index:
+            return ''
+        return str(self.region_table.loc[label].get('acronym_substructure') or '')
+
+    def update_paint_status(self):
+        if self.paint_window is None or not self.paint_window.winfo_exists():
+            return
+        text = self.paint_value_var.get().strip()
+        warning = ''
+        if text:
+            if not text.isdigit():
+                warning = "Enter a whole number, 0 or more."
+            else:
+                value = int(text)
+                label = self.stored_label(value)
+                count = int(self.value_counts()[label]) if label is not None and label < len(self.value_counts()) else 0
+                if count:
+                    name = self.region_name(value)
+                    warning = (f"Value {value} is already in use ({name + ', ' if name else ''}{count:,} voxels): "
+                               f"applying will merge the overlay into it.")
+        self.paint_warning.set(warning)
+        self.paint_status.set(f"Overlay: {self.overlay_count:,} voxels   Undo steps: {len(self.undo_stack)}")
+
+    def open_paint(self):
+        if self.volume is None:
+            return
+        if self.paint_window is not None and self.paint_window.winfo_exists():
+            self.paint_window.lift()
+            return
+        window = self.paint_window = tk.Toplevel(self.root)
+        window.title("CCF browser: paint")
+        window.transient(self.root)
+        window.protocol('WM_DELETE_WINDOW', self.close_paint)
+        body = ttk.Frame(window, padding=12)
+        body.pack(fill='both', expand=True)
+        row = ttk.Frame(body)
+        row.pack(fill='x')
+        self.paint_buttons = {}
+        for name, label in (('draw', "Draw"), ('erase', "Erase")):
+            button = tk.Button(row, text=label, width=9, command=lambda n=name: self.set_tool(n))
+            button.pack(side='left', padx=(0, 6))
+            self.paint_buttons[name] = button
+        ttk.Button(row, text="Undo", command=self.undo).pack(side='left')
+        for name, button in self.paint_buttons.items():
+            button.configure(relief='sunken' if name == self.tool else 'raised')
+        ttk.Label(body, foreground='#555555', text="Draw or Erase on, drag on the image to paint in red; "
+                                                   "press the tool again to pan.", wraplength=300).pack(
+            anchor='w', pady=(6, 8))
+        grid = ttk.Frame(body)
+        grid.pack(fill='x')
+        ttk.Label(grid, text="Brush radius (voxels)").grid(row=0, column=0, sticky='w')
+        ttk.Spinbox(grid, from_=0, to=100, width=6, textvariable=self.brush_var).grid(row=0, column=1, padx=(8, 0),
+                                                                                    sticky='w')
+        ttk.Label(grid, text="Pixel value").grid(row=1, column=0, sticky='w', pady=(6, 0))
+        entry = ttk.Entry(grid, textvariable=self.paint_value_var, width=14)
+        entry.grid(row=1, column=1, padx=(8, 0), pady=(6, 0), sticky='w')
+        if not self.paint_value_var.get().strip():   # first time: suggest the lowest unused value, else keep the last
+            self.paint_value_var.set(str(lowest_unused(self.used_values())))
+        self.paint_value_var.trace_add('write', lambda *a: self.update_paint_status())
+        ttk.Label(body, textvariable=self.paint_warning, foreground='#b00020', wraplength=320,
+                  justify='left').pack(anchor='w', pady=(6, 0))
+        ttk.Label(body, textvariable=self.paint_status, foreground='#555555').pack(anchor='w', pady=(6, 0))
+        buttons = ttk.Frame(body)
+        buttons.pack(fill='x', pady=(10, 0))
+        ttk.Button(buttons, text="Close", command=self.close_paint).pack(side='right')
+        ttk.Button(buttons, text="Apply", command=self.apply_paint).pack(side='right', padx=(0, 6))
+        ttk.Button(buttons, text="Save volume…", command=self.save_volume).pack(side='left')
+        info = self.info.window
+        info.update_idletasks()
+        below = info.winfo_y() + info.winfo_height() + 8
+        if below + 280 < self.root.winfo_screenheight():
+            window.geometry(f"+{info.winfo_x()}+{below}")
+        else:
+            window.geometry(f"+{info.winfo_x() + info.winfo_width() + 8}+{info.winfo_y()}")
+        self.update_paint_status()
+
+    def save_volume(self):
+        """Write the (edited) volume to a file; the format defaults to that of the atlas file it was loaded from."""
+        if self.volume is None or self.busy_label:
+            return
+        parent = self.paint_window if self.paint_window is not None and self.paint_window.winfo_exists() else self.root
+        if self.overlay_count and not messagebox.askyesno(
+                "Unapplied overlay", f"{self.overlay_count:,} red voxels have not been applied and will not be saved. "
+                "Save anyway?", parent=parent):
+            return
+        source = Path(self.atlas_path) if self.atlas_path else None
+        default = volume_format(source) if source else '.nii.gz'
+        default = default or '.nii.gz'
+        order = [default] + [ext for ext in SAVE_FORMATS if ext != default]
+        stem = source.name[:-len(default)] if source and source.name.lower().endswith(default) else 'annotation_25'
+        kind = tk.StringVar()
+        chosen = filedialog.asksaveasfilename(
+            title="Save the edited volume", parent=parent, initialdir=str((source.parent if source else SCRIPT_DIR.parent)),
+            initialfile=f"{stem}_edited{default}", defaultextension=default, typevariable=kind,
+            filetypes=[(SAVE_FORMATS[ext], f"*{ext}") for ext in order])
+        if not chosen:
+            return
+        if volume_format(chosen) is None:   # no recognised extension typed: use the file type chosen in the dialog
+            ext = next((e for e, label in SAVE_FORMATS.items() if label == kind.get()), default)
+            chosen += ext
+        path = Path(chosen)
+        ids = self.label_ids
+        if ids is not None:
+            values = ids.astype(np.uint32 if ids.max() > 65535 else np.uint16)[self.volume]
+        else:
+            values = self.volume.copy()
+        if values.dtype != np.uint32 and values.max() > 65535:
+            values = values.astype(np.uint32)
+
+        def done(result, error):
+            if error is not None:
+                messagebox.showerror("Save volume", f"Could not save the volume:\n{error}", parent=parent)
+                self.paint_status.set("Save failed.")
+                return
+            self.paint_status.set(f"Saved {path.name}")
+            self.message.configure(text=f"Saved {path}")
+        self.run_in_thread(f"Saving {path.name}…", lambda: write_volume(path, values, self.set_progress), done)
+
+    def close_paint(self):
+        self.set_tool('none')
+        if self.paint_window is not None:
+            self.paint_window.destroy()
+        self.paint_window = None
+
+    def apply_paint(self):
+        """Give the red overlay's voxels the typed pixel value."""
+        if not self.overlay_count:
+            self.paint_status.set("Nothing is drawn: use Draw first.")
+            return
+        text = self.paint_value_var.get().strip()
+        if not text.isdigit():
+            self.paint_status.set("Enter a whole number, 0 or more, as the pixel value.")
+            return
+        value = int(text)
+        if value in set(self.used_values().tolist()) and not messagebox.askyesno(
+                "Value already in use", f"Pixel value {value} is already in use"
+                + (f" ({self.region_name(value)})" if self.region_name(value) else "")
+                + ". The overlay will be merged into it.\n\nApply anyway?", parent=self.paint_window):
+            return
+        try:
+            label = self.ensure_label(value)
+        except ValueError as e:
+            self.paint_status.set(str(e))
+            return
+        flat = np.flatnonzero(self.overlay.reshape(-1))
+        old = self.volume.reshape(-1)[flat].copy()
+        self.volume.reshape(-1)[flat] = label
+        self.overlay.reshape(-1)[flat] = False
+        self.undo_stack.append(('apply', flat, old))
+        self.overlay_count = 0
+        self.edit_count += len(flat)
+        self.value_cache = None
+        self.apply_saturation()
+        self.refresh_all()
+        self.update_paint_status()
+        self.paint_status.set(f"Applied value {value} to {len(flat):,} voxels.")
+
+    def undo(self):
+        if not self.undo_stack:
+            self.paint_status.set("Nothing to undo.")
+            return
+        kind, flat, data = self.undo_stack.pop()
+        overlay = self.overlay.reshape(-1)
+        if kind == 'stroke':
+            overlay[flat] = not data
+            self.overlay_count += -len(flat) if data else len(flat)
+        else:
+            self.volume.reshape(-1)[flat] = data
+            overlay[flat] = True
+            self.overlay_count += len(flat)
+            self.edit_count -= len(flat)
+            self.value_cache = None
+        self.refresh_all()
+        self.update_paint_status()
+
     # ---- settings
     def on_root_configure(self, event):
         """Move the info window by as much as the main window moved, when that option is on."""
@@ -804,9 +1283,10 @@ class CCFBrowser:
             return
         dx, dy = position[0] - self.last_root_pos[0], position[1] - self.last_root_pos[1]
         self.last_root_pos = position
-        window = self.info.window
-        if self.follow_var.get() and window.winfo_viewable():
-            window.geometry(f"+{window.winfo_x() + dx}+{window.winfo_y() + dy}")
+        if self.follow_var.get():
+            for window in (self.info.window, self.paint_window):
+                if window is not None and window.winfo_exists() and window.winfo_viewable():
+                    window.geometry(f"+{window.winfo_x() + dx}+{window.winfo_y() + dy}")
 
     def open_settings(self):
         if self.settings_window is not None and self.settings_window.winfo_exists():
@@ -819,6 +1299,8 @@ class CCFBrowser:
         body.pack(fill='both', expand=True)
         ttk.Checkbutton(body, text="Move the info window along when the main window is moved",
                         variable=self.follow_var).pack(anchor='w')
+        ttk.Checkbutton(body, text="Mouse wheel zooms (Ctrl+wheel steps through slices; off: the other way round)",
+                        variable=self.wheel_zoom_var).pack(anchor='w', pady=(4, 0))
 
         box = ttk.LabelFrame(body, text="Atlas", padding=8)
         box.pack(fill='x', pady=(12, 0))
@@ -863,6 +1345,10 @@ class CCFBrowser:
             if self.busy_label:
                 self.settings_status.set("Busy loading; try again when it finishes.")
                 return
+            if (self.edit_count or self.overlay_count) and not messagebox.askyesno(
+                    "Painted changes", "Switching atlas discards the painted overlay and the applied edits "
+                    "(they are not saved anywhere). Continue?", parent=window):
+                return
             self.atlas_path = wanted
             if wanted:
                 self.alt_atlas_path = wanted
@@ -883,7 +1369,7 @@ class CCFBrowser:
         """Run `function()` on a thread; `on_done(result, error)` runs on the main thread when it finishes."""
         self.busy_label, self.progress_text = label, ''
         self.message.configure(text=label)
-        self.root.configure(cursor='watch')
+        self.update_cursors()
 
         def runner():
             try:
@@ -896,8 +1382,8 @@ class CCFBrowser:
         try:
             while True:
                 on_done, result, error = self.work.get_nowait()
-                self.root.configure(cursor='')
                 self.busy_label = ''
+                self.update_cursors()
                 self.message.configure(text="")
                 on_done(result, error)
         except queue.Empty:
@@ -942,6 +1428,11 @@ class CCFBrowser:
             return
         self.volume, self.region_table, self.lut = result
         self.loaded_atlas_path = self.atlas_path
+        self.label_ids = (self.region_table['region_id'].to_numpy()
+                          if self.region_table is not None and 'region_id' in self.region_table else None)
+        self.overlay, self.overlay_count, self.edit_count, self.undo_stack = None, 0, 0, []
+        self.value_cache, self.stroke = None, None
+        self.set_tool('none')
         self.settings_status.set("Atlas loaded: " + (Path(self.atlas_path).name if self.atlas_path else "default CCF"))
         self.root.title("CCF browser" + (f" - {Path(self.atlas_path).name}" if self.atlas_path else ""))
         self.apply_saturation()
@@ -1067,6 +1558,7 @@ class CCFBrowser:
             slot.visible_mask = None
             return
         ttk.Label(frame, text="Show:").pack(side='left')
+        ttk.Button(frame, text="All", width=4, command=lambda s=slot: self.toggle_all(s)).pack(side='left', padx=(4, 2))
         for index, label in enumerate(points.group_labels):
             color, shape = slot.styles[index % len(slot.styles)]
             variable = tk.BooleanVar(value=old.get(label, True))
@@ -1075,6 +1567,21 @@ class CCFBrowser:
                            variable=variable, fg=hex_color(color),
                            command=lambda s=slot: self.visibility_changed(s)).pack(side='left', padx=4)
         self.visibility_changed(slot, refresh=False)
+
+    def toggle_all(self, slot):
+        """Switch every group of the slot off if all are on, otherwise all on."""
+        if slot.points is None:
+            return
+        turn_on = not all(variable.get() for variable in slot.visible.values())
+        for variable in slot.visible.values():
+            variable.set(turn_on)
+        self.visibility_changed(slot)
+
+    def update_cursors(self):
+        """The busy cursor over the whole window, the image included (it has a cursor of its own), else the tool's."""
+        busy = bool(self.busy_label)
+        self.root.configure(cursor='watch' if busy else '')
+        self.canvas.configure(cursor='watch' if busy else ('pencil' if self.tool != 'none' else 'crosshair'))
 
     def visibility_changed(self, slot, refresh=True):
         if slot.points is not None:
@@ -1130,12 +1637,14 @@ class CCFBrowser:
             self.step(int(args[1]) * (10 if args[2] == 'pages' else 1))
 
     def on_wheel(self, event):
-        if event.state & 0x4:   # ctrl: zoom about the cursor
-            self.zoom_at(1.25 if event.delta > 0 else 0.8, (event.x, event.y))
-        else:
+        """The wheel zooms about the cursor (or steps through slices, shift: 10); Ctrl swaps the two."""
+        if bool(event.state & 0x4) == self.wheel_zoom_var.get():   # slices
             self.step((10 if event.state & 0x1 else 1) * (-1 if event.delta > 0 else 1))
+        else:
+            self.zoom_at(1.2 ** (event.delta / 120.0), (event.x, event.y))
 
     def fit_to_window(self):
+        self.zoom_goal = None
         width, height = max(50, self.canvas.winfo_width()), max(50, self.canvas.winfo_height())
         image_w, image_h = VIEW_IMAGE_SIZE[self.view_name]
         scale = min(width / image_w, height / image_h) * 0.97
@@ -1144,18 +1653,57 @@ class CCFBrowser:
         self.request_render()
 
     def zoom_at(self, factor, anchor=None):
+        """Zoom by `factor` about a canvas point (default the centre), easing toward the new scale over a few frames;
+        wheel notches arriving meanwhile add up."""
         scale, ox, oy = self.view
-        new_scale = min(max(scale * factor, 0.5), 60.0)
         ax, ay = anchor if anchor else (self.canvas.winfo_width() / 2, self.canvas.winfo_height() / 2)
-        u, v = (ax - ox) / scale, (ay - oy) / scale
-        self.view = [new_scale, ax - u * new_scale, ay - v * new_scale]
+        base = self.zoom_goal if self.zoom_goal is not None else scale
+        self.zoom_goal = min(max(base * factor, 0.5), 60.0)
+        self.zoom_anchor = (ax, ay, (ax - ox) / scale, (ay - oy) / scale)
         self.fit = False
+        if base == scale or self.zoom_goal != base:
+            self.animate_zoom()
+
+    def animate_zoom(self):
+        if self.zoom_goal is None:
+            return
+        scale = self.view[0]
+        ratio = self.zoom_goal / scale
+        done = abs(ratio - 1) < 0.003
+        new_scale = self.zoom_goal if done else scale * ratio ** 0.22
+        ax, ay, u, v = self.zoom_anchor
+        self.view = [new_scale, ax - u * new_scale, ay - v * new_scale]
         self.request_render()
+        if done:
+            self.zoom_goal = None
+        else:
+            self.root.after(16, self.animate_zoom)
 
     def on_press(self, event):
+        self.zoom_goal = None
+        if self.tool != 'none' and self.volume is not None:
+            if self.overlay is None:
+                self.overlay = np.zeros(VOLUME_SHAPE, dtype=bool)
+            self.stroke, self.last_paint = [], None
+            self.paint_to(event.x, event.y)
+            return
         self.drag = (event.x, event.y, self.view[1], self.view[2])
 
+    def on_release(self, event):
+        self.drag = None
+        if self.stroke is not None:
+            if self.stroke:
+                self.undo_stack.append(('stroke', np.unique(np.concatenate(self.stroke)), self.tool == 'draw'))
+            self.stroke, self.last_paint = None, None
+            self.refresh_all()
+            self.update_paint_status()
+
     def on_drag(self, event):
+        if self.stroke is not None:
+            self.paint_to(event.x, event.y)
+            self.mouse = (event.x, event.y)
+            self.draw_brush()
+            return
         if self.drag is None:
             return
         x0, y0, ox, oy = self.drag
@@ -1175,6 +1723,7 @@ class CCFBrowser:
             return
         self.request_render()
         self.refresh_info_slice()
+        self.refresh_overall()
         self.scrollbar.set(self.slice / self.n_slices, (self.slice + 1) / self.n_slices)
         self.slice_label.configure(text=f"{self.view_name} {self.slice + 1} / {self.n_slices}   "
                                         f"{AXIS_NAMES[self.axis]} {self.slice_um / 1000:.3f} mm")
@@ -1210,8 +1759,9 @@ class CCFBrowser:
             if len(shown):
                 layers.append((slot.points.coords[across][shown], slot.points.coords[down][shown],
                                slot.points.codes[shown], slot.styles))
+        overlay = view_slice(self.overlay, self.view_name, self.slice) if self.overlay_count > 0 else None
         frame = render_frame(view_slice(self.volume, self.view_name, self.slice), self.lut_view, self.mode_var.get(),
-                             self.view, (width, height), layers, int(self.dot_var.get() or 1))
+                             self.view, (width, height), layers, int(self.dot_var.get() or 1), overlay)
         self.photo = ImageTk.PhotoImage(Image.fromarray(frame))
         self.canvas.itemconfigure(self.image_item, image=self.photo)
         self.canvas.delete('label')
@@ -1263,6 +1813,7 @@ class CCFBrowser:
 
     def on_leave(self):
         self.mouse = None
+        self.canvas.delete('brush')
         self.info.set_sections(cursor_lines=[("(cursor outside the image)", 'dim')],
                                nearest_lines=[("", 'dim')])
 
@@ -1270,6 +1821,7 @@ class CCFBrowser:
         if self.volume is None:
             return
         self.mouse = (event.x, event.y)
+        self.draw_brush()
         u, v = self.cursor_image_coords()
         image_w, image_h = VIEW_IMAGE_SIZE[self.view_name]
         u_idx, v_idx = int(np.floor(u)), int(np.floor(v))
@@ -1322,8 +1874,9 @@ class CCFBrowser:
 
     # ---- lifecycle
     def close(self):
-        self.settings.update({'follow_info': bool(self.follow_var.get()), 'atlas_path': self.atlas_path,
-                              'alt_atlas_path': self.alt_atlas_path, 'view': self.view_name, 'slices': self.slices,
+        self.settings.update({'follow_info': bool(self.follow_var.get()), 'wheel_zoom': bool(self.wheel_zoom_var.get()), 'atlas_path': self.atlas_path,
+                              'alt_atlas_path': self.alt_atlas_path,
+                              'brush': int(self.brush_var.get() or 0), 'paint_value': self.paint_value_var.get().strip(), 'view': self.view_name, 'slices': self.slices,
                               'saturation': int(round(float(self.sat_var.get()))), 'slab': int(self.slab_var.get() or 0),
                               'dot': int(self.dot_var.get() or 1), 'mode': self.mode_var.get()})
         for slot in self.slots:
