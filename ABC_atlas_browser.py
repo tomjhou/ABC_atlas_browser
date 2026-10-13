@@ -13556,7 +13556,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     def mode_display_label(option):
         level_name = LEVEL_DISPLAY_NAMES[level_state['value']]
         if option == 'All Subclasses':
-            return f'All {level_name}s'
+            return f"All {level_name}{'es' if level_name.endswith('s') else 's'}"
         if option == 'Single Subclass':
             # 'es' for names ending in a sibilant ('Class', 'Subclass' ->
             # Classes/Subclasses, the standard English rule for words ending
@@ -15205,7 +15205,8 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         ax.set_yticks([])
         ax.set_xlabel('UMAP1', fontsize=SIDEBAR_FONTSIZE)
         ax.set_ylabel('UMAP2', fontsize=SIDEBAR_FONTSIZE)
-        ax.set_title(f'All {LEVEL_DISPLAY_NAMES[level].lower()}s', fontsize=SIDEBAR_FONTSIZE)
+        level_word = LEVEL_DISPLAY_NAMES[level].lower()
+        ax.set_title(f"All {level_word}{'es' if level_word.endswith('s') else 's'}", fontsize=SIDEBAR_FONTSIZE)
         current_view_name['token'] = f'all_{level}'
         n_categories = obs_col.nunique()  # categories actually present, not just declared
         n_colored = len(color_map)
