@@ -387,6 +387,7 @@ from matplotlib.path import Path as MplPath
 from matplotlib.offsetbox import AnchoredOffsetbox, DrawingArea, TextArea, VPacker
 
 from abc_atlas_access.abc_atlas_cache.abc_project_cache import AbcProjectCache
+from abc_atlas_access.abc_atlas_cache.cloud_cache import OutdatedManifestWarning
 
 
 
@@ -745,9 +746,62 @@ def choose_atlas_cache_location():
     return chosen
 
 
+def offer_atlas_release_update(cache):
+    """If a newer ABC atlas release exists online than the one this cache last
+    used, ask (dialog, or console if no GUI) whether to switch to it. Switching
+    is remembered by the library itself (_manifest_last_used.txt in the cache),
+    so later runs load the new release without asking. Declining isn't
+    remembered: the question comes back every startup until they switch."""
+    current = cache.current_manifest
+    latest = cache.latest_manifest_file
+    if not current or current == latest:
+        return
+
+    message = "\n".join([
+        "A newer ABC atlas release is available online:",
+        f"    in use:  {current}",
+        f"    newest:  {latest}",
+        "",
+        "Switching may re-download any data files that changed between releases",
+        "(already-downloaded files are kept), and results saved from the older",
+        "release may no longer match new runs.",
+        "",
+        "Switch to the newest release?",
+    ])
+    print("\n" + message + "\n")
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        switch = messagebox.askyesno("Newer ABC atlas release", message, parent=root)
+        root.destroy()
+    except Exception:
+        # No GUI available: fall back to the console.
+        try:
+            switch = input("Switch? [y/N] ").strip().lower() in ('y', 'yes')
+        except EOFError:
+            switch = False
+
+    if switch:
+        print(f"Switching ABC atlas release to {latest}.")
+        with warnings.catch_warnings():
+            # load_latest_manifest re-warns that files may need re-downloading,
+            # which the dialog above already said.
+            warnings.simplefilter('ignore', OutdatedManifestWarning)
+            cache.load_latest_manifest()
+    else:
+        print(f"Keeping ABC atlas release {current}.")
+
+
 download_base = choose_atlas_cache_location()
 if _has_internet_connection():
-    abc_cache = AbcProjectCache.from_cache_dir(download_base)
+    with warnings.catch_warnings():
+        # The library's own "a newer release exists" warning; offer_atlas_release_update asks instead.
+        warnings.simplefilter('ignore', OutdatedManifestWarning)
+        abc_cache = AbcProjectCache.from_cache_dir(download_base)
+    offer_atlas_release_update(abc_cache)
 else:
     print("No internet connection detected — using the local ABC atlas cache only "
           f"(skipping the S3 manifest check that would otherwise stall startup for minutes).")
