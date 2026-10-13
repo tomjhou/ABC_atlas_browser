@@ -11636,7 +11636,8 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         if ZOOM_DEBUG_DIAGNOSTICS:
             print(f"[zoom-settle] source={zoom_settle_source['ax']!r} "
                   f"umap_ratio={umap_zoom_ratio():.2f}x panel_ratio={section_zoom_ratio['value']:.2f}x")
-        if umap_settle and umap_zoom_ratio() <= ZOOM_BITMAP_ONLY_MAX_MULTIPLIER:
+        if (umap_settle and umap_zoom_ratio() <= ZOOM_BITMAP_ONLY_MAX_MULTIPLIER
+                and not zoom_home_cache_missing([ax])):
             # Below the threshold, stay on the zoom-preview bitmap already
             # on screen indefinitely rather than paying for a real, full-
             # resolution fig.canvas.draw() — see ZOOM_BITMAP_ONLY_MAX_
@@ -11707,7 +11708,8 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
                 print(f"[zoom-settle] umap>threshold (filtered real draw) in {time.perf_counter() - _settle_t0:.3f}s")
             return
         panel_settle = zoom_settle_source['ax'] == 'panel'
-        if panel_settle and section_zoom_ratio['value'] <= ZOOM_BITMAP_ONLY_MAX_MULTIPLIER:
+        if (panel_settle and section_zoom_ratio['value'] <= ZOOM_BITMAP_ONLY_MAX_MULTIPLIER
+                and not zoom_home_cache_missing([panel['ax'] for panel in section_panels.values()])):
             # Mirror image of the UMAP skip branch above — same reasoning,
             # same guarantees (blit_bg re-cached, active_zoom_previews
             # actually cleared rather than left "stuck", so hover etc.
@@ -11775,6 +11777,13 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         if ZOOM_DEBUG_DIAGNOSTICS:
             print(f"[zoom-settle] FALLBACK (neither umap_settle nor panel_settle matched) — "
                   f"about to do a full fig.canvas.draw()")
+        # Reached at or below the bitmap-only threshold only when a home bitmap is missing (see
+        # zoom_home_cache_missing): that real draw, from the complete data rather than any leftover
+        # viewport-filtered subset, is what re-takes it once the axes is back at home.
+        if umap_settle and umap_zoom_ratio() <= ZOOM_BITMAP_ONLY_MAX_MULTIPLIER:
+            restore_full_main_scatter()
+        if panel_settle and section_zoom_ratio['value'] <= ZOOM_BITMAP_ONLY_MAX_MULTIPLIER:
+            restore_full_section_scatters()
         blit_bg['data'] = fig.canvas.copy_from_bbox(fig.bbox)
         # Shown *before* any of the (comparatively cheap) cleanup below,
         # so it's on screen as early as possible ahead of the genuinely
@@ -12192,6 +12201,10 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             fig.draw_artist(group_highlight_state['artist'])
         if umap_highlight_state['artist'] is not None and umap_highlight_state['artist'].get_visible():
             fig.draw_artist(umap_highlight_state['artist'])
+        legend_underline = multi_gene_state['underline']
+        if legend_underline is not None and legend_underline.get_visible():
+            fig.draw_artist(legend_underline)
+        fig.draw_artist(hover_status_bg)
         fig.draw_artist(hover_status_text)
         for panel in section_panels.values():
             if panel['dim_veil'].get_visible():
@@ -12216,6 +12229,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         fig.draw_artist(query_label)
         fig.draw_artist(gene_dropdown_ax)
         fig.draw_artist(level_dropdown_ax)
+        fig.draw_artist(status_bg)
         fig.draw_artist(status_text)
         fig.draw_artist(working_text)
         # color_by_label/level_label ("Color by:"/"Level:") aren't touched
@@ -12323,6 +12337,53 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             return
         snapshot, extent = captured
         home_view_cache[target_ax] = {'buf': snapshot, 'extent': extent}
+
+    def prerender_umap_home_view():
+        """Takes the UMAP's cached home-extent bitmap right now, even though the UMAP is zoomed in:
+        draws it off-screen at its home limits (and home-view dot size), copies the pixels into
+        home_view_cache, then puts the zoomed limits back. Normally that bitmap is only re-taken by a
+        real draw while the axes sits at home, so after a recolor while zoomed in, a later zoom-out
+        had nothing to build its preview from and fell back to a full-figure redraw (several seconds).
+        Nothing here reaches the screen: fig.draw_artist only paints the renderer's buffer, and the
+        caller's next real draw repaints the zoomed view over it."""
+        home = pannable_axes.get(ax)
+        if home is None or ax in home_view_cache or active_zoom_previews:
+            return
+        if not any(len(f['offsets']) > 0 for f in main_scatter_state['full']):
+            return
+        saved_x, saved_y = ax.get_xlim(), ax.get_ylim()
+        if (np.allclose(sorted(saved_x), sorted(home['home_xlim']))
+                and np.allclose(sorted(saved_y), sorted(home['home_ylim']))):
+            return  # already at home: the next real draw captures it the usual way
+        try:
+            ax.set_xlim(home['home_xlim'])
+            ax.set_ylim(home['home_ylim'])
+            update_umap_dot_size()  # dot size follows the zoom; the home bitmap needs the home-view size
+            fig.draw_artist(ax)
+            captured = snapshot_axes_region(ax)
+            if captured is not None:
+                home_view_cache[ax] = {'buf': captured[0], 'extent': captured[1]}
+        finally:
+            ax.set_xlim(saved_x)
+            ax.set_ylim(saved_y)
+            update_umap_dot_size()
+
+    def zoom_home_cache_missing(axes_list):
+        """True if any of these axes has content but no cached home-extent bitmap. Anything that
+        recolors an axes drops its bitmap (invalidate_home_view_cache) and only a real draw while that
+        axes sits at home re-takes it; recolor while zoomed in and there is none, so a later zoom-out
+        preview has nothing to put around the old snapshot and shows black. "Has content" is judged
+        from the stored point sets, not axes_has_plotted_content: at settle time the zoom preview has
+        every real artist hidden, so that check would always say there is nothing."""
+        panel_of_ax = {panel['ax']: panel for panel in section_panels.values()}
+
+        def has_content(a):
+            if a is ax:
+                return any(len(f['offsets']) > 0 for f in main_scatter_state['full'])
+            panel = panel_of_ax.get(a)
+            return panel is not None and panel['full_offsets'] is not None and len(panel['full_offsets']) > 0
+
+        return any(a not in home_view_cache and has_content(a) for a in axes_list)
 
     def invalidate_home_view_cache(target_ax=None):
         """Drops the cached home-extent bitmap for `target_ax` (or every
@@ -12993,6 +13054,15 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     # Animated — updated via blit_hover_overlays() on nearly every hover
     # settle instead of a full draw_idle(); see blit_bg's own comment above.
     hover_status_text.set_animated(True)
+    # Painted over the line's whole strip, in the panel's own colour, just before the text itself
+    # (see draw_animated_overlays). Several zoom-settle paths re-cache blit_bg straight from the
+    # live canvas buffer, which by then already has the last-stamped status text on it, so that
+    # text got baked into the "clean" background: the default "Hover over any cell..." message then
+    # stayed visible underneath every hover message drawn over it. An opaque backing makes whatever
+    # was baked there irrelevant. Same colour as status_panel_ax's facecolor, so it is invisible.
+    hover_status_bg = Rectangle((0, 0), 1, 1, transform=hover_status_ax.transAxes, facecolor='#eeeeee',
+                                edgecolor='none', clip_on=False, animated=True)
+    hover_status_ax.add_patch(hover_status_bg)
 
     status_ax = fig.add_axes([
         GRID_LEFT + 0.005, panel_bottom, UMAP_RIGHT - GRID_LEFT - 0.01, panel_height * STATUS_PANEL_LINE_FRAC,
@@ -13009,6 +13079,9 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     # this text just rides along for free either way, same as hover_status_
     # text already does.
     status_text.set_animated(True)
+    status_bg = Rectangle((0, 0), 1, 1, transform=status_ax.transAxes, facecolor='#eeeeee',
+                          edgecolor='none', clip_on=False, animated=True)  # see hover_status_bg above
+    status_ax.add_patch(status_bg)
 
     LEVEL_DISPLAY_NAMES = {'class': 'Class', 'subclass': 'Subclass', 'supertype': 'Supertype',
                            'cluster': 'Cluster', LEIDEN_KEY: 'Leiden'}
@@ -13772,7 +13845,16 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     # function every other redraw_* already calls first, so switching to
     # any other mode correctly clears it without needing its own explicit
     # reset too.
-    multi_gene_state = {'active': False, 'genes': []}
+    # 'hidden': indices (into 'genes') of genes switched off by clicking their legend entry — see
+    # on_multi_gene_legend_click; 'hidden_for' is the (genes, imputed) those indices belong to, so a
+    # different query starts with everything shown. 'legend_rows' is the legend's clickable geometry
+    # (top_y, row_height, n_rows) in cbar_ax coordinates; 'cache' holds the last query's resolved
+    # expression so a toggle only recolors instead of re-reading every gene.
+    # 'legend_labels'/'underline'/'hover_row': the legend's gene-name texts, the animated underline
+    # drawn under the hovered one, and which row that is (see on_multi_gene_legend_hover).
+    multi_gene_state = {'active': False, 'genes': [], 'hidden': set(), 'hidden_for': None,
+                        'legend_rows': None, 'cache': None,
+                        'legend_labels': [], 'underline': None, 'hover_row': None, 'keep_view': None}
 
     def set_section_panel_facecolor(color):
         """Sets every section panel's own axes background — panels are
@@ -13811,6 +13893,10 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # Same reasoning, for render_export_figure's own multi-gene branch —
         # only redraw_multi_genes sets this back to active.
         multi_gene_state['active'] = False
+        multi_gene_state['legend_rows'] = None  # nothing clickable once the legend is gone
+        multi_gene_state['legend_labels'] = []
+        multi_gene_state['underline'] = None
+        multi_gene_state['hover_row'] = None
         # And for the section panels' own background color — only redraw_
         # multi_genes sets this to MULTI_GENE_UMAP_FACECOLOR instead, so
         # leaving multi-gene mode for any other redraw_* correctly restores
@@ -13906,8 +13992,10 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     # swatch/label matches the actual (brighter) blue multi_gene_rgb uses
     # on screen.
     MULTI_GENE_CHANNEL_COLORS = ('red', 'green', MULTI_GENE_BRIGHT_BLUE, 'red', 'green', MULTI_GENE_BRIGHT_BLUE)
+    # The same channels by name, for titles/status text/legends (the colour above is an RGB tuple for blue).
+    MULTI_GENE_CHANNEL_NAMES = ('red', 'green', 'blue', 'red', 'green', 'blue')
 
-    def draw_multi_gene_legend(genes, vmins, vmaxes):
+    def draw_multi_gene_legend(genes, vmins, vmaxes, hidden=()):
         """The multi-gene mode's own legend, into the same cbar_ax slot a
         real colorbar or draw_id_legend's swatches use — there's no single
         colorbar to show here (color is a function of 2 or 3 values, not
@@ -13937,15 +14025,33 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         top_y = 0.5 + n * row_h / 2  # centers the n-row block in the strip
         plus_shape = GENE456_SHAPE_REGISTRY.get(
             viewer_settings['gene456_shape'], GENE456_SHAPE_REGISTRY[GENE456_SHAPE_DEFAULT])
+        # Each row is clickable (on_multi_gene_legend_click): a hidden gene's swatch is an empty grey
+        # outline and its label grey, so the legend itself shows what is switched off.
+        multi_gene_state['legend_rows'] = (top_y, row_h, n)
+        multi_gene_state['legend_labels'] = []
+        multi_gene_state['hover_row'] = None
         for i, (gene, color, vmin, vmax) in enumerate(zip(genes, MULTI_GENE_CHANNEL_COLORS, vmins, vmaxes)):
             y = top_y - (i + 0.5) * row_h
             swatch_marker = 'o' if i < 3 else plus_shape['marker']
             swatch_scale = 1.0 if i < 3 else plus_shape['size_multiplier'] ** 2
-            cbar_ax.scatter([SWATCH_X], [y], s=legend_fontsize * 4 * swatch_scale, marker=swatch_marker, c=color,
-                             linewidths=0, clip_on=False)
-            cbar_ax.text(TEXT_X, y, gene, fontsize=legend_fontsize, va='center', ha='left', color=color)
-            cbar_ax.text(TEXT_X, y - row_h * 0.42, f'log2: {vmin:.1f}–{vmax:.1f}',
+            is_hidden = i in hidden
+            if is_hidden:
+                cbar_ax.scatter([SWATCH_X], [y], s=legend_fontsize * 4 * swatch_scale, marker=swatch_marker,
+                                 facecolors='none', edgecolors='0.55', linewidths=1.0, clip_on=False)
+            else:
+                cbar_ax.scatter([SWATCH_X], [y], s=legend_fontsize * 4 * swatch_scale, marker=swatch_marker,
+                                 color=color,  # not c=: blue's 3-value RGB tuple trips matplotlib's "c looks like a single RGB sequence" warning
+                                 linewidths=0, clip_on=False)
+            multi_gene_state['legend_labels'].append(
+                cbar_ax.text(TEXT_X, y, gene, fontsize=legend_fontsize, va='center', ha='left',
+                             color='0.55' if is_hidden else color))
+            cbar_ax.text(TEXT_X, y - row_h * 0.42, 'hidden' if is_hidden else f'log2: {vmin:.1f}–{vmax:.1f}',
                          fontsize=legend_fontsize * 0.75, va='center', ha='left', color='0.4')
+        cbar_ax.text(0.5, top_y - n * row_h - 0.5 * row_h, 'click a gene\nto hide/show it',
+                     fontsize=legend_fontsize * 0.7, va='center', ha='center', style='italic', color='0.5')
+        # Animated (drawn by draw_animated_overlays, like the hover rings) so hovering only needs a blit.
+        multi_gene_state['underline'] = cbar_ax.plot([0, 0], [0, 0], lw=1.2, animated=True, visible=False,
+                                                     scalex=False, scaley=False, clip_on=False)[0]
 
     # Set by redraw_all_subclasses to the row count its own 'All <level>s'
     # legend was actually built with, or None whenever no such legend is
@@ -14996,13 +15102,27 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # / (norm, vmin, vmax); unzipped into parallel lists (one entry per
         # gene) below, since set_section_colors_multi_gene and multi_gene_
         # rgb both want the whole set at once, not one gene at a time.
-        per_gene = [resolve_gene_expression(gene_source, c, imputed) for c in gene_cols]
+        # A legend click re-enters here with the same genes; the resolved/normalized expression is
+        # reused then, so toggling a gene only repaints (no re-reading of every gene's counts).
+        cache_key = (tuple(resolved), bool(imputed))
+        cached = multi_gene_state['cache']
+        if cached is not None and cached['key'] == cache_key:
+            per_gene, normalized = cached['per_gene'], cached['normalized']
+        else:
+            per_gene = [resolve_gene_expression(gene_source, c, imputed) for c in gene_cols]
+            normalized = [normalize_expression(g[0]) for g in per_gene]
+            multi_gene_state['cache'] = {'key': cache_key, 'per_gene': per_gene, 'normalized': normalized}
+        if multi_gene_state['hidden_for'] != cache_key:  # a different query: everything shown again
+            multi_gene_state['hidden'] = set()
+            multi_gene_state['hidden_for'] = cache_key
+        hidden = multi_gene_state['hidden']
         bg_sources = [g[1] for g in per_gene]
         bg_cols = [g[2] for g in per_gene]
         bg_layers = [g[3] for g in per_gene]
         bg_transforms = [g[4] for g in per_gene]
-        normalized = [normalize_expression(g[0]) for g in per_gene]
-        norms = [n[0] for n in normalized]
+        # A hidden gene contributes nothing (all-zero expression), exactly as if it were not expressed
+        # anywhere; the legend range below still reports its real vmin/vmax.
+        norms = [np.zeros(len(n[0])) if i in hidden else n[0] for i, n in enumerate(normalized)]
         vmins = [n[1] for n in normalized]
         vmaxes = [n[2] for n in normalized]
 
@@ -15014,6 +15134,9 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         recreate_group_highlight()
         ax.set_aspect('equal', adjustable='box')
         ax.set_facecolor(MULTI_GENE_UMAP_FACECOLOR)
+        # (A legend toggle re-enters here; keep_view is the zoom it was at, restored below.)
+        keep_view = multi_gene_state['keep_view']
+        multi_gene_state['keep_view'] = None
         # Same not-quite-black background as the UMAP, on every section
         # panel too — clear_colorbar() (already run above) just reset them
         # to the normal SECTION_PANEL_FACECOLOR (pure black); overridden
@@ -15022,8 +15145,8 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # visibly a cell instead of disappearing into an identically-black
         # background.
         set_section_panel_facecolor(MULTI_GENE_UMAP_FACECOLOR)
-        ax.set_xlim(pannable_axes[ax]['home_xlim'])
-        ax.set_ylim(pannable_axes[ax]['home_ylim'])
+        ax.set_xlim(pannable_axes[ax]['home_xlim'] if keep_view is None else keep_view[0])
+        ax.set_ylim(pannable_axes[ax]['home_ylim'] if keep_view is None else keep_view[1])
         ax.set_xticks([])
         ax.set_yticks([])
         ax.set_xlabel('UMAP1', fontsize=SIDEBAR_FONTSIZE)
@@ -15073,8 +15196,12 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             main_size_multipliers.append(plus_shape['size_multiplier'] ** 2)
 
         set_main_scatter_artists(main_artists, size_multipliers=main_size_multipliers)
+        # Cells outside the ROI take their values from the background lookup, not from `norms`, so a
+        # hidden gene has to be zeroed there too: an equal vmin/vmax makes that lookup's normalization
+        # return all zeros (those cells still count as found, so they stay black, not grey).
+        section_vmaxes = [vmins[i] if i in hidden else v for i, v in enumerate(vmaxes[:3])]
         set_section_colors_multi_gene(
-            norms[:3], MULTI_GENE_LOW_EXPRESSION_COLOR, vmins[:3], vmaxes[:3],
+            norms[:3], MULTI_GENE_LOW_EXPRESSION_COLOR, vmins[:3], section_vmaxes,
             full_sources=bg_sources[:3], full_gene_cols=bg_cols[:3],
             full_layers=bg_layers[:3], full_transforms=bg_transforms[:3],
         )
@@ -15090,7 +15217,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # min-max scaling is invariant to this positive linear factor, so
         # the actual on-screen colors are unaffected either way.
         to_log2 = 1.0 if imputed else np.log2(np.e)
-        draw_multi_gene_legend(resolved, [v * to_log2 for v in vmins], [v * to_log2 for v in vmaxes])
+        draw_multi_gene_legend(resolved, [v * to_log2 for v in vmins], [v * to_log2 for v in vmaxes], hidden)
         # Set *after* clear_colorbar (already run above) reset it to
         # inactive — this is what tells render_export_figure (Save UMAP)
         # to rebuild its own copy from this scatter's actual facecolors
@@ -15098,13 +15225,14 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # of which apply to a multi-gene view.
         multi_gene_state['active'] = True
         multi_gene_state['genes'] = resolved
-        channel_names = MULTI_GENE_CHANNEL_COLORS[:len(resolved)]
+        channel_names = MULTI_GENE_CHANNEL_NAMES[:len(resolved)]
         title_parts = ' / '.join(f'{g} ({c})' for g, c in zip(resolved, channel_names))
         ax.set_title(f"{title_parts}{' [imputed]' if imputed else ''}", fontsize=SIDEBAR_FONTSIZE)
         current_view_name['token'] = f"{'_'.join(resolved)}{'_imputed' if imputed else ''}"
         status_and_channels = ' and '.join(f"'{g}' ({c})" for g, c in zip(resolved, channel_names))
         status_text.set_text(
             f"Showing {status_and_channels}{' [imputed]' if imputed else ' (raw counts, log1p)'}."
+            + (f" Hidden: {', '.join(resolved[i] for i in sorted(hidden))}." if hidden else "")
         )
         fig.canvas.draw_idle()
         hide_working_indicator()
@@ -15130,6 +15258,60 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             redraw_gene(query, imputed=False)
         else:
             redraw_gene(query, imputed=True)
+
+    def on_multi_gene_legend_click(event):
+        """Left click on a gene's row in the multi-gene legend: hide that gene (its channel goes dark
+        on the UMAP and the section panels) or show it again."""
+        if event.button != 1 or event.inaxes is not cbar_ax or not multi_gene_state['active']:
+            return
+        rows = multi_gene_state['legend_rows']
+        if rows is None or event.ydata is None:
+            return
+        top_y, row_h, n_rows = rows
+        index = int((top_y - event.ydata) // row_h)
+        if not 0 <= index < n_rows:
+            return
+        multi_gene_state['hidden'].symmetric_difference_update({index})
+        multi_gene_state['keep_view'] = (ax.get_xlim(), ax.get_ylim())  # stay at the current zoom
+        redraw()
+        multi_gene_state['keep_view'] = None
+        prerender_umap_home_view()  # so a later zoom-out needn't redraw the whole figure
+
+    fig.canvas.mpl_connect('button_press_event', on_multi_gene_legend_click)
+
+    def set_multi_gene_legend_hover(row):
+        """Underlines the gene name in legend row `row` (None: no underline) and shows a hand cursor
+        over it, so it reads as clickable. Only repaints when the hovered row actually changes."""
+        if row == multi_gene_state['hover_row']:
+            return
+        multi_gene_state['hover_row'] = row
+        underline = multi_gene_state['underline']
+        if underline is not None:
+            if row is None:
+                underline.set_visible(False)
+            else:
+                label = multi_gene_state['legend_labels'][row]
+                box = label.get_window_extent(renderer=fig.canvas.get_renderer())
+                (x0, y0), (x1, _y1) = cbar_ax.transAxes.inverted().transform([(box.x0, box.y0), (box.x1, box.y1)])
+                underline.set_data([x0, x1], [y0 - 0.006, y0 - 0.006])
+                underline.set_color(label.get_color())
+                underline.set_visible(True)
+        fig.canvas.set_cursor(Cursors.POINTER if row is None else Cursors.HAND)
+        blit_hover_overlays()
+
+    def on_multi_gene_legend_hover(event):
+        row = None
+        rows = multi_gene_state['legend_rows']
+        if (multi_gene_state['active'] and rows is not None and event.inaxes is cbar_ax
+                and event.ydata is not None):
+            top_y, row_h, n_rows = rows
+            index = int((top_y - event.ydata) // row_h)
+            if 0 <= index < n_rows:
+                row = index
+        set_multi_gene_legend_hover(row)
+
+    fig.canvas.mpl_connect('motion_notify_event', on_multi_gene_legend_hover)
+    fig.canvas.mpl_connect('figure_leave_event', lambda event: set_multi_gene_legend_hover(None))
 
     umap_variants_in_memory = {umap_params_key(current_umap_params): (np.array(coords), cell_leiden)}
 
@@ -15488,8 +15670,10 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             # standard way to hand it markers/colors with no actual plotted
             # artist to point to) fills the equivalent role here.
             legend_handles = [
-                Line2D([0], [0], marker='o', linestyle='', color=color, label=f'{gene} ({color})')
-                for gene, color in zip(multi_gene_state['genes'], MULTI_GENE_CHANNEL_COLORS)
+                Line2D([0], [0], marker='o', linestyle='', color=color, label=f'{gene} ({name})')
+                for i, (gene, color, name) in enumerate(zip(multi_gene_state['genes'], MULTI_GENE_CHANNEL_COLORS,
+                                                            MULTI_GENE_CHANNEL_NAMES))
+                if i not in multi_gene_state['hidden']  # a gene switched off in the viewer isn't in the picture
             ]
             export_fig.legend(handles=legend_handles, loc='center left', bbox_to_anchor=(1.02, 0.5),
                                bbox_transform=export_ax.transAxes, fontsize=EXPORT_FONTSIZE, frameon=True)
