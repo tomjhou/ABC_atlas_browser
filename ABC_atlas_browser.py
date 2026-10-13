@@ -101,6 +101,7 @@ OPTIONAL_LIBRARIES = {
     'igraph': ('igraph', 'Leiden clustering of new UMAP runs'),
     'pyarrow': ('pyarrow', 'Parquet file support'),
     'plotly': ('plotly', 'the 3D view in the browser'),
+    'skimage': ('scikit-image', 'the translucent-surfaces background of the browser 3D view'),
 }
 # Install anything missing automatically (into the interpreter running this
 # script) instead of just listing the commands and quitting. Set False to get
@@ -1499,6 +1500,156 @@ THREED_WEB_MAX_POINTS = 300000  # the browser (WebGL) view copes with far more
 THREED_SHELL_POINTS = 60000   # whole-brain sample: its silhouette is the outline, a subset is the faint cloud
 THREED_CLOUD_POINTS = 25000
 THREED_BACKGROUND = '#12141a'
+# The browser view draws each cell as a small lit sphere (a real mesh, so overlapping cells shade and occlude one
+# another and read as 3D) rather than as a flat marker sprite, which merges into a flat patch where cells overlap.
+# Meshes cost file size and GPU time per cell, so the sphere detail steps down with the number of cells drawn and
+# gives way to outlined flat markers past THREED_WEB_SPHERE_MAX_POINTS.
+THREED_WEB_SPHERE_RADIUS_FRACTION = 0.003   # sphere radius as a fraction of the plotted data's longest span
+THREED_WEB_SMOOTH_SPHERE_MAX_POINTS = 6000  # up to this many cells: 42-vertex spheres (round when zoomed in)
+THREED_WEB_SPHERE_MAX_POINTS = 40000        # up to this many: 12-vertex spheres; beyond, outlined flat markers
+# Edges for the browser view: the Allen CCF annotation volume (every 25 um voxel labelled with its brain region, the same
+# parcellation_index the cells carry) gives the true brain surface, the ventricles and any region's boundary.
+CCF_VOLUME_DIRECTORY = 'Allen-CCF-2020'
+CCF_VOLUME_FILE_NAME = 'annotation_25'      # ~3.6 MB download; 528 x 320 x 456 voxels, axes (AP, DV, ML) as x/y/z_ccf
+CCF_VOLUME_VOXEL_MM = 0.025
+CCF_VENTRICLE_DIVISIONS = ('VL', 'V3', 'V4', 'AQ', 'c')   # lateral, third, fourth ventricle, aqueduct, central canal
+CCF_EDGES_CACHE_VERSION = 1
+THREED_EDGE_SLICE_MM = 0.5            # contour spacing (every direction) for the brain and ventricle line edges
+THREED_EDGE_REGION_SLICE_MM = 0.25    # ... and for a cells' region, which is usually much smaller
+THREED_EDGE_REGION_MAX = 4            # at most this many regions (the ones holding most of the shown cells) get edges
+THREED_EDGE_REGION_MIN_SHARE = 0.05   # ... and only those holding at least this share of them
+THREED_EDGE_BRAIN_COLOR = '#c9d1e0'
+THREED_EDGE_VENTRICLE_COLOR = '#5aa9ff'
+THREED_EDGE_REGION_COLORS = ('#ffd166', '#06d6a0', '#ef8354', '#bb86fc')
+
+# Plotly paints translucent geometry in data order, not by depth: with the opacity slider below 100% a far sphere can
+# land on top of a near one (and a sphere's far side shows through its near side), depending on the viewing direction.
+# All the cells therefore share ONE mesh (so one draw order covers every group), and this page script keeps that
+# mesh's triangles sorted back-to-front along the camera's view direction (painter's algorithm) whenever the camera or
+# the opacity changes. It also owns group visibility: a legend click hides a group by dropping its triangles, since
+# the groups no longer have a trace each (the legend entries are empty stand-in traces). The sort is by view
+# direction, not true perspective distance, which is plenty for ordering overlapping cells.
+THREED_WEB_MESH_SCRIPT = """
+(function () {
+  var gd = document.getElementById('{plot_id}');
+  var meshIndex = __MESH_INDEX__, legendIndices = __LEGEND_INDICES__, vertexStarts = __VERTEX_STARTS__;
+  // _fullData, not data: plotly keeps the packed (base64) input in data and the decoded typed arrays in _fullData.
+  var full = gd._fullData[meshIndex];
+  var o = {x: full.x, y: full.y, z: full.z, i: Int32Array.from(full.i), j: Int32Array.from(full.j),
+           k: Int32Array.from(full.k)};
+  var vertexCount = o.x.length, faceCount = o.i.length;
+  var vertexGroup = new Uint8Array(vertexCount);
+  vertexStarts.forEach(function (start, group) { for (var v = start; v < vertexCount; v++) vertexGroup[v] = group; });
+  var hidden = legendIndices.map(function () { return false; });
+  var busy = false, timer = null;
+  function rebuild() {
+    var scene = gd._fullLayout.scene || {};
+    var camera = scene.camera || {eye: {x: 1.25, y: 1.25, z: 1.25}, center: {x: 0, y: 0, z: 0}};
+    var flipZ = gd.layout.scene && gd.layout.scene.zaxis && gd.layout.scene.zaxis.autorange === 'reversed' ? -1 : 1;
+    var ex = camera.eye.x - camera.center.x, ey = camera.eye.y - camera.center.y,
+        ez = (camera.eye.z - camera.center.z) * flipZ;
+    var translucent = gd._fullData[meshIndex].opacity < 1;
+    var keep = [];
+    for (var f = 0; f < faceCount; f++) if (!hidden[vertexGroup[o.i[f]]]) keep.push(f);
+    if (translucent) {
+      var depth = new Float64Array(vertexCount);
+      for (var v = 0; v < vertexCount; v++) depth[v] = o.x[v] * ex + o.y[v] * ey + o.z[v] * ez;
+      var key = new Float64Array(faceCount);
+      for (var n = 0; n < keep.length; n++) { var g = keep[n]; key[g] = depth[o.i[g]] + depth[o.j[g]] + depth[o.k[g]]; }
+      var order = Uint32Array.from(keep);
+      order.sort(function (a, b) { return key[a] - key[b]; });  // far (small) first, near drawn last
+      keep = order;
+    }
+    var ni = new Int32Array(keep.length), nj = new Int32Array(keep.length), nk = new Int32Array(keep.length);
+    for (var m = 0; m < keep.length; m++) { var src = keep[m]; ni[m] = o.i[src]; nj[m] = o.j[src]; nk[m] = o.k[src]; }
+    busy = true;
+    Plotly.restyle(gd, {i: [ni], j: [nj], k: [nk]}, [meshIndex]).then(function () { busy = false; }, function () { busy = false; });
+  }
+  function schedule() { clearTimeout(timer); timer = setTimeout(rebuild, 60); }
+  gd.on('plotly_relayout', function (e) {
+    if (busy || !e) return;
+    if (Object.keys(e).some(function (name) { return name.indexOf('scene.camera') === 0; })) schedule();
+  });
+  gd.on('plotly_restyle', function (e) {
+    if (busy || !e || !e[0]) return;
+    if ('opacity' in e[0] && (!e[1] || e[1].indexOf(meshIndex) >= 0)) schedule();
+  });
+  gd.on('plotly_legendclick', function (e) {
+    var group = legendIndices.indexOf(e.curveNumber);
+    if (group < 0) return true;  // outline / cloud entries keep the normal toggle
+    hidden[group] = !hidden[group];
+    Plotly.restyle(gd, {visible: hidden[group] ? 'legendonly' : true}, [e.curveNumber]);
+    schedule();
+    return false;
+  });
+  gd.on('plotly_legenddoubleclick', function () { return false; });  // isolate-on-double-click would bypass `hidden`
+})();
+"""
+
+
+# The "Background" radio group over the plot: Cloud (the faint whole-brain cloud plus the three wall outlines), Lines
+# (slice-contour edges of the brain, the ventricles and the cells' region) or Surfaces (translucent shells of the same).
+THREED_WEB_EDGE_SCRIPT = """
+(function () {
+  var gd = document.getElementById('{plot_id}');
+  var roles = __ROLES__;
+  var modes = [['cloud', 'Cloud'], ['lines', 'Lines']];
+  if (roles.surfaces.length) modes.push(['surfaces', 'Surfaces']);
+  var box = document.createElement('div');
+  box.style.cssText = 'position:absolute;left:14px;top:46px;z-index:20;padding:6px 10px;' +
+    'background:rgba(29,32,41,0.88);color:#e6e8ee;border:1px solid #3a3f4d;border-radius:6px;font:12px sans-serif;';
+  box.appendChild(document.createTextNode('Background: '));
+  function apply(mode) {
+    var show = {cloud: mode === 'cloud', walls: mode === 'cloud', lines: mode === 'lines', surfaces: mode === 'surfaces'};
+    Object.keys(roles).forEach(function (role) {
+      if (roles[role].length) Plotly.restyle(gd, {visible: show[role]}, roles[role]);
+    });
+  }
+  modes.forEach(function (mode, n) {
+    var label = document.createElement('label');
+    label.style.cssText = 'margin-right:10px;cursor:pointer;';
+    var radio = document.createElement('input');
+    radio.type = 'radio'; radio.name = 'background-mode'; radio.checked = mode[0] === '__DEFAULT__';
+    radio.addEventListener('change', function () { apply(mode[0]); });
+    label.appendChild(radio);
+    label.appendChild(document.createTextNode(' ' + mode[1]));
+    box.appendChild(label);
+  });
+  gd.style.position = 'relative';
+  gd.appendChild(box);
+})();
+"""
+
+
+# TEMPORARY (remove once the brain shell's base opacity, 0.10 in write_3d_group_html's edge_sets, is settled): a 0-100%
+# slider for that base opacity, to find a good value by eye. It composes with the Background opacity slider (shell
+# opacity = this base x that slider's factor). To remove: delete this constant and the scripts.append(...) that uses it.
+THREED_WEB_SHELL_TEST_SCRIPT = """
+(function () {
+  var gd = document.getElementById('{plot_id}');
+  var index = __BRAIN_INDEX__, base = __BASE__, factor = 1;
+  var box = document.createElement('div');
+  box.style.cssText = 'position:absolute;left:14px;top:86px;z-index:20;padding:6px 10px;' +
+    'background:rgba(29,32,41,0.88);color:#e6e8ee;border:1px solid #3a3f4d;border-radius:6px;font:12px sans-serif;';
+  var text = document.createElement('div');
+  var input = document.createElement('input');
+  input.type = 'range'; input.min = 0; input.max = 100; input.step = 1; input.value = Math.round(base * 100);
+  input.style.width = '170px';
+  box.appendChild(text); box.appendChild(input);
+  function apply() {
+    text.textContent = 'Brain shell base opacity (temporary): ' + Math.round(base * 100) + '%';
+    Plotly.restyle(gd, {opacity: base * factor}, [index]);
+  }
+  input.addEventListener('input', function () { base = input.value / 100; apply(); });
+  gd.on('plotly_sliderchange', function (e) {
+    var prefix = e && e.slider && e.slider.currentvalue ? e.slider.currentvalue.prefix : '';
+    if (prefix.indexOf('Background') === 0) { factor = parseFloat(e.step.label) / 100; setTimeout(apply, 80); }
+  });
+  text.textContent = 'Brain shell base opacity (temporary): ' + Math.round(base * 100) + '%';
+  gd.style.position = 'relative';
+  gd.appendChild(box);
+})();
+"""
 
 
 def metadata_file_status(abc_cache, directory, file_name):
@@ -1656,6 +1807,179 @@ def brain_outline_segments(shell_xyz, bins=80):
     return outlines
 
 
+def read_nifti_volume(path):
+    """The voxel array of a (gzipped) NIfTI-1 file as [i, j, k] (the file's own axis order), without needing
+    nibabel: this only has to cope with the few plain integer/float volumes the atlas ships."""
+    import gzip
+    import struct
+    with gzip.open(path, 'rb') as handle:
+        raw = handle.read()
+    header = raw[:348]
+    dims = struct.unpack('<8h', header[40:56])
+    shape = tuple(dims[1:1 + dims[0]])
+    code, = struct.unpack('<h', header[70:72])
+    dtypes = {2: '<u1', 4: '<i2', 8: '<i4', 16: '<f4', 64: '<f8', 256: '<i1', 512: '<u2', 768: '<u4'}
+    if code not in dtypes:
+        raise ValueError(f"unsupported NIfTI data type {code}")
+    offset = int(struct.unpack('<f', header[108:112])[0])
+    count = int(np.prod(shape))
+    return np.frombuffer(raw, dtype=dtypes[code], offset=offset, count=count).reshape(shape[::-1]).T
+
+
+def coarse_smoothed_mask(mask, step, sigma):
+    """`mask` (bool, [i, j, k]) cropped to its own bounding box (so a small region costs little), reduced by `step`
+    per axis with any-voxel-set kept (so a thin ventricle survives the reduction), padded by one voxel so surfaces
+    close, then lightly blurred: (float32 array or None if the mask is empty, voxel_mm, origin_mm, pad), where
+    origin_mm is the (3,) position in mm of the first unpadded voxel's centre and voxel `n` of the array sits at
+    origin_mm + (n - pad) * voxel_mm on each axis."""
+    from scipy import ndimage
+    voxel_mm = step * CCF_VOLUME_VOXEL_MM
+    pad = 1
+    bounds = []
+    for axis in range(3):
+        others = tuple(a for a in range(3) if a != axis)
+        present = np.flatnonzero(mask.any(axis=others))
+        if not len(present):
+            return None, voxel_mm, np.zeros(3), pad
+        low = max(0, int(present[0]) - 2 * step) // step * step
+        high = min(mask.shape[axis], int(present[-1]) + 1 + 2 * step)
+        bounds.append((low, low + (high - low) // step * step))
+    cropped = mask[bounds[0][0]:bounds[0][1], bounds[1][0]:bounds[1][1], bounds[2][0]:bounds[2][1]].astype(np.uint8)
+    if step > 1:
+        n0, n1, n2 = (n // step for n in cropped.shape)
+        cropped = cropped.reshape(n0, step, n1, step, n2, step).max(axis=(1, 3, 5))
+    padded = np.pad(cropped, pad).astype(np.float32)
+    blurred = ndimage.gaussian_filter(padded, sigma) if sigma else padded
+    origin_mm = np.array([(low + (step - 1) / 2) * CCF_VOLUME_VOXEL_MM for low, _high in bounds])
+    return blurred, voxel_mm, origin_mm, pad
+
+
+def slice_contour_lines(mask, spacing_mm, step=2, sigma=0.7):
+    """Outline of a 3D label mask drawn as contour lines on slices every `spacing_mm` along all three axes: (x, y, z)
+    float32 arrays with NaN between separate lines, in the 3D view's own axis order (left-right = CCF z, anterior-
+    posterior = CCF x, dorsal-ventral = CCF y). Empty arrays if the mask is empty."""
+    import contourpy
+    empty = np.empty(0, dtype=np.float32)
+    blurred, voxel_mm, origin_mm, pad = coarse_smoothed_mask(mask, step, sigma)
+    if blurred is None:
+        return empty, empty, empty
+    coords = [np.arange(n) * voxel_mm + origin_mm[axis] - pad * voxel_mm for axis, n in enumerate(blurred.shape)]
+    stride = max(1, int(round(spacing_mm / voxel_mm)))
+    pieces = []
+    for axis in range(3):
+        other = [a for a in range(3) if a != axis]  # slice[b, c] with b < c
+        first = int(np.ceil(origin_mm[axis] / spacing_mm - 1e-9))  # slices sit on multiples of spacing_mm in CCF mm
+        for position in np.arange(first, 1e9, 1.0):
+            mm = position * spacing_mm
+            index = int(round((mm - coords[axis][0]) / voxel_mm))
+            if index >= blurred.shape[axis]:
+                break
+            if index < 0:
+                continue
+            plane = np.take(blurred, index, axis=axis)
+            if plane.max() < 0.5:
+                continue
+            generator = contourpy.contour_generator(x=coords[other[1]], y=coords[other[0]], z=plane)
+            for line in generator.lines(0.5):
+                points = np.empty((len(line), 3), dtype=np.float32)
+                points[:, axis] = coords[axis][index]
+                points[:, other[0]] = line[:, 1]
+                points[:, other[1]] = line[:, 0]
+                pieces.append(points)
+                pieces.append(np.full((1, 3), np.nan, dtype=np.float32))
+    if not pieces:
+        return empty, empty, empty
+    stacked = np.vstack(pieces)
+    return stacked[:, 2], stacked[:, 0], stacked[:, 1]  # (ML, AP, DV) = (z_ccf, x_ccf, y_ccf)
+
+
+def surface_mesh(mask, step, sigma=1.0):
+    """The surface of a 3D label mask as (vertices (n, 3) float32 in the 3D view's axis order, faces (m, 3) int32),
+    by marching cubes at `step` times the volume's own voxel size; None if the mask is empty or scikit-image is
+    not installed."""
+    try:
+        from skimage import measure
+    except ImportError:
+        return None
+    blurred, voxel_mm, origin_mm, pad = coarse_smoothed_mask(mask, step, sigma)
+    if blurred is None or blurred.max() < 0.5:
+        return None
+    vertices, faces, _normals, _values = measure.marching_cubes(blurred, level=0.5, spacing=(voxel_mm,) * 3)
+    vertices = vertices - pad * voxel_mm + origin_mm
+    return vertices[:, [2, 0, 1]].astype(np.float32), faces.astype(np.int32)  # (ML, AP, DV); a cyclic swap keeps winding
+
+
+def region_edge_geometry(volume, labels, slice_mm, line_step, surface_step):
+    """{'lines': (x, y, z), 'surface': (vertices, faces) or None} for the voxels of `volume` whose label is in `labels`."""
+    labels = np.asarray(list(labels), dtype=np.int64)
+    lookup = np.zeros(int(volume.max()) + 1, dtype=bool)  # a table lookup, far faster than np.isin over ~77 M voxels
+    lookup[labels[(labels >= 0) & (labels < len(lookup))]] = True
+    mask = lookup[volume]
+    return {'lines': slice_contour_lines(mask, slice_mm, step=line_step),
+            'surface': surface_mesh(mask, surface_step)}
+
+
+def choose_cell_regions(structures):
+    """The CCF structure names holding most of the shown cells, biggest first: at most THREED_EDGE_REGION_MAX of them,
+    each with at least THREED_EDGE_REGION_MIN_SHARE of the cells (but always the biggest one)."""
+    names = pd.Series(structures).dropna().astype(str)
+    names = names[~names.isin(['unassigned', 'brain-unassigned', 'fiber tracts-unassigned', '?'])]
+    if names.empty:
+        return []
+    counts = names.value_counts()
+    keep = [name for name, count in counts.items() if count / len(names) >= THREED_EDGE_REGION_MIN_SHARE]
+    return (keep or [counts.index[0]])[:THREED_EDGE_REGION_MAX]
+
+
+def ccf_edges_missing(region_names, want_surfaces=True):
+    """(store, missing_keys): the edges cache's contents and which of 'brain', 'ventricles' and ('region', name) it
+    still lacks (or has only without surfaces, back when scikit-image was not installed). Nothing is computed."""
+    cache_path = CACHE_DIR / f"ccf_edges_v{CCF_EDGES_CACHE_VERSION}.pkl"
+    store = {}
+    if cache_path.exists():
+        try:
+            store = pd.read_pickle(cache_path)
+        except Exception as e:
+            print(f"CCF edges cache unreadable ({e}); recomputing.")
+    try:
+        import skimage  # noqa: F401
+        have_skimage = True
+    except ImportError:
+        have_skimage = False
+    wanted = ['brain', 'ventricles'] + [('region', name) for name in region_names]
+    missing = [key for key in wanted
+               if store.get(key) is None or (want_surfaces and have_skimage and not store[key]['has_skimage'])]
+    return store, missing, have_skimage
+
+
+def load_ccf_edges(abc_cache, parcel_names, region_names, want_surfaces=True):
+    """Edge geometry for the browser 3D view, from the cache file where already computed (the volume itself is only
+    read, and downloaded if need be, when something is missing). Returns {'brain': g, 'ventricles': g, 'regions':
+    {name: g}} with each g as in region_edge_geometry; a region name with no voxels is left out. Blocking and slow
+    the first time (about half a minute): call it from a worker thread."""
+    store, missing, have_skimage = ccf_edges_missing(region_names, want_surfaces)
+    if missing:
+        path = abc_cache.get_data_path(directory=CCF_VOLUME_DIRECTORY, file_name=CCF_VOLUME_FILE_NAME)
+        volume = read_nifti_volume(path)
+        for key in missing:
+            if key == 'brain':
+                geometry = region_edge_geometry(volume, np.arange(1, int(volume.max()) + 1), THREED_EDGE_SLICE_MM, 2, 4)
+            elif key == 'ventricles':
+                labels = parcel_names.index[parcel_names['division'].isin(CCF_VENTRICLE_DIVISIONS)]
+                geometry = region_edge_geometry(volume, labels, THREED_EDGE_SLICE_MM, 1, 2)
+            else:
+                labels = parcel_names.index[parcel_names['structure'] == key[1]]
+                geometry = region_edge_geometry(volume, labels, THREED_EDGE_REGION_SLICE_MM, 1, 2)
+            geometry['has_skimage'] = have_skimage
+            store[key] = geometry
+        try:
+            pd.to_pickle(store, CACHE_DIR / f"ccf_edges_v{CCF_EDGES_CACHE_VERSION}.pkl")
+        except Exception as e:
+            print(f"Could not save the CCF edges cache ({e}).")
+    return {'brain': store['brain'], 'ventricles': store['ventricles'],
+            'regions': {name: store[('region', name)] for name in region_names if len(store[('region', name)]['lines'][0])}}
+
+
 def fair_keep_counts(sizes, budget):
     """How many points each group may keep so the total stays within `budget`: small groups keep everything, and
     only the groups bigger than their share are thinned (a 500-cell group is not cut because another has 200k)."""
@@ -1665,6 +1989,44 @@ def fair_keep_counts(sizes, budget):
         keep[index] = min(sizes[index], int(remaining_budget / (len(order) - position)))
         remaining_budget -= keep[index]
     return keep
+
+
+def unit_sphere_mesh(subdivisions):
+    """(vertices, faces) of a unit sphere built by subdividing an icosahedron: 12 vertices / 20 faces for 0
+    subdivisions, 42 / 80 for 1. Vertices are float32 (n, 3); faces int32 (m, 3), wound outward."""
+    t = (1 + 5 ** 0.5) / 2
+    vertices = [(-1, t, 0), (1, t, 0), (-1, -t, 0), (1, -t, 0), (0, -1, t), (0, 1, t),
+                (0, -1, -t), (0, 1, -t), (t, 0, -1), (t, 0, 1), (-t, 0, -1), (-t, 0, 1)]
+    faces = [(0, 11, 5), (0, 5, 1), (0, 1, 7), (0, 7, 10), (0, 10, 11), (1, 5, 9), (5, 11, 4), (11, 10, 2),
+             (10, 7, 6), (7, 1, 8), (3, 9, 4), (3, 4, 2), (3, 2, 6), (3, 6, 8), (3, 8, 9), (4, 9, 5),
+             (2, 4, 11), (6, 2, 10), (8, 6, 7), (9, 8, 1)]
+    vertices = [np.asarray(v, dtype=float) / np.linalg.norm(v) for v in vertices]
+    for _ in range(subdivisions):
+        midpoints, refined = {}, []
+
+        def midpoint(a, b):
+            key = (min(a, b), max(a, b))
+            if key not in midpoints:
+                m = vertices[a] + vertices[b]
+                vertices.append(m / np.linalg.norm(m))
+                midpoints[key] = len(vertices) - 1
+            return midpoints[key]
+
+        for a, b, c in faces:
+            ab, bc, ca = midpoint(a, b), midpoint(b, c), midpoint(c, a)
+            refined += [(a, ab, ca), (b, bc, ab), (c, ca, bc), (ab, bc, ca)]
+        faces = refined
+    return np.asarray(vertices, dtype=np.float32), np.asarray(faces, dtype=np.int32)
+
+
+def sphere_mesh_at(centers, radius, unit_vertices, unit_faces):
+    """One mesh holding a sphere of `radius` at each row of `centers` (n, 3): (x, y, z, i, j, k) for plotly's Mesh3d."""
+    centers = np.asarray(centers, dtype=np.float32)
+    per_sphere = len(unit_vertices)
+    vertices = (centers[:, None, :] + unit_vertices[None, :, :] * np.float32(radius)).reshape(-1, 3)
+    offsets = (np.arange(len(centers), dtype=np.int32) * per_sphere)[:, None, None]
+    faces = (unit_faces[None, :, :] + offsets).reshape(-1, 3)
+    return vertices[:, 0], vertices[:, 1], vertices[:, 2], faces[:, 0], faces[:, 1], faces[:, 2]
 
 
 def open_3d_group_view(groups, shell_xyz, outline, axis_labels, title, invert_z=True, max_points=THREED_MAX_POINTS):
@@ -1813,7 +2175,7 @@ def open_3d_group_view(groups, shell_xyz, outline, axis_labels, title, invert_z=
 
 
 def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, invert_z=True,
-                        max_points=THREED_WEB_MAX_POINTS):
+                        max_points=THREED_WEB_MAX_POINTS, edges=None):
     """The same view as open_3d_group_view as one self-contained interactive HTML file (plotly, WebGL), written to
     `path`: true depth handling, smooth with hundreds of thousands of points, hover text per cell where a group
     gives 'hover' strings, and the legend toggles each group. Raises ImportError if plotly is not installed."""
@@ -1830,6 +2192,16 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
     keep = fair_keep_counts([len(points) for points, _h in cleaned], max_points)
 
     figure = go.Figure()
+    # The page opens on Surfaces when there are shells (scikit-image was available), else Lines, else the cloud.
+    default_mode = 'cloud'
+    if edges:
+        geometries = [edges['brain'], edges['ventricles'], *edges['regions'].values()]
+        if any(g['surface'] is not None for g in geometries):
+            default_mode = 'surfaces'
+        elif any(len(g['lines'][0]) for g in geometries):
+            default_mode = 'lines'
+    roles = {'cloud': [], 'walls': [], 'lines': [], 'surfaces': []}  # trace indices the Background radio group switches
+    background_base = {}  # background trace index -> its own opacity at 100% on the Background opacity slider
     if outline:
         xs, ys, zs = [], [], []
         low_high = np.asarray(shell_xyz) if shell_xyz is not None and len(shell_xyz) else np.vstack([p for p, _h in cleaned])
@@ -1847,14 +2219,67 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
                 xs += list(cx) + [None]
                 ys += list(cy) + [None]
                 zs += list(cz) + [None]
+        roles['walls'].append(len(figure.data))
+        background_base[len(figure.data)] = 1.0
         figure.add_trace(go.Scatter3d(x=xs, y=ys, z=zs, mode='lines', line=dict(color='#8a93a6', width=2),
-                                      name='brain outline', hoverinfo='skip'))
+                                      name='brain outline', hoverinfo='skip', visible=default_mode == 'cloud'))
     if shell_xyz is not None and len(shell_xyz):
         cloud = np.asarray(shell_xyz)[:THREED_CLOUD_POINTS * 2]
+        roles['cloud'].append(len(figure.data))
+        background_base[len(figure.data)] = 1.0
         figure.add_trace(go.Scatter3d(
             x=np.round(cloud[:, 0], 3), y=np.round(cloud[:, 1], 3), z=np.round(cloud[:, 2], 3), mode='markers',
-            marker=dict(size=1.2, color='#aeb4c0', opacity=0.12), name='whole brain (cloud)', hoverinfo='skip'))
+            marker=dict(size=1.2, color='#aeb4c0', opacity=0.12), name='whole brain (cloud)', hoverinfo='skip',
+            visible=default_mode == 'cloud'))
+    if edges:
+        # Added before the cells (so a translucent shell is drawn first), hidden until the radio group picks them.
+        def break_at_nan(values):  # plotly breaks a line at None, not NaN
+            return [None if np.isnan(v) else float(v) for v in np.round(np.asarray(values, dtype=float), 3)]
+
+        edge_sets = [('brain', THREED_EDGE_BRAIN_COLOR, 0.10, edges['brain']),
+                     ('ventricles', THREED_EDGE_VENTRICLE_COLOR, 0.35, edges['ventricles'])]
+        for region_index, (name, geometry) in enumerate(edges['regions'].items()):
+            edge_sets.append((name, THREED_EDGE_REGION_COLORS[region_index % len(THREED_EDGE_REGION_COLORS)], 0.30,
+                              geometry))
+        for name, color, shell_opacity, geometry in edge_sets:
+            xs, ys, zs = geometry['lines']
+            if len(xs):
+                line_opacity = 0.5 if name == 'brain' else 1.0  # the dense brain mesh is drawn faded
+                roles['lines'].append(len(figure.data))
+                background_base[len(figure.data)] = line_opacity
+                figure.add_trace(go.Scatter3d(
+                    x=break_at_nan(xs), y=break_at_nan(ys), z=break_at_nan(zs), mode='lines',
+                    line=dict(color=color, width=2), opacity=line_opacity,
+                    name=f"{name} edges", visible=default_mode == 'lines', hoverinfo='skip'))
+        for name, color, shell_opacity, geometry in edge_sets:
+            if geometry['surface'] is not None:
+                vertices, faces = geometry['surface']
+                roles['surfaces'].append(len(figure.data))
+                background_base[len(figure.data)] = shell_opacity
+                figure.add_trace(go.Mesh3d(
+                    x=vertices[:, 0], y=vertices[:, 1], z=vertices[:, 2], i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+                    color=color, opacity=shell_opacity, flatshading=False,
+                    lighting=dict(ambient=0.6, diffuse=0.7, specular=0.1, roughness=0.8),
+                    name=f"{name} surface", showlegend=True, visible=default_mode == 'surfaces',
+                    hoverinfo='skip'))
+    planned = sum(keep.values())
+    # Hover text on a mesh is per vertex, so it is repeated for every vertex of every sphere: with it, smoother
+    # (more-vertex) spheres would multiply the file size, so they are only used when no group carries hover text.
+    has_hover = any(hover is not None for _p, hover in cleaned)
+    if planned <= THREED_WEB_SMOOTH_SPHERE_MAX_POINTS and not has_hover:
+        sphere_subdivisions = 1
+    elif planned <= THREED_WEB_SPHERE_MAX_POINTS:
+        sphere_subdivisions = 0
+    else:
+        sphere_subdivisions = None  # too many for a mesh each: outlined flat markers instead
+    if sphere_subdivisions is not None:
+        unit_vertices, unit_faces = unit_sphere_mesh(sphere_subdivisions)
+        everything = np.vstack(([np.asarray(shell_xyz)] if shell_xyz is not None and len(shell_xyz) else [])
+                               + [points for points, _h in cleaned if len(points)])
+        sphere_radius = float(np.ptp(everything, axis=0).max()) * THREED_WEB_SPHERE_RADIUS_FRACTION
     shown = 0
+    group_traces = []  # indices of the cells' own traces: what the opacity slider adjusts (not outline or cloud)
+    mesh_groups = []   # (label, color, points, hover text) per group, for the single combined sphere mesh
     for index, (group, (points, hover)) in enumerate(zip(groups, cleaned)):
         if keep[index] < len(points):
             chosen = rng.choice(len(points), size=max(1, keep[index]), replace=False)
@@ -1866,18 +2291,91 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
             color = to_hex(group['color'])
         except Exception:
             color = 'red'
+        if sphere_subdivisions is not None:
+            mesh_groups.append((group['label'], color, points, text))
+            continue
+        group_traces.append(len(figure.data))
         figure.add_trace(go.Scatter3d(
             x=np.round(points[:, 0], 3), y=np.round(points[:, 1], 3), z=np.round(points[:, 2], 3), mode='markers',
-            marker=dict(size=2.6, color=color, opacity=0.85), name=group['label'],
+            marker=dict(size=2.6, color=color, opacity=1.0, line=dict(color=THREED_BACKGROUND, width=1)),
+            name=group['label'],
             text=None if text is None else list(text), hoverinfo='name+text' if text is not None else 'name'))
+    post_script = None
+    if mesh_groups:
+        # One mesh for every group (see THREED_WEB_MESH_SCRIPT for why); a group's colour rides on a per-vertex
+        # intensity through a stepped colour scale, so the spheres stay flat-coloured and lit.
+        pieces, vertex_starts, vertex_total = [], [], 0
+        for group_index, (label, color, points, text) in enumerate(mesh_groups):
+            xs, ys, zs, face_i, face_j, face_k = sphere_mesh_at(points, sphere_radius, unit_vertices, unit_faces)
+            vertex_starts.append(vertex_total)
+            if text is not None:
+                hover_text = np.char.add(label + '<br>', np.asarray(text, dtype=str)).astype(object)
+            else:
+                hover_text = np.full(len(points), label, dtype=object)
+            pieces.append((xs, ys, zs, face_i + vertex_total, face_j + vertex_total, face_k + vertex_total,
+                           np.full(len(xs), group_index, dtype=np.int8),
+                           np.repeat(hover_text, len(unit_vertices))))
+            vertex_total += len(xs)
+        n_groups = len(mesh_groups)
+        colorscale = []
+        for group_index, (_label, color, _points, _text) in enumerate(mesh_groups):
+            colorscale += [[group_index / n_groups, color], [(group_index + 1) / n_groups, color]]
+        mesh_index = len(figure.data)
+        figure.add_trace(go.Mesh3d(
+            x=np.concatenate([p[0] for p in pieces]), y=np.concatenate([p[1] for p in pieces]),
+            z=np.concatenate([p[2] for p in pieces]), i=np.concatenate([p[3] for p in pieces]),
+            j=np.concatenate([p[4] for p in pieces]), k=np.concatenate([p[5] for p in pieces]),
+            intensity=np.concatenate([p[6] for p in pieces]), intensitymode='vertex', colorscale=colorscale,
+            cmin=-0.5, cmax=n_groups - 0.5, showscale=False, opacity=1.0, flatshading=False,
+            lighting=dict(ambient=0.45, diffuse=0.9, specular=0.35, roughness=0.5, fresnel=0.15),
+            name='cells', showlegend=False, text=list(np.concatenate([p[7] for p in pieces])), hoverinfo='text'))
+        group_traces.append(mesh_index)
+        legend_indices = []
+        for label, color, _points, _text in mesh_groups:  # empty stand-in traces: the legend entries the script drives
+            legend_indices.append(len(figure.data))
+            figure.add_trace(go.Scatter3d(x=[None], y=[None], z=[None], mode='markers', name=label,
+                                          marker=dict(size=8, color=color), hoverinfo='skip', showlegend=True))
+        post_script = (THREED_WEB_MESH_SCRIPT.replace('__MESH_INDEX__', str(mesh_index))
+                       .replace('__LEGEND_INDICES__', json.dumps(legend_indices))
+                       .replace('__VERTEX_STARTS__', json.dumps(vertex_starts)))
     scene = dict(aspectmode='data', xaxis_title=axis_labels[0], yaxis_title=axis_labels[1], zaxis_title=axis_labels[2])
     if invert_z:
         scene['zaxis'] = dict(autorange='reversed', title=axis_labels[2])
+    # Both sliders hang from the bottom edge of the plot at fixed pixel sizes and offsets (not paper fractions, which
+    # stretch with the window height): a short track with few steps, the second one pushed down by one slider's height.
+    slider_values = (1.0, 0.8, 0.6, 0.4, 0.25, 0.1)
+    slider_style = dict(active=0, x=0.02, len=150, lenmode='pixels', y=0, yanchor='top',
+                        tickwidth=0, minorticklen=0,
+                        font=dict(size=1, color=THREED_BACKGROUND))  # step labels hidden: the title shows the value
+    opacity_steps = [dict(label=f"{value:.0%}", method='restyle', args=[{'opacity': value}, group_traces])
+                     for value in slider_values]
+    sliders = [dict(slider_style, steps=opacity_steps, pad=dict(t=8, b=0),
+                    currentvalue=dict(prefix='Cell opacity: ', font=dict(size=11, color='#e6e8ee')))]
+    if background_base:
+        # Above the cell slider: scales every background trace (cloud, wall outlines, edges, shells) from its own
+        # 100% look down to 10%, never to nothing, which is what the radio group's other modes are for.
+        indices = list(background_base)
+        background_steps = [
+            dict(label=f"{value:.0%}", method='restyle',
+                 args=[{'opacity': [round(value * background_base[i], 3) for i in indices]}, indices])
+            for value in slider_values]
+        sliders[0]['pad'] = dict(t=44, b=0)
+        sliders.insert(0, dict(slider_style, steps=background_steps, pad=dict(t=8, b=0),
+                               currentvalue=dict(prefix='Background opacity: ', font=dict(size=11, color='#e6e8ee'))))
     figure.update_layout(
-        template='plotly_dark', scene=scene, margin=dict(l=0, r=0, t=50, b=0),
+        sliders=sliders,
+        template='plotly_dark', scene=scene, margin=dict(l=0, r=0, t=50, b=92 if background_base else 50),
         title=title if shown >= total else f"{title}  (showing {shown:,} of {total:,} cells)",
         legend=dict(itemsizing='constant'))
-    figure.write_html(str(path), include_plotlyjs=True, full_html=True, config={'displaylogo': False})
+    scripts = [post_script] if post_script else []
+    if roles['lines'] or roles['surfaces']:
+        scripts.append(THREED_WEB_EDGE_SCRIPT.replace('__ROLES__', json.dumps(roles)).replace('__DEFAULT__', default_mode))
+    if edges and edges['brain']['surface'] is not None and roles['surfaces']:  # TEMPORARY: see THREED_WEB_SHELL_TEST_SCRIPT
+        brain_shell = roles['surfaces'][0]  # the brain's own surface is always the first one added
+        scripts.append(THREED_WEB_SHELL_TEST_SCRIPT.replace('__BRAIN_INDEX__', str(brain_shell))
+                       .replace('__BASE__', str(background_base[brain_shell])))
+    figure.write_html(str(path), include_plotlyjs=True, full_html=True, config={'displaylogo': False},
+                      post_script='\n'.join(scripts) or None)
     return Path(path)
 
 
@@ -16926,7 +17424,9 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             groups.append({'label': f"{level_name} {target} ({len(rows):,})",
                            'color': last_id_selection['colors'].get(target, 'red'),
                            'xyz': rows[list(columns)].to_numpy(dtype=float), 'hover': hover})
+        structures = table['ccf_structure'].to_numpy() if have_ccf and 'ccf_structure' in table.columns else None
         return {'groups': groups, 'shell_xyz': shell_xyz, 'outline': outline, 'axis_labels': axis_labels,
+                'structures': structures,
                 'title': f"3D view: {level_name.lower()} {', '.join(str(t) for t in targets)} ({scope})",
                 'have_ccf': have_ccf, 'level': level, 'targets': targets}
 
@@ -16947,6 +17447,41 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         hide_working_indicator()
         blit_hover_overlays()
 
+    def prepare_3d_edges(prepared):
+        """The browser view's edge geometry (brain surface, ventricles, and the region(s) holding most of the shown
+        cells) from the CCF annotation volume, or None (the view then just has its cloud). Asks before the one-time
+        download of that volume; the first build takes about half a minute, and is cached after that."""
+        names = load_parcellation_names(abc_cache)
+        if names is None or prepared['structures'] is None:
+            return None
+        regions = choose_cell_regions(prepared['structures'])
+        _store, missing, have_skimage = ccf_edges_missing(regions)
+        if missing:
+            _path, size, present = metadata_file_status(abc_cache, CCF_VOLUME_DIRECTORY, CCF_VOLUME_FILE_NAME)
+            if present is not True:
+                parent = tk_widget.winfo_toplevel() if tk_widget is not None else None
+                try:
+                    from tkinter import messagebox
+                    size_text = f"{size / 1e6:.1f} MB" if size else "a small file"
+                    if not messagebox.askyesno(
+                            "Download the CCF annotation volume?",
+                            f"The brain edges need the Allen CCF annotation volume, a one-time download of {size_text} "
+                            f"into your atlas cache folder. Download it now?", parent=parent):
+                        return None
+                except Exception as e:
+                    print(f"Could not ask about the CCF volume download ({e}); no edges.")
+                    return None
+        unblock_input = block_viewer_input()  # the loading window pumps Tk events; keep the viewer still
+        try:
+            return run_with_loading_window(
+                "Building the brain edges (the first time takes about half a minute; they are cached after that).",
+                lambda: load_ccf_edges(abc_cache, names, regions, want_surfaces=have_skimage))
+        except Exception as e:
+            print(f"Could not build the brain edges ({e}); the view has its cloud only.")
+            return None
+        finally:
+            unblock_input()
+
     def show_3d_in_browser(event=None):
         try:
             import plotly  # noqa: F401
@@ -16963,9 +17498,10 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
                 path = unique_export_paths(
                     target_dir, f"3d_{prepared['level']}_{'-'.join(str(t) for t in prepared['targets'])}",
                     ('.html',))['.html']
+                edges = prepare_3d_edges(prepared) if prepared['have_ccf'] else None
                 show_working_indicator('Writing the 3D page…')
                 write_3d_group_html(prepared['groups'], prepared['shell_xyz'], prepared['outline'],
-                                    prepared['axis_labels'], prepared['title'], path)
+                                    prepared['axis_labels'], prepared['title'], path, edges=edges)
                 open_with_default_viewer(path)
                 status_text.set_text(f"Opened {path.name} in your browser (saved in {target_dir}).")
         except Exception as e:
