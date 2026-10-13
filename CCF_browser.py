@@ -798,6 +798,8 @@ class CCFBrowser:
         self.overlay = None            # bool volume of the red painted voxels, made on first use
         self.overlay_count = 0
         self.edit_count = 0            # voxels changed by Apply since the atlas was loaded
+        self.edit_version = 0          # counts every Apply and undone Apply, to tell whether the volume was saved
+        self.saved_version = 0
         self.undo_stack = []           # ('stroke', flat voxel indices, drawn?) / ('apply', flat indices, old values)
         self.tool = 'none'             # 'draw', 'erase' or 'none' (drag pans)
         self.stroke = None             # flat voxel indices changed by the stroke in progress
@@ -1207,11 +1209,14 @@ class CCFBrowser:
         if values.dtype != np.uint32 and values.max() > 65535:
             values = values.astype(np.uint32)
 
+        version = self.edit_version
+
         def done(result, error):
             if error is not None:
                 messagebox.showerror("Save volume", f"Could not save the volume:\n{error}", parent=parent)
                 self.paint_status.set("Save failed.")
                 return
+            self.saved_version = version
             self.paint_status.set(f"Saved {path.name}")
             self.message.configure(text=f"Saved {path}")
         self.run_in_thread(f"Saving {path.name}…", lambda: write_volume(path, values, self.set_progress), done)
@@ -1249,6 +1254,7 @@ class CCFBrowser:
         self.undo_stack.append(('apply', flat, old))
         self.overlay_count = 0
         self.edit_count += len(flat)
+        self.edit_version += 1
         self.value_cache = None
         self.apply_saturation()
         self.refresh_all()
@@ -1269,6 +1275,7 @@ class CCFBrowser:
             overlay[flat] = True
             self.overlay_count += len(flat)
             self.edit_count -= len(flat)
+            self.edit_version += 1
             self.value_cache = None
         self.refresh_all()
         self.update_paint_status()
@@ -1345,7 +1352,7 @@ class CCFBrowser:
             if self.busy_label:
                 self.settings_status.set("Busy loading; try again when it finishes.")
                 return
-            if (self.edit_count or self.overlay_count) and not messagebox.askyesno(
+            if (self.edit_version != self.saved_version or self.overlay_count) and not messagebox.askyesno(
                     "Painted changes", "Switching atlas discards the painted overlay and the applied edits "
                     "(they are not saved anywhere). Continue?", parent=window):
                 return
@@ -1431,6 +1438,7 @@ class CCFBrowser:
         self.label_ids = (self.region_table['region_id'].to_numpy()
                           if self.region_table is not None and 'region_id' in self.region_table else None)
         self.overlay, self.overlay_count, self.edit_count, self.undo_stack = None, 0, 0, []
+        self.edit_version = self.saved_version = 0
         self.value_cache, self.stroke = None, None
         self.set_tool('none')
         self.settings_status.set("Atlas loaded: " + (Path(self.atlas_path).name if self.atlas_path else "default CCF"))
@@ -1874,6 +1882,11 @@ class CCFBrowser:
 
     # ---- lifecycle
     def close(self):
+        if self.edit_version != self.saved_version and not messagebox.askyesno(
+                "Unsaved changes", f"The volume has {self.edit_count:,} edited voxels that have not been saved "
+                "(Paint panel > Save volume).{0}{0}Close without saving?".format(chr(10)), icon='warning', default='no',
+                parent=self.root):
+            return
         self.settings.update({'follow_info': bool(self.follow_var.get()), 'wheel_zoom': bool(self.wheel_zoom_var.get()), 'atlas_path': self.atlas_path,
                               'alt_atlas_path': self.alt_atlas_path,
                               'brush': int(self.brush_var.get() or 0), 'paint_value': self.paint_value_var.get().strip(), 'view': self.view_name, 'slices': self.slices,
