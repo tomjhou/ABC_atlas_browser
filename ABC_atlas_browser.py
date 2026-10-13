@@ -5342,6 +5342,50 @@ def prompt_viewer_settings_dialog(parent_window, current_settings, umap_params=N
     return result['value']
 
 
+TAXONOMY_COLUMNS = ('class', 'subclass', 'supertype', 'cluster')
+
+
+def backfill_taxonomy_columns(adata, abc_cache, csv_path, processed_h5ad_path=None):
+    """For a saved run whose cells carry no class / subclass / supertype / cluster annotations (its pipeline's
+    metadata merge did not happen or failed, so neither umap_coords.csv nor the processed AnnData has them, and the
+    viewer reports "No 'subclass' column"): fills them in from the atlas's cell metadata, which the spatial cache
+    serves in about a second, and writes them back to the CSV and the processed .h5ad so it is a one-time repair.
+    Returns True if anything was added. Touches no GUI object, so it can run behind run_with_loading_window."""
+    missing = [c for c in TAXONOMY_COLUMNS if c not in adata.obs.columns]
+    if not missing:
+        return False
+    print(f"This saved run has no {', '.join(missing)} annotations; adding them from the atlas cell metadata.")
+    meta = load_section_spatial_coords(adata, abc_cache)  # aligned to adata.obs.index
+    if meta is None:
+        print("Could not read the atlas cell metadata; the viewer will lack those levels.")
+        return False
+    added = [c for c in missing if c in meta.columns]
+    if not added:
+        return False
+    for column in added:
+        adata.obs[column] = meta[column].to_numpy()
+    matched = int(meta[added[0]].notna().sum())
+    print(f"Added {', '.join(added)} for {matched} of {adata.n_obs} cells.")
+    try:
+        table = pd.read_csv(csv_path, index_col=0, converters={0: str})
+        for column in added:
+            table[column] = adata.obs[column].reindex(table.index).to_numpy()
+        front = [c for c in ('UMAP1', 'UMAP2') if c in table.columns]
+        table = table[front + [c for c in TAXONOMY_COLUMNS if c in table.columns]
+                      + [c for c in table.columns if c not in front and c not in TAXONOMY_COLUMNS]]
+        table.to_csv(csv_path)
+        print(f"Saved the annotations to {csv_path}.")
+    except Exception as e:
+        print(f"Warning: could not update {csv_path} with the annotations ({e}).")
+    try:
+        if processed_h5ad_path is not None and Path(processed_h5ad_path).exists():
+            adata.write_h5ad(processed_h5ad_path)
+            print(f"Saved the annotations to {processed_h5ad_path}.")
+    except Exception as e:
+        print(f"Warning: could not update {processed_h5ad_path} with the annotations ({e}).")
+    return True
+
+
 def offer_leiden_backfill(adata, csv_path, processed_h5ad_path=None):
     """For a cached run whose umap_coords.csv predates Leiden clustering:
     offer to compute it now and save it back, so the viewer's Leiden level
@@ -18219,6 +18263,13 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
             rois = []
             print(f"Warning: {roi_csv_path} not found; assuming this run covers the whole brain (no ROIs).")
 
+        # A run saved without its cell-type annotations (class/subclass/...) would show "No 'subclass' column" for
+        # every level: restore them from the atlas metadata, once, and save them back.
+        run_with_loading_window(
+            "Checking this saved run's cell-type annotations (adds any that are missing).",
+            lambda: backfill_taxonomy_columns(adata, abc_cache, Path(load_existing_folder) / 'umap_coords.csv',
+                                              processed_h5ad_path))
+
         # Runs computed before Leiden was added have no clustering saved —
         # offer to backfill it rather than silently showing the Leiden level
         # as unavailable. Declining is fine; nothing below depends on it.
@@ -18398,6 +18449,12 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
             log_status(f"Step 2: Could not load/merge cell type metadata ({e}); proceeding without it.")
             metadata_cols = []
             color_key = None
+            # Surfaced as a dialog too: the run otherwise carries on and is saved with no class/subclass/supertype/
+            # cluster columns, and the viewer later says "No 'subclass' column" with the cause long gone from view.
+            show_error_dialog("Cell-type annotations could not be attached",
+                              f"Merging the atlas cell-type metadata failed:\n\n{e}\n\nThe run continues without "
+                              "class/subclass/supertype/cluster. They are added automatically the next time this saved "
+                              "run is opened.")
 
     # ---------------------------------------------------------------------------
     # 3. Filter to the selected cell type, section(s), and ROIs (if any)
