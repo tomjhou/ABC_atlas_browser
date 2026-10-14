@@ -431,6 +431,25 @@ def load_custom_atlas(path):
     return volume, table, region_colors(volume, table)
 
 
+def read_section_values(path, axis, index):
+    """The region values (whole numbers, int64) of one plane of a .nrrd / .nii / .nii.gz annotation volume on the 25 um
+    grid: the plane `index` along `axis` of [AP, DV, ML], whatever the file's own axis order. Raises ValueError for a
+    file of the wrong size or one holding an intensity image."""
+    path = Path(path)
+    volume = read_nrrd_volume(path) if path.suffix.lower() == '.nrrd' else read_nifti_volume(path)
+    if sorted(volume.shape) != sorted(VOLUME_SHAPE):
+        raise ValueError(f"expected a {N_AP} x {N_DV} x {N_ML} volume (25 um), got {volume.shape}")
+    volume = np.transpose(volume, [volume.shape.index(n) for n in VOLUME_SHAPE])   # to [AP, DV, ML]
+    plane = np.array(np.take(volume, index, axis=axis))
+    if plane.dtype.kind == 'f':
+        if not np.array_equal(plane, np.round(plane)):
+            raise ValueError("this is an intensity image, not an annotation volume (region labels are whole numbers)")
+    plane = plane.astype(np.int64)
+    if plane.min() < 0:
+        raise ValueError("region labels cannot be negative")
+    return plane
+
+
 # ---- cells from a CSV ------------------------------------------------------------------------------------------
 COORDINATE_COLUMNS = {'ap_um', 'dv_um', 'ml_um', 'ccf_x_mm', 'ccf_y_mm', 'ccf_z_mm', 'section_x_mm', 'section_y_mm',
                       'section_z_mm', 'umap1', 'umap2'}
@@ -914,6 +933,7 @@ class CCFBrowser:
         self.paint_buttons = {}
         self.paint_value_var = tk.StringVar(value=self.settings.get('paint_value', ''))
         self.paint_warning = tk.StringVar()
+        self.filter_var = tk.StringVar()   # Paint panel's "Filter by": blank = off (deliberately not remembered)
         self.paint_status = tk.StringVar()
         # The paint dialog's brush radius counts from 1 (1 = just the voxel under the pointer); an older settings file
         # stored it from 0 under 'brush'.
@@ -926,6 +946,7 @@ class CCFBrowser:
         self.render_pending = False
         self.work = queue.Queue()
         self.busy_label, self.progress_text = '', ''
+        self.busy_overlay = ''         # "Loading CSV…" / "Loading Atlas…", drawn over the middle of the picture while it lasts
         self.autoload = []             # (slot, path) from the last session, loaded one after another
         self.build_ui()
         self.info = InfoWindow(self)
@@ -1000,6 +1021,7 @@ class CCFBrowser:
                         command=self.request_render).pack(side='left', padx=(8, 0))
         ttk.Button(controls, text="Info window", command=lambda: self.info.show()).pack(side='left', padx=(10, 0))
         ttk.Button(controls, text="Paint panel", command=self.open_paint).pack(side='left', padx=(4, 0))
+        ttk.Button(controls, text="Copy section from", command=self.restore_section).pack(side='left', padx=(4, 0))
         for variable in (self.slab_var, self.dot_var):
             variable.trace_add('write', lambda *a: self.refresh_all())
         self.message = ttk.Label(controls, text="", foreground='#7a3b00')
@@ -1042,6 +1064,18 @@ class CCFBrowser:
                 widget.dnd_bind('<<Drop>>', lambda e: self.on_drop(e, None))
 
     # ---- painting
+    def paint_filter_label(self):
+        """None when the Paint panel's filter is off (blank box); otherwise the label that painting is limited to, or -1
+        when the box holds something that matches no voxel (not a whole number, or a value the atlas does not have), so
+        that nothing at all gets painted rather than everything."""
+        text = self.filter_var.get().strip()
+        if not text:
+            return None
+        if not text.isdigit():
+            return -1
+        label = self.stored_label(int(text))
+        return -1 if label is None else label
+
     def paint_to(self, x, y):
         """Draw or erase the brush disk (and the stretch since the last mouse position) on the overlay."""
         scale, ox, oy = self.view
@@ -1064,6 +1098,9 @@ class CCFBrowser:
         plane = plane_view(self.overlay, self.view_name, self.slice)
         target = self.tool == 'draw'
         changed = plane[vs, us] != target
+        wanted = self.paint_filter_label() if target else None   # erasing is never filtered
+        if wanted is not None:   # "Filter by": only voxels that currently hold that region's value are drawn on
+            changed &= plane_view(self.volume, self.view_name, self.slice)[vs, us] == wanted
         us, vs = us[changed], vs[changed]
         if not len(us):
             return
@@ -1108,6 +1145,9 @@ class CCFBrowser:
         if self.overlay is None:
             self.overlay = np.zeros(VOLUME_SHAPE, dtype=bool)
         region = self.volume == label
+        wanted = self.paint_filter_label() if add else None
+        if wanted is not None and wanted != label:   # the Paint panel's filter limits what may be drawn
+            region = np.zeros_like(region)
         changed = np.flatnonzero((region & ~self.overlay if add else region & self.overlay).reshape(-1))
         if not len(changed):
             self.paint_status.set("Nothing to " + ("add: the region is already all in the drawing."
@@ -1255,6 +1295,18 @@ class CCFBrowser:
                     name = self.region_name(value)
                     warning = (f"Value {value} is already in use ({name + ', ' if name else ''}{count:,} voxels): "
                                f"applying will merge the overlay into it.")
+        filter_text = self.filter_var.get().strip()
+        if filter_text:
+            if not filter_text.isdigit():
+                warning += ("\n" if warning else "") + "Filter by: enter a whole number, or leave it blank. Nothing can be drawn."
+            else:
+                filter_label = self.stored_label(int(filter_text))
+                counts = self.value_counts()
+                in_use = filter_label is not None and filter_label < len(counts) and counts[filter_label] > 0
+                name = self.region_name(int(filter_text))
+                warning += ("\n" if warning else "") + (
+                    f"Filter on: only voxels with value {filter_text}{' (' + name + ')' if name else ''} can be painted."
+                    if in_use else f"Filter by {filter_text}: no voxel has that value, so nothing can be drawn.")
         self.paint_warning.set(warning)
         self.paint_status.set(f"Overlay: {self.overlay_count:,} voxels   Undo steps: {len(self.undo_stack)}")
 
@@ -1294,6 +1346,13 @@ class CCFBrowser:
         if not self.paint_value_var.get().strip():   # first time: suggest the lowest unused value, else keep the last
             self.paint_value_var.set(str(lowest_unused(self.used_values())))
         self.paint_value_var.trace_add('write', lambda *a: self.update_paint_status())
+        ttk.Label(grid, text="Filter by (pixel value)").grid(row=2, column=0, sticky='w', pady=(6, 0))
+        ttk.Entry(grid, textvariable=self.filter_var, width=14).grid(row=2, column=1, padx=(8, 0), pady=(6, 0),
+                                                                     sticky='w')
+        ttk.Label(grid, foreground='#555555', text="blank = off; a number limits painting to voxels that "
+                                                   "currently have that value").grid(row=3, column=0, columnspan=2,
+                                                                                    sticky='w', pady=(2, 0))
+        self.filter_var.trace_add('write', lambda *a: self.update_paint_status())
         ttk.Label(body, textvariable=self.paint_warning, foreground='#b00020', wraplength=320,
                   justify='left').pack(anchor='w', pady=(6, 0))
         ttk.Label(body, textvariable=self.paint_status, foreground='#555555').pack(anchor='w', pady=(6, 0))
@@ -1383,24 +1442,99 @@ class CCFBrowser:
             self.paint_status.set(str(e))
             return
         flat = np.flatnonzero(self.overlay.reshape(-1))
+        wanted = self.paint_filter_label()
+        left_over = 0
+        if wanted is not None:   # filter set after drawing: only matching voxels are painted, the rest stay red
+            matching = self.volume.reshape(-1)[flat] == wanted
+            left_over = int((~matching).sum())
+            flat = flat[matching]
+            if not len(flat):
+                self.paint_status.set("Nothing was applied: none of the red voxels matches the filter.")
+                return
         old = self.volume.reshape(-1)[flat].copy()
         self.volume.reshape(-1)[flat] = label
         self.overlay.reshape(-1)[flat] = False
         self.undo_stack.append(('apply', flat, old))
-        self.overlay_count = 0
+        self.overlay_count = left_over
         self.edit_count += len(flat)
         self.edit_version += 1
         self.value_cache = None
         self.apply_saturation()
         self.refresh_all()
         self.update_paint_status()
-        self.paint_status.set(f"Applied value {value} to {len(flat):,} voxels.")
+        self.paint_status.set(f"Applied value {value} to {len(flat):,} voxels."
+                              + (f" {left_over:,} red voxels outside the filter were left." if left_over else ""))
+
+    def restore_section(self):
+        """Reset the section on screen, and nothing else, to the same section of another annotation volume (.nrrd, .nii
+        or .nii.gz on the same grid), whose pixel values are taken as region values like those typed in the Paint
+        panel. One undo step; the red drawing is left alone."""
+        if self.volume is None:
+            return
+        if self.busy_label:
+            self.message.configure(text="Still busy; try again when it finishes.")
+            return
+        start = self.settings.get('restore_dir')
+        chosen = filedialog.askopenfilename(
+            title=f"Copy {self.view_name} section {self.slice + 1} from which volume?", parent=self.root,
+            initialdir=start if start and Path(start).is_dir() else None,
+            filetypes=[("Annotation volumes", "*.nrrd *.nii *.nii.gz"), ("All files", "*.*")])
+        if not chosen:
+            return
+        self.settings['restore_dir'] = str(Path(chosen).parent)
+        path, axis, index, view = Path(chosen), self.axis, self.slice, self.view_name
+
+        def done(result, error):
+            if error is not None:
+                messagebox.showerror("Copy section from", f"Could not copy the section:\n{error}", parent=self.root)
+                return
+            self.apply_restored_section(result, axis, index, view, path)
+        self.run_in_thread(f"Reading {path.name}…", lambda: read_section_values(path, axis, index), done)
+
+    def apply_restored_section(self, values, axis, index, view, path):
+        unique, inverse = np.unique(values, return_inverse=True)
+        try:
+            labels = np.array([self.ensure_label(int(v)) for v in unique], dtype=np.uint16)
+        except ValueError as e:
+            messagebox.showerror("Copy section from", str(e), parent=self.root)
+            return
+        new_plane = labels[inverse.reshape(values.shape)]
+        selector = [slice(None)] * 3
+        selector[axis] = index
+        current = self.volume[tuple(selector)]
+        rows, cols = np.nonzero(new_plane != current)
+        if not len(rows):
+            self.message.configure(text=f"The {view} section {index + 1} already matches {path.name}.")
+            return
+        coords, free = [None] * 3, [a for a in range(3) if a != axis]
+        coords[axis] = np.full(len(rows), index)
+        coords[free[0]], coords[free[1]] = rows, cols
+        flat = np.ravel_multi_index(tuple(coords), VOLUME_SHAPE)
+        old = self.volume.reshape(-1)[flat].copy()
+        self.volume.reshape(-1)[flat] = new_plane[rows, cols]
+        self.undo_stack.append(('restore', flat, old))
+        self.edit_count += len(flat)
+        self.edit_version += 1
+        self.value_cache = None
+        self.apply_saturation()
+        self.refresh_all()
+        self.update_paint_status()
+        self.message.configure(text=f"Copied {len(flat):,} voxels of the {view} section {index + 1} from "
+                                    f"{path.name} (Undo is in the Paint panel).")
 
     def undo(self):
         if not self.undo_stack:
             self.paint_status.set("Nothing to undo.")
             return
         kind, flat, data = self.undo_stack.pop()
+        if kind == 'restore':   # a restored section: put the old labels back, leaving the red drawing as it is
+            self.volume.reshape(-1)[flat] = data
+            self.edit_count -= len(flat)
+            self.edit_version += 1
+            self.value_cache = None
+            self.refresh_all()
+            self.update_paint_status()
+            return
         overlay = self.overlay.reshape(-1)
         if kind == 'stroke':
             overlay[flat] = not data
@@ -1457,6 +1591,7 @@ class CCFBrowser:
         row.pack(fill='x', padx=(20, 0))
         entry = ttk.Entry(row, textvariable=path_var, width=60)
         entry.pack(side='left', fill='x', expand=True)
+        entry.bind('<Return>', lambda e: close_settings())   # Enter in the path box is OK
 
         def browse():
             current = path_var.get().strip().strip('"')
@@ -1469,6 +1604,28 @@ class CCFBrowser:
                 path_var.set(chosen)
                 mode.set('custom')
         ttk.Button(row, text="Browse…", command=browse).pack(side='left', padx=(4, 0))
+
+        def open_folder():
+            """Show the chosen volume's folder in the system file browser (with the file selected, when it exists)."""
+            text = path_var.get().strip().strip('"')
+            if not text:
+                self.settings_status.set("No file chosen yet.")
+                return
+            current = Path(text)
+            folder = current if current.is_dir() else current.parent
+            if not folder.is_dir():
+                self.settings_status.set("That folder does not exist.")
+                return
+            try:
+                if sys.platform == 'win32':
+                    subprocess.Popen(['explorer', '/select,', str(current)] if current.is_file() else ['explorer', str(folder)])
+                elif sys.platform == 'darwin':
+                    subprocess.Popen(['open', str(folder)])
+                else:
+                    subprocess.Popen(['xdg-open', str(folder)])
+            except OSError as e:
+                self.settings_status.set(f"Could not open the folder: {e}")
+        ttk.Button(row, text="Open folder", command=open_folder).pack(side='left', padx=(4, 0))
         ttk.Label(box, foreground='#555555', justify='left', wraplength=520, text=(
             "Region names and colours come from an ontology*.csv in the same folder, if there is one (the Allen2017 "
             "folder has ontology_api_2017.csv). Label numbers differ between the 2017 and ABC atlases.")).pack(
@@ -1505,21 +1662,25 @@ class CCFBrowser:
         status = ttk.Label(body, textvariable=self.settings_status, foreground='#7a3b00')
         status.pack(anchor='w', pady=(8, 0))
 
+        def wanted_atlas():
+            return path_var.get().strip().strip('"') if mode.get() == 'custom' else ''
+
         def apply_atlas():
-            wanted = path_var.get().strip().strip('"') if mode.get() == 'custom' else ''
+            """Switch to the atlas the box asks for; True if the switch started (or was not needed)."""
+            wanted = wanted_atlas()
             if mode.get() == 'custom' and not Path(wanted).is_file():
                 self.settings_status.set("Choose an existing atlas file first.")
-                return
+                return False
             if wanted == self.atlas_path:
                 self.settings_status.set("That atlas is already in use.")
-                return
+                return True
             if self.busy_label:
                 self.settings_status.set("Busy loading; try again when it finishes.")
-                return
+                return False
             if (self.edit_version != self.saved_version or self.overlay_count) and not messagebox.askyesno(
                     "Painted changes", "Switching atlas discards the painted overlay and the applied edits "
                     "(they are not saved anywhere). Continue?", parent=window):
-                return
+                return False
             self.atlas_path = wanted
             if wanted:
                 self.alt_atlas_path = wanted
@@ -1527,20 +1688,65 @@ class CCFBrowser:
             save_settings(self.settings)
             self.start_atlas()
             self.settings_status.set("Loading the atlas…")
+            self.update_settings_close()
+            return True
+
+        def close_settings():
+            """OK: load the atlas chosen here if it is a different one, then close (the picture shows "Loading Atlas…")."""
+            if self.busy_label:   # the OK button is greyed out while something loads; the window's own X is ignored too
+                return
+            if wanted_atlas() != self.atlas_path and not apply_atlas():
+                return   # the reason is in the status line; the window stays open
+            window.destroy()
+
+        def cancel_settings():
+            """The window's own X: close without loading a newly chosen atlas."""
+            if not self.busy_label:
+                window.destroy()
 
         buttons = ttk.Frame(body)
         buttons.pack(fill='x', pady=(10, 0))
-        ttk.Button(buttons, text="Close", command=window.destroy).pack(side='right')
-        ttk.Button(buttons, text="Apply atlas", command=apply_atlas).pack(side='right', padx=(0, 6))
+        self.settings_close_button = ttk.Button(buttons, text="OK", command=close_settings)
+        self.settings_close_button.pack(side='right')
+        window.protocol('WM_DELETE_WINDOW', cancel_settings)
+        self.update_settings_close()
         x = self.root.winfo_x() + 80
         window.geometry(f"+{x}+{self.root.winfo_y() + 80}")
 
+    def update_settings_close(self):
+        """Grey out the Settings window's OK button while anything is loading (an atlas switch in particular)."""
+        button = getattr(self, 'settings_close_button', None)
+        try:
+            if button is not None and button.winfo_exists():
+                button.state(['disabled'] if self.busy_label else ['!disabled'])
+        except tk.TclError:
+            pass
+
     # ---- background work
-    def run_in_thread(self, label, function, on_done):
-        """Run `function()` on a thread; `on_done(result, error)` runs on the main thread when it finishes."""
+    def draw_busy_overlay(self):
+        """Put (or take away) the big "Loading ..." note over the middle of the main picture."""
+        self.canvas.delete('busy')
+        if not self.busy_overlay:
+            return
+        width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
+        if width < 10 or height < 10:
+            return
+        item = self.canvas.create_text(width // 2, height // 2, text=self.busy_overlay, fill='white', tags='busy',
+                                       font=('Segoe UI', 22, 'bold'))
+        x0, y0, x1, y1 = self.canvas.bbox(item)
+        box = self.canvas.create_rectangle(x0 - 24, y0 - 14, x1 + 24, y1 + 14, fill='#202020', outline='#808080',
+                                           tags='busy')
+        self.canvas.tag_raise(item, box)
+
+    def run_in_thread(self, label, function, on_done, overlay=''):
+        """Run `function()` on a thread; `on_done(result, error)` runs on the main thread when it finishes. `overlay`,
+        if given, is shown over the middle of the picture until the work is done."""
         self.busy_label, self.progress_text = label, ''
+        self.busy_overlay = overlay
         self.message.configure(text=label)
         self.update_cursors()
+        self.update_settings_close()
+        self.draw_busy_overlay()
 
         def runner():
             try:
@@ -1554,9 +1760,12 @@ class CCFBrowser:
             while True:
                 on_done, result, error = self.work.get_nowait()
                 self.busy_label = ''
+                self.busy_overlay = ''
                 self.update_cursors()
                 self.message.configure(text="")
                 on_done(result, error)
+                self.update_settings_close()   # (on_done may itself have started another load)
+                self.draw_busy_overlay()       # (and if it started one, the new note is drawn; else it is cleared)
         except queue.Empty:
             if self.busy_label:
                 self.message.configure(text=f"{self.busy_label} {self.progress_text}")
@@ -1566,7 +1775,8 @@ class CCFBrowser:
     def start_atlas(self):
         if self.atlas_path:
             name = Path(self.atlas_path).name
-            self.run_in_thread(f"Loading {name}…", lambda: load_custom_atlas(self.atlas_path), self.atlas_ready)
+            self.run_in_thread(f"Loading {name}…", lambda: load_custom_atlas(self.atlas_path), self.atlas_ready,
+                               overlay="Loading Atlas…")
             return
         base = find_atlas_cache_dir()
         if base is None:
@@ -1584,7 +1794,7 @@ class CCFBrowser:
                 self.message.configure(text="The CCF volume is needed; restart to be asked again.")
                 return
         self.run_in_thread("Loading the CCF atlas…" if present else "Downloading the CCF volume…",
-                           lambda: load_atlas(base, download), self.atlas_ready)
+                           lambda: load_atlas(base, download), self.atlas_ready, overlay="Loading Atlas…")
 
     def atlas_ready(self, result, error):
         if error is not None:
@@ -1632,7 +1842,8 @@ class CCFBrowser:
                 if present:
                     self.reference_loading = True
                     self.run_in_thread("Loading the standard CCF to compare with…",
-                                       lambda: load_atlas(base, False), self.reference_ready)
+                                       lambda: load_atlas(base, False), self.reference_ready,
+                                       overlay="Loading Atlas…")
                 else:
                     self.message.configure(text="The standard CCF is not in the atlas cache, so differences cannot be shown.")
         else:
@@ -1785,7 +1996,7 @@ class CCFBrowser:
         slot.loading = True
         self.run_in_thread(f"Reading {path.name}… (large files take a while)",
                            lambda: PointSet(read_points_csv(path, self.set_progress), path),
-                           lambda result, error: self.points_ready(slot, result, error))
+                           lambda result, error: self.points_ready(slot, result, error), overlay="Loading CSV…")
 
     def set_progress(self, text):
         self.progress_text = text
@@ -2034,6 +2245,8 @@ class CCFBrowser:
         self.request_render()
 
     def on_canvas_resize(self):
+        if self.busy_overlay:
+            self.draw_busy_overlay()
         if self.volume is not None and (self.fit or self.view[0] < self.fit_scale()):
             self.fit_to_window()   # also when the window shrank below the current zoom: never smaller than the full view
         else:
@@ -2087,6 +2300,8 @@ class CCFBrowser:
         self.render_picture()
         if self.tip_active:
             self.refresh_tip()
+        if self.busy_overlay:
+            self.draw_busy_overlay()   # keeps the note on top of the freshly drawn picture
 
     def render_picture(self):
         self.render_pending = False

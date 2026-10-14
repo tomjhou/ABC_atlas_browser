@@ -14808,6 +14808,50 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
     query_ax.set_visible(False)  # MODE_OPTIONS[0] ('All Subclasses') has no query box
     query_label.set_visible(False)
 
+    # Linear/Log switch for the Gene and Imputed Gene views (the UMAP and every section panel are coloured from the same
+    # values), like the one over the ROI picker's section view. Log is the default, as there: counts are heavy-tailed.
+    # MERFISH genes: Log = log1p(raw counts), Linear = raw counts. Imputed genes (stored as log2 values): Log = as
+    # stored, Linear = 2**v - 1. Hand-rolled like the mode radio above, but not animated: a click is always followed
+    # by a full redraw of the view anyway.
+    GENE_SCALE_OPTIONS = ('Linear', 'Log')
+    GENE_SCALE_TOP_Y = 0.62
+    gene_scale_state = {'mode': 'log'}
+    gene_scale_label = fig.text(SIDEBAR_LEFT, GENE_SCALE_TOP_Y + 0.045, 'Expression scale:',
+                                fontsize=SIDEBAR_FONTSIZE, va='bottom', ha='left')
+    gene_scale_ax = fig.add_axes([SIDEBAR_LEFT, GENE_SCALE_TOP_Y, SIDEBAR_WIDTH, 0.04])
+    gene_scale_ax.set_xlim(0, 1)
+    gene_scale_ax.set_ylim(0, 1)
+    gene_scale_ax.set_xticks([])
+    gene_scale_ax.set_yticks([])
+    gene_scale_ax.set_facecolor('#dddddd')
+    for spine in gene_scale_ax.spines.values():
+        spine.set_edgecolor('black')
+    gene_scale_dot_x = (0.10, 0.58)
+    gene_scale_dots = gene_scale_ax.scatter(
+        gene_scale_dot_x, [0.5, 0.5], s=[SIDEBAR_FONTSIZE ** 2] * 2, marker='o', edgecolor='black',
+        facecolor=['none', 'tab:blue'], zorder=3)
+    for dot_x, option in zip(gene_scale_dot_x, GENE_SCALE_OPTIONS):
+        gene_scale_ax.text(dot_x + 0.08, 0.5, option, fontsize=SIDEBAR_FONTSIZE, va='center', ha='left')
+    gene_scale_ax.set_visible(False)  # only in the Gene / Imputed Gene views
+    gene_scale_label.set_visible(False)
+
+    def gene_value_transforms(imputed):
+        """(transform of the per-cell values read for the ROI's cells or None, transform for the cells outside the ROI
+        or None) under the current Linear/Log choice; None = values as read (raw counts for MERFISH, log2 for imputed)."""
+        linear = gene_scale_state['mode'] == 'linear'
+        if imputed:
+            if linear:
+                unlog = lambda values: np.exp2(values) - 1.0
+                return unlog, unlog
+            return None, None
+        return (None, None) if linear else (np.log1p, np.log1p)
+
+    def gene_scale_text(imputed):
+        linear = gene_scale_state['mode'] == 'linear'
+        if imputed:
+            return ' [imputed, linear]' if linear else ' [imputed]'
+        return ' (raw counts)' if linear else ' (raw counts, log1p)'
+
     # Level-of-granularity selector (class/subclass/supertype/cluster) —
     # same hand-rolled click-to-open/select dropdown pattern as the gene
     # autocomplete box below, placed just above it. Governs the category
@@ -15608,7 +15652,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             multi_gene_state['legend_labels'].append(
                 cbar_ax.text(TEXT_X, y, gene, fontsize=legend_fontsize, va='center', ha='left',
                              color='0.55' if is_hidden else color))
-            cbar_ax.text(TEXT_X, y - row_h * 0.42, 'hidden' if is_hidden else f'log2: {vmin:.1f}–{vmax:.1f}',
+            cbar_ax.text(TEXT_X, y - row_h * 0.42, 'hidden' if is_hidden else f"{'' if gene_scale_state['mode'] == 'linear' else 'log2: '}{vmin:.1f}–{vmax:.1f}",
                          fontsize=legend_fontsize * 0.75, va='center', ha='left', color='0.4')
         cbar_ax.text(0.5, top_y - n * row_h - 0.5 * row_h, 'click a gene\nto hide/show it',
                      fontsize=legend_fontsize * 0.7, va='center', ha='center', style='italic', color='0.5')
@@ -16493,13 +16537,19 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             found = positions >= 0
             color_values = np.full(adata.n_obs, np.nan, dtype=float)
             color_values[found] = full_col[positions[found]]
+            value_transform, background_full_transform = gene_value_transforms(True)
+            if value_transform is not None:
+                color_values = value_transform(color_values)
             background_full_source, background_full_gene_col = gene_source, gene_col
-            background_full_layer = background_full_transform = None
+            background_full_layer = None
         else:
             expr = adata.layers['counts'][:, gene_col]
             if hasattr(expr, 'toarray'):
                 expr = expr.toarray()
-            color_values = np.log1p(np.asarray(expr).ravel().astype(float))
+            color_values = np.asarray(expr).ravel().astype(float)
+            value_transform, background_full_transform = gene_value_transforms(False)
+            if value_transform is not None:
+                color_values = value_transform(color_values)
             # adata (ROI-filtered) has no counts for cells outside the ROI
             # at all — adata_backed (the whole, unfiltered section) is the
             # only place to get them, if it was even given (see this
@@ -16519,7 +16569,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             # adata's own var index — adata_backed isn't guaranteed to have
             # been derived the same way.
             background_full_source = background_full_gene_col = None
-            background_full_layer, background_full_transform = None, np.log1p
+            background_full_layer = None
             if has_background and adata_backed is not None:
                 bg_gene_col = find_gene_index(adata_backed, query)
                 if bg_gene_col is not None:
@@ -16559,7 +16609,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         colorbar_state['cbar'].ax.tick_params(labelsize=SIDEBAR_FONTSIZE)
         ax.set_title(f"{resolved_gene}{' [imputed]' if imputed else ''}", fontsize=SIDEBAR_FONTSIZE)
         current_view_name['token'] = f"{resolved_gene}{'_imputed' if imputed else ''}"
-        status_text.set_text(f"Showing '{resolved_gene}'{' [imputed]' if imputed else ' (raw counts, log1p)'}.")
+        status_text.set_text(f"Showing '{resolved_gene}'{gene_scale_text(imputed)}.")
         fig.canvas.draw_idle()
         hide_working_indicator()
 
@@ -16579,18 +16629,24 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             found = positions >= 0
             color_values = np.full(adata.n_obs, np.nan, dtype=float)
             color_values[found] = full_col[positions[found]]
-            return color_values, gene_source, gene_col, None, None
+            value_transform, background_transform = gene_value_transforms(True)
+            if value_transform is not None:
+                color_values = value_transform(color_values)
+            return color_values, gene_source, gene_col, None, background_transform
         expr = adata.layers['counts'][:, gene_col]
         if hasattr(expr, 'toarray'):
             expr = expr.toarray()
-        color_values = np.log1p(np.asarray(expr).ravel().astype(float))
+        color_values = np.asarray(expr).ravel().astype(float)
+        value_transform, background_transform = gene_value_transforms(False)
+        if value_transform is not None:
+            color_values = value_transform(color_values)
         full_source = full_gene_col = None
         if has_background and adata_backed is not None:
             resolved_symbol = str(gene_source.var['gene_symbol'].iloc[gene_col])
             bg_gene_col = find_gene_index(adata_backed, resolved_symbol)
             if bg_gene_col is not None:
                 full_source, full_gene_col = adata_backed, bg_gene_col
-        return color_values, full_source, full_gene_col, None, np.log1p
+        return color_values, full_source, full_gene_col, None, background_transform
 
     def normalize_expression(values):
         """Min-max scales `values` to [0, 1] (NaN preserved — multi_gene_
@@ -16668,7 +16724,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # rgb both want the whole set at once, not one gene at a time.
         # A legend click re-enters here with the same genes; the resolved/normalized expression is
         # reused then, so toggling a gene only repaints (no re-reading of every gene's counts).
-        cache_key = (tuple(resolved), bool(imputed))
+        cache_key = (tuple(resolved), bool(imputed), gene_scale_state['mode'])
         cached = multi_gene_state['cache']
         if cached is not None and cached['key'] == cache_key:
             per_gene, normalized = cached['per_gene'], cached['normalized']
@@ -16780,7 +16836,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         # Purely a display-side conversion: normalize_expression's own
         # min-max scaling is invariant to this positive linear factor, so
         # the actual on-screen colors are unaffected either way.
-        to_log2 = 1.0 if imputed else np.log2(np.e)
+        to_log2 = 1.0 if imputed or gene_scale_state['mode'] == 'linear' else np.log2(np.e)
         draw_multi_gene_legend(resolved, [v * to_log2 for v in vmins], [v * to_log2 for v in vmaxes], hidden)
         # Set *after* clear_colorbar (already run above) reset it to
         # inactive — this is what tells render_export_figure (Save UMAP)
@@ -16795,7 +16851,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         current_view_name['token'] = f"{'_'.join(resolved)}{'_imputed' if imputed else ''}"
         status_and_channels = ' and '.join(f"'{g}' ({c})" for g, c in zip(resolved, channel_names))
         status_text.set_text(
-            f"Showing {status_and_channels}{' [imputed]' if imputed else ' (raw counts, log1p)'}."
+            f"Showing {status_and_channels}{gene_scale_text(imputed)}."
             + (f" Hidden: {', '.join(resolved[i] for i in sorted(hidden))}." if hidden else "")
         )
         fig.canvas.draw_idle()
@@ -18086,6 +18142,8 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         show_query = label != 'All Subclasses'  # no query box at all for 'All Subclasses'
         query_ax.set_visible(show_query)
         query_label.set_visible(show_query)
+        gene_scale_ax.set_visible(label in ('Gene', 'Imputed Gene'))
+        gene_scale_label.set_visible(label in ('Gene', 'Imputed Gene'))
         export_degs_ax.set_visible(label == 'Single Subclass')
         export_expr_ax.set_visible(label == 'Single Subclass')
         export_coords_ax.set_visible(label == 'Single Subclass')
@@ -18137,6 +18195,24 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         on_mode_change(label)
 
     fig.canvas.mpl_connect('button_press_event', on_mode_click)
+
+    def on_gene_scale_click(event):
+        if busy_state['active'] or not gene_scale_ax.get_visible():
+            return
+        if event.inaxes is not gene_scale_ax or event.xdata is None:
+            return
+        idx = 0 if event.xdata < (gene_scale_dot_x[0] + gene_scale_dot_x[1] + 0.08) / 2 else 1
+        new_mode = GENE_SCALE_OPTIONS[idx].lower()
+        if new_mode == gene_scale_state['mode']:
+            return
+        gene_scale_state['mode'] = new_mode
+        facecolors = ['none', 'none']
+        facecolors[idx] = 'tab:blue'
+        gene_scale_dots.set_facecolor(facecolors)
+        multi_gene_state['cache'] = None  # the cached values were transformed under the old scale
+        redraw()
+
+    fig.canvas.mpl_connect('button_press_event', on_gene_scale_click)
 
     def on_query_submit(text):
         # 'submit' fires from two genuinely different matplotlib code
@@ -18342,6 +18418,8 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         level_dropdown_ax.set_position([new_left, cur_level_pos.y0, new_width, cur_level_pos.height])
         query_ax.set_position([new_left, QUERY_TOP_Y, new_width, 0.04])
         query_label.set_x(new_left)
+        gene_scale_ax.set_position([new_left, GENE_SCALE_TOP_Y, new_width, 0.04])
+        gene_scale_label.set_x(new_left)
         # gene_dropdown_ax's own y0/height depend on how many suggestions
         # are currently shown (see update_gene_suggestions) — only x0/width
         # change here.
