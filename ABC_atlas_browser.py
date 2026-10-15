@@ -1916,8 +1916,8 @@ THREED_WEB_SLICE_SCRIPT = """
   // What makes a drag quick: (1) each shell's face centres are computed once; (2) an object that is not drawn (switched off in
   // the legend) is skipped, and brought up to date when it is switched on; (3) an object whose kept set did not change (the
   // plane is not crossing it) is not sent to plotly at all, since pushing a mesh to the graphics card is the slow part;
-  // (4) the big shell meshes are only updated once the slider has been still for a moment, while the cells follow the
-  // slider at once (the cells' own mesh is filtered by THREED_WEB_MESH_SCRIPT through gd.__sliceCut).
+  // (4) the shells are brought up to date on every pass along with the cells (the cells' own mesh is filtered by
+  // THREED_WEB_MESH_SCRIPT through gd.__sliceCut); while a pass is under way, slider moves are collected into one more pass.
   var active = false, busy = false, pending = false, timer = 0, heavyReady = true, heavyTimer = 0;
   var cutState = {side: 1, x: 0, y: 0, z: 0};
   function centres(t) {
@@ -1986,10 +1986,8 @@ THREED_WEB_SLICE_SCRIPT = """
   }
   function run() { timer = 0; if (!active) return; if (busy) { pending = true; return; } apply(false, heavyReady); }
   function request() { if (active && !timer) timer = setTimeout(run, 40); }
-  function sliderMoved() {   // the shells wait until the slider has been still for a moment
-    heavyReady = false;
-    clearTimeout(heavyTimer);
-    heavyTimer = setTimeout(function () { heavyReady = true; request(); }, 180);
+  function sliderMoved() {   // the shells follow the slider along with the cells (one pass at a time, newest position wins)
+    heavyReady = true;
     request();
   }
   gd.__sliceReload = function (indices) {   // some meshes were given new geometry: take it as their original

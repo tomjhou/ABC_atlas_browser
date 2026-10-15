@@ -18,6 +18,7 @@ Mouse: shift+wheel = next/previous slice (ctrl+shift: 10 slices); wheel = zoom a
 with ctrl+wheel); +/- also zoom; drag = pan; 0 = fit to window.
 """
 import json
+import os
 import queue
 import subprocess
 import sys
@@ -568,14 +569,47 @@ def oriented_volume(path, extra_flips=(False, False, False)):
     return volume, info
 
 
+IMAGE_MAX_NEIGHBOUR_SAME = 0.5   # below this share of equal neighbours, a volume is a greyscale image, not a map of regions
+
+
+def neighbour_same_share(volume):
+    """The share of voxels that equal the next voxel along the fastest axis, counting only pairs with at least one
+    non-zero voxel (the empty background is the same value in every kind of volume). A map of regions is made of
+    large patches, so this is high (about 0.9 for the Allen CCF); in a greyscale image neighbouring voxels rarely hold
+    exactly the same value (about 0.0005 for a Nissl template). Every second plane is used, which is plenty."""
+    a, b = volume[::2, :, 1:], volume[::2, :, :-1]
+    pairs = (a > 0) | (b > 0)
+    return float((a == b)[pairs].mean()) if pairs.any() else 1.0
+
+
+def intensity_volume(volume):
+    """(uint16 volume, colour lookup) for a greyscale image volume (a Nissl or other microscopy template rather than a map
+    of regions): values that already fit 16 bits are kept as they are, anything else (floats, negative or larger values) is
+    stretched to 0-65535; the lookup is a grey ramp from the 0.5th to the 99.5th percentile of the non-zero values."""
+    if volume.dtype != np.uint16:
+        low, high = float(volume.min()), float(volume.max())
+        volume = np.rint((volume.astype(np.float32) - low) / max(high - low, 1e-9) * 65535).astype(np.uint16)
+    sample = volume[::3, ::3, ::3]
+    sample = sample[sample > 0] if (sample > 0).any() else sample.ravel()
+    low, high = np.percentile(sample, [0.5, 99.5])
+    ramp = np.clip((np.arange(int(volume.max()) + 1, dtype=np.float32) - low) / max(float(high - low), 1.0), 0, 1)
+    lut = np.repeat((ramp * 255).astype(np.uint8)[:, None], 3, axis=1)
+    lut[0] = (0, 0, 0)
+    return np.ascontiguousarray(volume), lut
+
+
 def load_custom_atlas(path, extra_flips=(False, False, False)):
-    """(volume [AP, DV, ML], region table or None, colour lookup, info) from a .nrrd / .nii / .nii.gz annotation volume
-    of any size (see oriented_volume), with names and colours from an ontology*.csv beside it when there is one."""
+    """(volume [AP, DV, ML], region table or None, colour lookup, info) from a .nrrd / .nii / .nii.gz volume of any size
+    (see oriented_volume). An annotation volume gets names and colours from an ontology*.csv beside it when there is one.
+    A greyscale image volume (non-integer values, or too few equal neighbours: see neighbour_same_share) is shown in
+    grey instead, with no region table, and info['intensity'] is True."""
     path = Path(path)
     volume, info = oriented_volume(path, extra_flips)
+    whole_numbers = volume.dtype.kind != 'f' or np.array_equal(volume, np.round(volume))
+    if not whole_numbers or neighbour_same_share(volume) < IMAGE_MAX_NEIGHBOUR_SAME:
+        image, lut = intensity_volume(volume)
+        return image, None, lut, dict(info, intensity=True)
     if volume.dtype.kind == 'f':
-        if not np.array_equal(volume, np.round(volume)):
-            raise ValueError("this is an intensity image, not an annotation volume (region labels are whole numbers)")
         volume = volume.astype(np.int64)
     if volume.min() < 0:
         raise ValueError("region labels cannot be negative")
@@ -713,9 +747,43 @@ def read_neuroinfo_markers(path, progress=None):
             'skipped': skipped}
 
 
+def read_mbf_landmarks(path):
+    """The points of an MBF Bioscience (NeuroInfo) XML file, such as the *_landmarks.xml next to an atlas template, as the
+    same dict read_points_csv returns: one row per point, grouped by marker. The file's coordinates are in um in the
+    image's own frame: x runs left to right, y is negative going down the image and z negative going through the sections,
+    so the position in the atlas is ML = x, DV = -y and AP = -z (checked on the Gerfen 2024 Nissl landmarks, which come out
+    on the anterior commissure, the endopiriform nucleus, the mammillothalamic tract and the fasciculus retroflexus,
+    in left-right pairs about the midline)."""
+    import xml.etree.ElementTree as ET
+    root = ET.parse(path).getroot()
+    rows = []
+    for marker in root.iter():
+        if not marker.tag.endswith('}marker') and marker.tag != 'marker':
+            continue
+        name = marker.get('name') or 'marker'
+        number = 0
+        for point in marker:
+            if not (point.tag.endswith('}point') or point.tag == 'point'):
+                continue
+            try:
+                x, y, z = (float(point.get(axis)) for axis in 'xyz')
+            except (TypeError, ValueError):
+                continue
+            number += 1
+            rows.append({'marker': name, 'landmark': number, 'x_um': x, 'y_um': y, 'z_um': z,
+                         'diameter_um': float(point.get('d') or 0), 'ml_um': x, 'dv_um': -y, 'ap_um': -z})
+    if not rows:
+        raise ValueError("no marker points found in this XML file")
+    table = pd.DataFrame(rows)
+    return {'table': table, 'ap': table['ap_um'].to_numpy(dtype=np.float32), 'dv': table['dv_um'].to_numpy(dtype=np.float32),
+            'ml': table['ml_um'].to_numpy(dtype=np.float32), 'default_group': 'marker', 'kind': 'MBF landmarks', 'skipped': 0}
+
+
 def read_points_csv(path, progress=None):
     """The cells of a CSV as {'table', 'ap', 'dv', 'ml' (um), 'default_group', 'kind', 'skipped'}; raises ValueError
-    when the layout is not one of the two recognised."""
+    when the layout is not one of the recognised ones (an MBF landmarks .xml is read too)."""
+    if str(path).lower().endswith('.xml'):
+        return read_mbf_landmarks(path)
     with open(path, 'r', encoding='utf-8-sig', errors='replace') as handle:
         first = handle.readline()
     if first.startswith('Marker,Experiment'):
@@ -1145,9 +1213,30 @@ class CCFBrowser:
         self.root.after(200, self.start_atlas)
         self.root.protocol('WM_DELETE_WINDOW', self.close)
 
+    # ---- recent files of the CSV boxes
+    RECENT_CSV_MAX = 12
+
+    def recent_files(self, slot):
+        """The files this CSV box loaded recently (newest first) that still exist."""
+        return [path for path in self.recent_csv.get(str(slot.index), []) if Path(path).is_file()]
+
+    def remember_recent(self, slot, path):
+        """Put `path` first in this box's list (once), keep at most RECENT_CSV_MAX, and refresh the box's drop-down."""
+        key = os.path.normcase(os.path.normpath(path))
+        kept = [item for item in self.recent_csv.get(str(slot.index), [])
+                if os.path.normcase(os.path.normpath(item)) != key]
+        self.recent_csv[str(slot.index)] = ([path] + kept)[:self.RECENT_CSV_MAX]
+        widgets = self.slot_widgets[slot.index] if slot.index < len(self.slot_widgets) else None
+        if widgets is not None:
+            widgets['entry'].configure(values=self.recent_files(slot))
+
     # ---- layout
     def build_ui(self):
         root = self.root
+        try:
+            self.recent_csv = {str(k): [str(p) for p in v] for k, v in self.settings.get('recent_csv', {}).items()}
+        except (AttributeError, TypeError):
+            self.recent_csv = {}
         self.slot_widgets = []
         for slot in self.slots:
             saved = self.settings.get(f'csv{slot.index}', self.settings.get('csv', '') if slot.index == 0 else '')
@@ -1157,8 +1246,10 @@ class CCFBrowser:
             row = ttk.Frame(block)
             row.pack(fill='x')
             ttk.Label(row, text=f"CSV {slot.index + 1}:").pack(side='left')
-            entry = ttk.Entry(row, textvariable=slot.path_var)
+            # An editable drop-down: type, paste or drop a path, or pick one of this box's recently loaded files.
+            entry = ttk.Combobox(row, textvariable=slot.path_var, values=self.recent_files(slot))
             entry.pack(side='left', fill='x', expand=True, padx=4)
+            entry.bind('<<ComboboxSelected>>', lambda e, s=slot: self.load_slot(s, chosen=True))
             entry.bind('<Return>', lambda e, s=slot: self.load_slot(s))
             entry.bind('<<Paste>>', lambda e, s=slot: self.root.after(60, lambda: self.load_slot(s)))
             ttk.Button(row, text="Choose file…", command=lambda s=slot: self.choose_file(s)).pack(side='left')
@@ -2036,7 +2127,8 @@ class CCFBrowser:
         self.edit_version = self.saved_version = 0
         self.value_cache, self.stroke = None, None
         self.set_tool('none')
-        self.settings_status.set("Atlas loaded: " + (Path(self.atlas_path).name if self.atlas_path else "default CCF"))
+        self.settings_status.set("Atlas loaded: " + (Path(self.atlas_path).name if self.atlas_path else "default CCF")
+                                 + (" (a greyscale image: shown in grey, no regions)" if self.atlas_info.get('intensity') else ""))
         self.root.title("CCF browser" + (f" - {Path(self.atlas_path).name}" if self.atlas_path else ""))
         self.apply_saturation()
         self.fit_to_window()
@@ -2052,7 +2144,8 @@ class CCFBrowser:
     def update_comparison_mode(self):
         """Offer the Differences mode (and load the standard CCF to compare with) while an alternate atlas is on
         screen; take both away when the standard atlas itself is."""
-        alternate = bool(self.loaded_atlas_path) and self.on_ccf_grid   # only the same grid can be compared voxel by voxel
+        alternate = (bool(self.loaded_atlas_path) and self.on_ccf_grid   # only the same grid can be compared voxel by voxel
+                     and not self.atlas_info.get('intensity'))               # and only a map of regions with another
         self.diff_cache = None
         if alternate:
             self.mode_box.configure(values=ATLAS_MODES + DIFF_MODES)
@@ -2159,8 +2252,8 @@ class CCFBrowser:
         current = slot.path_var.get().strip().strip('"')
         start = Path(current).parent if current else None
         chosen = filedialog.askopenfilename(
-            title="Choose a CSV of cells", parent=self.root, initialdir=str(start) if start and start.is_dir() else None,
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+            title="Choose a CSV of cells or an MBF landmarks XML", parent=self.root, initialdir=str(start) if start and start.is_dir() else None,
+            filetypes=[("CSV files and landmarks", "*.csv *.xml"), ("All files", "*.*")])
         if chosen:
             slot.path_var.set(chosen)
             self.load_slot(slot, chosen=True)
@@ -2284,6 +2377,7 @@ class CCFBrowser:
         slot.points = result
         slot.loaded_at = time.time()
         points = result
+        self.remember_recent(slot, str(points.path))
         self.slot_widgets[slot.index]['combo'].configure(values=points.group_columns or ['(all cells)'])
         slot.group_var.set(points.group_column or '(all cells)')
         slot.visible = {}
@@ -2506,8 +2600,8 @@ class CCFBrowser:
     def outline_style(self, mode):
         """(colour, opacity) of the region outlines for this display mode, or None for none: dark lines over the bright
         regions, light ones over the dimmed views, and nothing in Boundaries (which is outlines already)."""
-        if not self.outline_var.get() or mode == 'Boundaries':
-            return None
+        if not self.outline_var.get() or mode == 'Boundaries' or self.atlas_info.get('intensity'):
+            return None   # (a greyscale image has no regions to outline)
         return ((190, 190, 190), 0.35) if mode in ('Regions (dim)',) + DIFF_MODES else ((0, 0, 0), 0.6)
 
     def draw_edge_labels(self, origin, pane_width, height):
@@ -2834,6 +2928,7 @@ class CCFBrowser:
                               'saturation': int(round(float(self.sat_var.get()))), 'slab': int(self.slab_var.get() or 0),
                               'dot': int(self.dot_var.get() or 1), 'mode': self.mode_var.get(),
                               'outlines': bool(self.outline_var.get())})
+        self.settings['recent_csv'] = self.recent_csv
         for slot in self.slots:
             self.settings[f'csv{slot.index}'] = str(slot.points.path) if slot.points is not None else ''
         self.settings.pop('csv', None)
