@@ -43,6 +43,7 @@ REGION_TABLES = ('acronym', 'name', 'color')   # parcellation_to_parcellation_te
 VOXEL_UM = 25.0
 N_AP, N_DV, N_ML = 528, 320, 456        # the volume as [anterior-posterior, dorsal-ventral, left-right]
 VOLUME_SHAPE = (N_AP, N_DV, N_ML)
+CCF_SHAPE, CCF_VOXEL_UM = VOLUME_SHAPE, VOXEL_UM
 MIDLINE_UM = N_ML * VOXEL_UM / 2        # left-right positions at or beyond this are the left hemisphere (as in the atlas)
 BACKGROUND = (24, 24, 24)
 MAX_GROUPS = 12
@@ -75,6 +76,17 @@ VIEW_EDGE_LABELS = {'Coronal': ('dorsal', 'ventral', 'right', 'left'),
 AXIS_NAMES = ('AP', 'DV', 'ML')
 
 
+def set_geometry(shape, voxel_um):
+    """Make the module's volume constants those of the atlas now on screen (the CCF's, or another atlas's: a loaded
+    volume is always [AP, DV, ML] with isotropic voxels of `voxel_um`)."""
+    global VOXEL_UM, N_AP, N_DV, N_ML, VOLUME_SHAPE, MIDLINE_UM
+    N_AP, N_DV, N_ML = (int(n) for n in shape)
+    VOLUME_SHAPE = (N_AP, N_DV, N_ML)
+    VOXEL_UM = float(voxel_um)
+    MIDLINE_UM = N_ML * VOXEL_UM / 2
+    VIEW_IMAGE_SIZE.update({'Coronal': (N_ML, N_DV), 'Sagittal': (N_AP, N_DV), 'Horizontal': (N_ML, N_AP)})
+
+
 def view_slice(volume, view, index):
     """The (rows, columns) image of region labels of one slice in the given view."""
     if view == 'Coronal':
@@ -104,7 +116,7 @@ def import_drag_and_drop():
 
 
 # ---- the atlas ---------------------------------------------------------------------------------------------------
-def read_nifti_volume(path):
+def read_nifti_volume(path, with_header=False):
     """The voxel array of a (gzipped) NIfTI-1 file as [i, j, k] (the file's own axis order), without nibabel."""
     import gzip
     import struct
@@ -121,7 +133,8 @@ def read_nifti_volume(path):
         raise ValueError(f"unsupported NIfTI data type {code}")
     offset = int(struct.unpack('<f', header[108:112])[0])
     count = int(np.prod(shape))
-    return np.frombuffer(raw, dtype=dtypes[code], offset=offset, count=count).reshape(shape[::-1]).T
+    array = np.frombuffer(raw, dtype=dtypes[code], offset=offset, count=count).reshape(shape[::-1]).T
+    return (array, raw[:max(348, offset)]) if with_header else array
 
 
 def find_atlas_cache_dir():
@@ -173,7 +186,7 @@ def load_atlas(base, download):
         cache = AbcProjectCache.from_cache_dir(base)
         path = Path(cache.get_data_path(directory=VOLUME_DIRECTORY, file_name=VOLUME_FILE_NAME))
     volume = np.ascontiguousarray(read_nifti_volume(path))
-    if volume.shape != (N_AP, N_DV, N_ML):
+    if tuple(volume.shape) != CCF_SHAPE:   # not VOLUME_SHAPE: that follows the atlas on screen
         raise ValueError(f"unexpected annotation volume shape {volume.shape}")
 
     table = None
@@ -199,7 +212,7 @@ def load_atlas(base, download):
     except Exception as e:
         print(f"Region names and colours unavailable ({e}); regions are coloured by label number only.")
 
-    return volume, table, region_colors(volume, table)
+    return volume, table, region_colors(volume, table), {'voxel_um': CCF_VOXEL_UM, 'legacy': True}
 
 
 def quiet_atlas_cache_dir():
@@ -286,7 +299,7 @@ NRRD_TYPES = {'unsigned short': 'u2', 'uint16': 'u2', 'ushort': 'u2', 'uint16_t'
               'double': 'f8'}
 
 
-def read_nrrd_volume(path):
+def read_nrrd_volume(path, details=False):
     """The voxel array of a NRRD file (raw or gzip encoded) as [slowest axis, ..., fastest axis], without pynrrd."""
     import zlib
     with open(path, 'rb') as handle:
@@ -295,7 +308,8 @@ def read_nrrd_volume(path):
     if not raw.startswith(b'NRRD') or end < 0:
         raise ValueError("not a NRRD file")
     fields = {}
-    for line in raw[:end].decode('latin-1').splitlines()[1:]:
+    lines = raw[:end].decode('latin-1').splitlines()[1:]
+    for line in lines:
         if line.startswith('#') or ':' not in line:
             continue
         key, value = line.split(':', 1)
@@ -311,7 +325,8 @@ def read_nrrd_volume(path):
     elif encoding != 'raw':
         raise ValueError(f"unsupported NRRD encoding {encoding!r}")
     sizes = tuple(int(n) for n in fields['sizes'].split())
-    return np.frombuffer(body, dtype=dtype, count=int(np.prod(sizes))).reshape(sizes[::-1])
+    array = np.frombuffer(body, dtype=dtype, count=int(np.prod(sizes))).reshape(sizes[::-1])
+    return (array, fields, lines) if details else array
 
 
 SAVE_FORMATS = {'.nrrd': "NRRD (.nrrd)", '.nii.gz': "NIfTI-1, gzipped (.nii.gz)", '.nii': "NIfTI-1 (.nii)"}
@@ -341,60 +356,223 @@ def nifti_header(shape, dtype):
     return bytes(header)
 
 
-def write_volume(path, values, progress=None):
-    """Write a [AP, DV, ML] array of uint16/uint32 region values as .nrrd, .nii or .nii.gz (chosen by the name)."""
+def write_volume(path, values, progress=None, source=None):
+    """Write a [AP, DV, ML] array of uint16/uint32 region values as .nrrd, .nii or .nii.gz (chosen by the name). For an
+    atlas that was not on the CCF grid, `source` (its info from oriented_volume) puts the array back in the file's own
+    axis order and keeps the original header, so the file is written in its original format and orientation."""
     import gzip
     import zlib
     fmt = volume_format(path)
     if progress:
         progress("compressing" if fmt != '.nii' else "writing")
+    if source is not None:
+        if fmt != source['format']:
+            raise ValueError(f"this atlas can only be saved in its own format ({source['format']})")
+        flipped = np.flip(values, axis=[a for a in range(3) if source['flips'][a]])
+        file_array = np.transpose(flipped, np.argsort(source['perm']))   # [i, j, k] as in the file
+        slowest_first = file_array.T
+        shape = file_array.shape
+    else:
+        shape = None
+        slowest_first = values if fmt == '.nrrd' else values.T   # the CCF files: see below
     if fmt == '.nrrd':
         kind = {'uint16': 'unsigned short', 'uint32': 'unsigned int'}[values.dtype.name]
-        header = (f"NRRD0004\n# Written by CCF_browser.py\ntype: {kind}\ndimension: 3\nspace: left-posterior-superior\n"
-                  f"sizes: {values.shape[2]} {values.shape[1]} {values.shape[0]}\n"
-                  f"space directions: ({VOXEL_UM:g},0,0) (0,{VOXEL_UM:g},0) (0,0,{VOXEL_UM:g})\n"
-                  "kinds: domain domain domain\nendian: little\nencoding: gzip\nspace origin: (0,0,0)\n\n")
+        if source is not None:
+            skipped = ('type', 'endian', 'encoding', 'byteskip', 'line skip', 'lineskip', 'data file', 'datafile')
+            kept = [line for line in source['nrrd_lines'] if line.split(':', 1)[0].strip().lower() not in skipped]
+            header = ("NRRD0004\n" + "\n".join(kept) + f"\ntype: {kind}\nendian: little\nencoding: gzip\n\n")
+        else:
+            header = (f"NRRD0004\n# Written by CCF_browser.py\ntype: {kind}\ndimension: 3\n"
+                      f"space: left-posterior-superior\n"
+                      f"sizes: {values.shape[2]} {values.shape[1]} {values.shape[0]}\n"
+                      f"space directions: ({VOXEL_UM:g},0,0) (0,{VOXEL_UM:g},0) (0,0,{VOXEL_UM:g})\n"
+                      "kinds: domain domain domain\nendian: little\nencoding: gzip\nspace origin: (0,0,0)\n\n")
         compressor = zlib.compressobj(6, zlib.DEFLATED, 31)
         with open(path, 'wb') as handle:
-            handle.write(header.encode('ascii'))
-            for start in range(0, values.shape[0], 16):   # in slabs, to keep the temporary copies small
-                handle.write(compressor.compress(np.ascontiguousarray(values[start:start + 16]).tobytes()))
+            handle.write(header.encode('latin-1'))
+            for start in range(0, slowest_first.shape[0], 16):   # in slabs, to keep the temporary copies small
+                handle.write(compressor.compress(np.ascontiguousarray(slowest_first[start:start + 16]).tobytes()))
             handle.write(compressor.flush())
     elif fmt in ('.nii', '.nii.gz'):
+        if source is not None:
+            import struct
+            header = bytearray(source['nifti_header'])
+            code, bits = {'uint16': (512, 16), 'uint32': (768, 32)}[values.dtype.name]
+            struct.pack_into('<2h', header, 70, code, bits)
+            struct.pack_into('<2f', header, 112, 1.0, 0.0)   # scl_slope, scl_inter: the stored numbers are the labels
+            header = bytes(header)
+        else:
+            header = nifti_header(values.shape, values.dtype)
         opener = gzip.open(path, 'wb', compresslevel=5) if fmt == '.nii.gz' else open(path, 'wb')
         with opener as handle:
-            handle.write(nifti_header(values.shape, values.dtype))
-            transposed = values.T   # NIfTI stores the first axis (AP) fastest
-            for start in range(0, transposed.shape[0], 16):
-                handle.write(np.ascontiguousarray(transposed[start:start + 16]).tobytes())
+            handle.write(header)
+            for start in range(0, slowest_first.shape[0], 16):   # NIfTI stores the first axis fastest
+                handle.write(np.ascontiguousarray(slowest_first[start:start + 16]).tobytes())
     else:
         raise ValueError("the file name must end in .nrrd, .nii or .nii.gz")
 
 
 def read_ontology(path, top):
-    """A region table from an Allen ontology CSV (id, name, acronym, color_hex_triplet, structure_id_path), for the ids
-    up to `top`: same columns as the ABC table, with the lineage of acronyms as the detail line."""
-    frame = pd.read_csv(path)
-    acronyms = frame.drop_duplicates('id').set_index('id')['acronym']
-    frame = frame[frame['id'] <= top].drop_duplicates('id').set_index('id')
+    """A region table from an Allen-style ontology CSV, for the ids up to `top`: same columns as the ABC table, with the
+    lineage of acronyms as the detail line. Needs id, name and acronym columns; colours come from color_hex_triplet or
+    color, and the lineage from structure_id_path or, failing that, a parent_id column."""
+    frame = pd.read_csv(path, dtype={'color': str, 'color_hex_triplet': str})
+    unique = frame.drop_duplicates('id').set_index('id')
+    acronyms = unique['acronym']
+    frame = unique[unique.index <= top]
+    parents = unique['parent_id'].to_dict() if 'parent_id' in unique else {}
 
-    def lineage(id_path):
-        ids = [int(part) for part in str(id_path).split('/') if part.strip().isdigit()]
-        return ' > '.join(str(acronyms.get(i, i)) for i in ids if i not in (997, 8))
+    def lineage(row_id):
+        if 'structure_id_path' in frame:
+            ids = [int(part) for part in str(frame.at[row_id, 'structure_id_path']).split('/') if part.strip().isdigit()]
+            return ' > '.join(str(acronyms.get(i, i)) for i in ids if i not in (997, 8))
+        chain, current = [], row_id
+        while current in unique.index and len(chain) < 30:
+            chain.append(str(acronyms.get(current, current)))
+            current = parents.get(current)
+            if current is None or pd.isna(current):
+                break
+            current = int(current)
+        return ' > '.join(reversed(chain[:-1] if len(chain) > 1 else chain))   # without the root
 
+    color_column = 'color_hex_triplet' if 'color_hex_triplet' in frame else 'color'
     return pd.DataFrame({'acronym_substructure': frame['acronym'], 'name_substructure': frame['name'],
-                         'detail': 'lineage: ' + frame['structure_id_path'].map(lineage),
-                         'substructure_color': '#' + frame['color_hex_triplet'].astype(str).str.zfill(6)})
+                         'detail': 'lineage: ' + pd.Series([lineage(i) for i in frame.index], index=frame.index),
+                         'substructure_color': '#' + frame[color_column].astype(str).str.strip().str.zfill(6)})
 
 
-def load_custom_atlas(path):
-    """(volume [AP, DV, ML], region table or None, colour lookup) from a .nrrd / .nii / .nii.gz annotation volume on
-    the same 25 um grid, with names and colours from an ontology*.csv beside it when there is one."""
+OPPOSITE = {'left': 'right', 'right': 'left', 'anterior': 'posterior', 'posterior': 'anterior',
+            'superior': 'inferior', 'inferior': 'superior'}
+LETTER_WORDS = {'l': 'left', 'r': 'right', 'a': 'anterior', 'p': 'posterior', 's': 'superior', 'i': 'inferior'}
+
+
+def orientation_transform(vectors, words):
+    """How to turn a volume stored as [i, j, k] into [AP, DV, ML] (AP growing posterior, DV growing ventral, ML growing
+    toward the left, as the CCF is held here): returns (perm, flips) so that
+    np.flip(np.transpose(volume, perm), axes where flips) is the result. `vectors[k]` is the direction in the world
+    of file axis k, `words` the names of the world's +x, +y, +z directions (e.g. left, posterior, superior)."""
+    roles = {'posterior': (0, False), 'anterior': (0, True), 'inferior': (1, False), 'superior': (1, True),
+             'left': (2, False), 'right': (2, True)}
+    perm, flips = [None] * 3, [False] * 3
+    for k, vector in enumerate(vectors):
+        world = int(np.argmax(np.abs(vector)))
+        toward = words[world] if vector[world] > 0 else OPPOSITE[words[world]]
+        axis, flip = roles[toward]
+        if perm[axis] is not None:
+            raise ValueError("cannot tell the orientation of this volume: two axes point the same way")
+        perm[axis], flips[axis] = k, flip
+    return tuple(perm), tuple(flips)
+
+
+def qform_matrix(b, c, d, pixdim):
+    """The 3 x 3 voxel-to-world matrix of a NIfTI qform (quaternion b, c, d; pixdim[0] is qfac, pixdim[1:4] the sizes)."""
+    a = np.sqrt(max(0.0, 1.0 - b * b - c * c - d * d))
+    rotation = np.array([[a * a + b * b - c * c - d * d, 2 * (b * c - a * d), 2 * (b * d + a * c)],
+                         [2 * (b * c + a * d), a * a + c * c - b * b - d * d, 2 * (c * d - a * b)],
+                         [2 * (b * d - a * c), 2 * (c * d + a * b), a * a + d * d - c * c - b * b]])
+    return rotation * np.array([pixdim[1], pixdim[2], pixdim[3] * (-1.0 if pixdim[0] < 0 else 1.0)])
+
+
+def embedded_nifti_matrix(fields):
+    """The voxel-to-world matrix (RAS) from NIfTI fields a converter left in a NRRD header (qform_code, quatern_b, ...,
+    srow_x, ...), or None. These describe the original data, whose orientation the NRRD's own 'space directions' can
+    contradict (the signs of x and y are wrong in some converted files)."""
+    def field(name):   # 'key:=value' lines arrive as 'key' -> '=value'
+        return fields[name].lstrip('=').strip()
+
+    try:
+        sform, qform = int(field('sform_code')), int(field('qform_code'))
+        if sform > 0:
+            return np.array([[float(n) for n in field(f'srow_{axis}').split()] for axis in 'xyz'])[:, :3]
+        if qform > 0:
+            pixdim = [float(field(f'pixdim[{i}]')) for i in range(4)]
+            return qform_matrix(float(field('quatern_b')), float(field('quatern_c')), float(field('quatern_d')),
+                                pixdim)
+    except (KeyError, ValueError):
+        pass
+    return None
+
+
+def nrrd_space(fields):
+    """(directions, words, voxel um) from NRRD header fields: the world vector of each axis, the names of the world's
+    +x/+y/+z, and the voxel size."""
+    import re
+    space = fields.get('space', '').strip().lower().replace('_', '-')
+    words = space.split('-') if '-' in space else [LETTER_WORDS.get(c, '') for c in space]
+    if len(words) != 3 or not all(w in OPPOSITE for w in words):
+        raise ValueError(f"cannot tell the orientation of this volume: unsupported NRRD space {space!r}")
+    vectors = [[float(n) for n in text.split(',')] for text in re.findall(r'\(([^)]*)\)', fields.get('space directions', ''))]
+    if len(vectors) != 3 or any(len(v) != 3 for v in vectors):
+        raise ValueError("cannot tell the orientation of this volume: no usable 'space directions' in the NRRD header")
+    sizes = np.linalg.norm(np.array(vectors), axis=1)
+    units = fields.get('space units', '').lower()
+    if 'mm' in units or (not units and sizes.max() < 1):
+        sizes = sizes * 1000
+    embedded = embedded_nifti_matrix(fields)
+    if embedded is not None:
+        return embedded.T, ('right', 'anterior', 'superior'), sizes
+    vectors = np.array(vectors)
+    if tuple(words) == ('left', 'posterior', 'superior') and np.all(np.diag(vectors) > 0)             and np.count_nonzero(vectors) == 3:
+        # Converted NIfTI files (MBF) label the space LPS but keep the RAS storage order: i to the right, j anterior, k
+        # superior, with the signs of x and y lost. Read them as RAS (Settings can still flip an axis).
+        return vectors, ('right', 'anterior', 'superior'), sizes
+    return vectors, tuple(words), sizes
+
+
+def nifti_space(header):
+    """The same as nrrd_space for the 348+ byte header of a NIfTI-1 file (sform if set, else qform)."""
+    import struct
+    pixdim = struct.unpack('<8f', header[76:108])
+    qform, sform = struct.unpack('<2h', header[252:256])
+    if sform > 0:
+        rows = np.array(struct.unpack('<12f', header[280:328])).reshape(3, 4)
+        matrix = rows[:, :3]
+    elif qform > 0:
+        matrix = qform_matrix(*struct.unpack('<3f', header[256:268]), pixdim)
+    else:
+        raise ValueError("cannot tell the orientation of this volume: the NIfTI header has neither sform nor qform")
+    unit = {1: 1e6, 2: 1e3, 3: 1.0}.get(header[123] & 7, 1e3)   # to um; mm if unspecified
+    return matrix.T, ('right', 'anterior', 'superior'), np.linalg.norm(matrix, axis=0) * unit
+
+
+def oriented_volume(path, extra_flips=(False, False, False)):
+    """(volume [AP, DV, ML], info) from a .nrrd / .nii / .nii.gz volume of any size. A volume with the CCF's dimensions
+    (in any axis order) is taken as the CCF grid, 25 um; any other is turned into [AP, DV, ML] using the orientation in
+    its header. `info` has 'voxel_um', 'legacy' (CCF grid) and, for the others, what write_volume needs to save it back
+    in the file's own layout. Raises ValueError for a volume it cannot orient or with non-cubic voxels."""
     path = Path(path)
-    volume = read_nrrd_volume(path) if path.suffix.lower() == '.nrrd' else read_nifti_volume(path)
-    if sorted(volume.shape) != sorted(VOLUME_SHAPE):
-        raise ValueError(f"expected a {N_AP} x {N_DV} x {N_ML} volume (25 um), got {volume.shape}")
-    volume = np.transpose(volume, [volume.shape.index(n) for n in VOLUME_SHAPE])   # to [AP, DV, ML]
+    fmt = volume_format(path)
+    if fmt == '.nrrd':
+        array, fields, lines = read_nrrd_volume(path, details=True)
+        file_array = array.T
+    elif fmt in ('.nii', '.nii.gz'):
+        file_array, header = read_nifti_volume(path, with_header=True)
+    else:
+        raise ValueError("the file name must end in .nrrd, .nii or .nii.gz")
+    if file_array.ndim != 3:
+        raise ValueError(f"expected a 3-D volume, got {file_array.shape}")
+    if sorted(file_array.shape) == sorted(CCF_SHAPE):
+        return (np.transpose(file_array, [file_array.shape.index(n) for n in CCF_SHAPE]),
+                {'voxel_um': CCF_VOXEL_UM, 'legacy': True})
+    vectors, words, sizes = nrrd_space(fields) if fmt == '.nrrd' else nifti_space(header)
+    if sizes.max() > sizes.min() * 1.02:
+        raise ValueError(f"the voxels are not cubic ({', '.join(f'{x:.4g}' for x in sizes)} um): not supported")
+    perm, flips = orientation_transform(vectors, words)
+    flips = tuple(bool(f) != bool(e) for f, e in zip(flips, extra_flips))   # the user's corrections, from Settings
+    volume = np.transpose(file_array, perm)
+    flip_axes = [a for a in range(3) if flips[a]]
+    if flip_axes:
+        volume = np.flip(volume, axis=flip_axes)
+    info = {'voxel_um': float(sizes.mean()), 'legacy': False, 'perm': perm, 'flips': flips, 'format': fmt}
+    info.update({'nrrd_lines': lines} if fmt == '.nrrd' else {'nifti_header': header})
+    return volume, info
+
+
+def load_custom_atlas(path, extra_flips=(False, False, False)):
+    """(volume [AP, DV, ML], region table or None, colour lookup, info) from a .nrrd / .nii / .nii.gz annotation volume
+    of any size (see oriented_volume), with names and colours from an ontology*.csv beside it when there is one."""
+    path = Path(path)
+    volume, info = oriented_volume(path, extra_flips)
     if volume.dtype.kind == 'f':
         if not np.array_equal(volume, np.round(volume)):
             raise ValueError("this is an intensity image, not an annotation volume (region labels are whole numbers)")
@@ -428,18 +606,17 @@ def load_custom_atlas(path):
         for column in ('acronym_substructure', 'name_substructure', 'detail'):
             if column in table:
                 table[column] = table[column].fillna('')
-    return volume, table, region_colors(volume, table)
+    return volume, table, region_colors(volume, table), info
 
 
 def read_section_values(path, axis, index):
     """The region values (whole numbers, int64) of one plane of a .nrrd / .nii / .nii.gz annotation volume on the 25 um
     grid: the plane `index` along `axis` of [AP, DV, ML], whatever the file's own axis order. Raises ValueError for a
     file of the wrong size or one holding an intensity image."""
-    path = Path(path)
-    volume = read_nrrd_volume(path) if path.suffix.lower() == '.nrrd' else read_nifti_volume(path)
-    if sorted(volume.shape) != sorted(VOLUME_SHAPE):
-        raise ValueError(f"expected a {N_AP} x {N_DV} x {N_ML} volume (25 um), got {volume.shape}")
-    volume = np.transpose(volume, [volume.shape.index(n) for n in VOLUME_SHAPE])   # to [AP, DV, ML]
+    volume, _info = oriented_volume(path)
+    if volume.shape != tuple(VOLUME_SHAPE):
+        raise ValueError(f"expected a volume of {N_AP} x {N_DV} x {N_ML} voxels like the atlas on screen, "
+                         f"got {volume.shape}")
     plane = np.array(np.take(volume, index, axis=axis))
     if plane.dtype.kind == 'f':
         if not np.array_equal(plane, np.round(plane)):
@@ -863,6 +1040,13 @@ class CCFBrowser:
     SLOTS = 2
 
     @property
+    def on_ccf_grid(self):
+        """Whether the atlas on screen is on the CCF's grid (25 um, 528 x 320 x 456): bregma and the comparison with the
+        standard CCF only make sense there."""
+        return (self.volume is None or (tuple(self.volume.shape) == CCF_SHAPE
+                                        and abs(self.atlas_info['voxel_um'] - CCF_VOXEL_UM) < 1e-6))
+
+    @property
     def slice(self):
         return self.slices[self.view_name]
 
@@ -889,6 +1073,7 @@ class CCFBrowser:
         self.root.geometry("1100x800+60+40")
         self.settings = load_settings()
         self.volume = self.region_table = self.lut = None
+        self.atlas_info = {'voxel_um': CCF_VOXEL_UM, 'legacy': True}   # geometry and orientation of the atlas on screen
         self.reference = None          # the standard CCF (volume, table, lut) while another atlas is on screen
         self.reference_loading = False
         self.diff_cache = None         # (key, alt_lut, ref_lut, basis, totals or None)
@@ -904,6 +1089,9 @@ class CCFBrowser:
         self.lut_view = None           # the region colours at the chosen saturation
         self.follow_var = tk.BooleanVar(value=bool(self.settings.get('follow_info', True)))
         self.atlas_path = self.settings.get('atlas_path', '')   # '' = the CCF from the ABC atlas cache
+        self.atlas_flips = {k: tuple(bool(x) for x in v) for k, v in self.settings.get('atlas_flips', {}).items()}
+        self.loaded_flips = (False, False, False)   # orientation corrections the atlas on screen was loaded with
+        self.loading_flips = (False, False, False)
         self.alt_atlas_path = self.settings.get('alt_atlas_path', '') or self.atlas_path   # remembered for switching back
         self.loaded_atlas_path = ''    # the atlas now on screen
         self.settings_status = tk.StringVar()
@@ -1382,7 +1570,8 @@ class CCFBrowser:
         source = Path(self.atlas_path) if self.atlas_path else None
         default = volume_format(source) if source else '.nii.gz'
         default = default or '.nii.gz'
-        order = [default] + [ext for ext in SAVE_FORMATS if ext != default]
+        generic = not self.atlas_info.get('legacy', True)   # not on the CCF grid: saved in its own format and layout
+        order = [default] + ([] if generic else [ext for ext in SAVE_FORMATS if ext != default])
         stem = source.name[:-len(default)] if source and source.name.lower().endswith(default) else 'annotation_25'
         kind = tk.StringVar()
         chosen = filedialog.asksaveasfilename(
@@ -1395,6 +1584,10 @@ class CCFBrowser:
             ext = next((e for e, label in SAVE_FORMATS.items() if label == kind.get()), default)
             chosen += ext
         path = Path(chosen)
+        if generic and volume_format(path) != self.atlas_info['format']:
+            messagebox.showerror("Save volume", f"This atlas can only be saved in its own format "
+                                 f"({self.atlas_info['format']}), with its original orientation.", parent=parent)
+            return
         ids = self.label_ids
         if ids is not None:
             values = ids.astype(np.uint32 if ids.max() > 65535 else np.uint16)[self.volume]
@@ -1413,7 +1606,7 @@ class CCFBrowser:
             self.saved_version = version
             self.paint_status.set(f"Saved {path.name}")
             self.message.configure(text=f"Saved {path}")
-        self.run_in_thread(f"Saving {path.name}…", lambda: write_volume(path, values, self.set_progress), done)
+        self.run_in_thread(f"Saving {path.name}…", lambda: write_volume(path, values, self.set_progress, self.atlas_info if generic else None), done)
 
     def close_paint(self):
         self.set_tool('none')
@@ -1585,7 +1778,7 @@ class CCFBrowser:
         self.settings_status.set('')
         ttk.Radiobutton(box, text="Allen CCF 2020, from the ABC atlas cache (default)", value='abc',
                         variable=mode).pack(anchor='w')
-        ttk.Radiobutton(box, text="Another annotation volume (.nrrd, .nii or .nii.gz, 25 um, same grid):",
+        ttk.Radiobutton(box, text="Another annotation volume (.nrrd, .nii or .nii.gz, any size, e.g. Allen2017 or Waxholm rat):",
                         value='custom', variable=mode).pack(anchor='w', pady=(6, 0))
         row = ttk.Frame(box)
         row.pack(fill='x', padx=(20, 0))
@@ -1626,7 +1819,21 @@ class CCFBrowser:
             except OSError as e:
                 self.settings_status.set(f"Could not open the folder: {e}")
         ttk.Button(row, text="Open folder", command=open_folder).pack(side='left', padx=(4, 0))
+        flip_row = ttk.Frame(box)
+        flip_row.pack(fill='x', padx=(20, 0), pady=(6, 0))
+        ttk.Label(flip_row, text="If it looks reversed, flip:").pack(side='left')
+        flip_vars = [tk.BooleanVar(value=False) for _ in range(3)]
+        for var, text in zip(flip_vars, ("front ↔ back", "top ↔ bottom", "left ↔ right")):
+            ttk.Checkbutton(flip_row, text=text, variable=var).pack(side='left', padx=(10, 0))
+
+        def show_flips(*_args):
+            for var, value in zip(flip_vars, self.atlas_flips.get(path_var.get().strip().strip('"'), (False,) * 3)):
+                var.set(value)
+        path_var.trace_add('write', show_flips)
+        show_flips()
         ttk.Label(box, foreground='#555555', justify='left', wraplength=520, text=(
+            "The orientation is read from the file's header, which is sometimes wrong; the flips (remembered per file, "
+            "and kept when the volume is saved) correct it. They do not apply to volumes on the CCF grid. "
             "Region names and colours come from an ontology*.csv in the same folder, if there is one (the Allen2017 "
             "folder has ontology_api_2017.csv). Label numbers differ between the 2017 and ABC atlases.")).pack(
             anchor='w', pady=(6, 0))
@@ -1665,13 +1872,16 @@ class CCFBrowser:
         def wanted_atlas():
             return path_var.get().strip().strip('"') if mode.get() == 'custom' else ''
 
+        def wanted_flips():
+            return tuple(var.get() for var in flip_vars)
+
         def apply_atlas():
             """Switch to the atlas the box asks for; True if the switch started (or was not needed)."""
             wanted = wanted_atlas()
             if mode.get() == 'custom' and not Path(wanted).is_file():
                 self.settings_status.set("Choose an existing atlas file first.")
                 return False
-            if wanted == self.atlas_path:
+            if wanted == self.atlas_path and (not wanted or wanted_flips() == self.loaded_flips):
                 self.settings_status.set("That atlas is already in use.")
                 return True
             if self.busy_label:
@@ -1684,7 +1894,9 @@ class CCFBrowser:
             self.atlas_path = wanted
             if wanted:
                 self.alt_atlas_path = wanted
-            self.settings.update({'atlas_path': wanted, 'alt_atlas_path': self.alt_atlas_path})
+                self.atlas_flips[wanted] = wanted_flips()
+            self.settings.update({'atlas_path': wanted, 'alt_atlas_path': self.alt_atlas_path,
+                                  'atlas_flips': {k: list(v) for k, v in self.atlas_flips.items()}})
             save_settings(self.settings)
             self.start_atlas()
             self.settings_status.set("Loading the atlas…")
@@ -1695,7 +1907,7 @@ class CCFBrowser:
             """OK: load the atlas chosen here if it is a different one, then close (the picture shows "Loading Atlas…")."""
             if self.busy_label:   # the OK button is greyed out while something loads; the window's own X is ignored too
                 return
-            if wanted_atlas() != self.atlas_path and not apply_atlas():
+            if (wanted_atlas() != self.atlas_path or (wanted_atlas() and wanted_flips() != self.loaded_flips))                     and not apply_atlas():
                 return   # the reason is in the status line; the window stays open
             window.destroy()
 
@@ -1775,7 +1987,8 @@ class CCFBrowser:
     def start_atlas(self):
         if self.atlas_path:
             name = Path(self.atlas_path).name
-            self.run_in_thread(f"Loading {name}…", lambda: load_custom_atlas(self.atlas_path), self.atlas_ready,
+            flips = self.loading_flips = self.atlas_flips.get(self.atlas_path, (False, False, False))
+            self.run_in_thread(f"Loading {name}…", lambda: load_custom_atlas(self.atlas_path, flips), self.atlas_ready,
                                overlay="Loading Atlas…")
             return
         base = find_atlas_cache_dir()
@@ -1807,8 +2020,15 @@ class CCFBrowser:
                 self.atlas_path = ''
                 self.start_atlas()
             return
-        self.volume, self.region_table, self.lut = result
+        self.volume, self.region_table, self.lut, self.atlas_info = result
+        previous = tuple(VOLUME_SHAPE), VOXEL_UM
+        set_geometry(self.volume.shape, self.atlas_info['voxel_um'])
+        for name in VIEWS:   # another size of atlas: start in the middle; the same size: keep the places
+            count = VOLUME_SHAPE[VIEW_AXIS[name]]
+            self.slices[name] = count // 2 if previous != (tuple(VOLUME_SHAPE), VOXEL_UM) \
+                else min(max(self.slices[name], 0), count - 1)
         self.loaded_atlas_path = self.atlas_path
+        self.loaded_flips = self.loading_flips if self.atlas_path else (False, False, False)
         self.update_comparison_mode()
         self.label_ids = (self.region_table['region_id'].to_numpy()
                           if self.region_table is not None and 'region_id' in self.region_table else None)
@@ -1832,7 +2052,7 @@ class CCFBrowser:
     def update_comparison_mode(self):
         """Offer the Differences mode (and load the standard CCF to compare with) while an alternate atlas is on
         screen; take both away when the standard atlas itself is."""
-        alternate = bool(self.loaded_atlas_path)
+        alternate = bool(self.loaded_atlas_path) and self.on_ccf_grid   # only the same grid can be compared voxel by voxel
         self.diff_cache = None
         if alternate:
             self.mode_box.configure(values=ATLAS_MODES + DIFF_MODES)
@@ -1860,7 +2080,7 @@ class CCFBrowser:
             self.message.configure(text=f"Could not load the standard CCF for comparison: {error}")
             self.load_next_saved()
             return
-        volume, table, lut = result
+        volume, table, lut = result[:3]
         self.reference = {'volume': volume, 'table': table, 'lut': lut}
         self.diff_cache = None
         self.apply_saturation()
@@ -2358,11 +2578,15 @@ class CCFBrowser:
         return (self.bregma[0] - ap_um / 1000.0, self.bregma[1] - dv_um / 1000.0, ml_um / 1000.0 - self.bregma[2])
 
     def bregma_text(self, ap_um, dv_um, ml_um):
+        if not self.on_ccf_grid:
+            return "Bregma: defined for the CCF only"
         ap, dv, ml = self.bregma_mm(ap_um, dv_um, ml_um)
         return f"Bregma mm: AP {ap:+.3f}   DV {dv:+.3f}   ML {abs(ml):.3f} {'left' if ml >= 0 else 'right'}"
 
     def slice_bregma_text(self):
         """The current slice's position relative to bregma along its own axis, e.g. 'bregma -1.250 mm'."""
+        if not self.on_ccf_grid:
+            return "no bregma"
         value = self.slice_um / 1000.0
         relative = (self.bregma[0] - value, self.bregma[1] - value, value - self.bregma[2])[self.axis]
         return f"bregma {relative:+.3f} mm"
@@ -2479,8 +2703,10 @@ class CCFBrowser:
     def refresh_info_slice(self):
         lines = [(f"{self.view_name} slice {self.slice + 1} of {self.n_slices}   "
                   f"{AXIS_NAMES[self.axis]} {self.slice_um / 1000:.3f} mm   ({self.slice_bregma_text()})", None),
-                 (f"Bregma at CCF mm AP {self.bregma[0]:.3f}, DV {self.bregma[1]:.3f}, ML {self.bregma[2]:.3f} "
-                  "(change in Settings); AP + is anterior, DV + is dorsal", 'dim')]
+                 ((f"Bregma at CCF mm AP {self.bregma[0]:.3f}, DV {self.bregma[1]:.3f}, ML {self.bregma[2]:.3f} "
+                   "(change in Settings); AP + is anterior, DV + is dorsal") if self.on_ccf_grid else
+                  f"Voxels of {VOXEL_UM:g} um; positions are measured from the volume's corner (AP from the front, DV "
+                  "from the top, ML from the right)", 'dim')]
         if self.mode_var.get() in DIFF_MODES:
             compared = self.diff_slice()
             if compared is None:
@@ -2550,8 +2776,8 @@ class CCFBrowser:
             side = 'left' if voxel[2] * VOXEL_UM >= MIDLINE_UM else 'right'
             cursor_lines = [
                 (f"voxel (AP, DV, ML) = ({voxel[0]}, {voxel[1]}, {voxel[2]})   {side} hemisphere", None),
-                (f"CCF mm: AP {position[0] / 1000:.3f}   DV {position[1] / 1000:.3f}   ML {position[2] / 1000:.3f}",
-                 None),
+                (f"{'CCF' if self.on_ccf_grid else 'Atlas'} mm: AP {position[0] / 1000:.3f}   DV {position[1] / 1000:.3f}   "
+                 f"ML {position[2] / 1000:.3f}", None),
                 (self.bregma_text(*position), None),
                 (f"Region {self.region_text(label)}", None)]
             if self.reference is not None and self.loaded_atlas_path:
@@ -2601,6 +2827,7 @@ class CCFBrowser:
                 parent=self.root):
             return
         self.settings['bregma_mm'] = list(self.bregma)
+        self.settings['atlas_flips'] = {k: list(v) for k, v in self.atlas_flips.items()}
         self.settings.update({'follow_info': bool(self.follow_var.get()), 'wheel_zoom': bool(self.wheel_zoom_var.get()), 'atlas_path': self.atlas_path,
                               'alt_atlas_path': self.alt_atlas_path,
                               'brush_radius': self.brush_radius() + 1, 'paint_value': self.paint_value_var.get().strip(), 'view': self.view_name, 'slices': self.slices,
