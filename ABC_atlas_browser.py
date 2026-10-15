@@ -1594,6 +1594,48 @@ THREED_EDGE_REGION_COLORS = ('#ffd166', '#06d6a0', '#ef8354', '#bb86fc')
 # the opacity changes. It also owns group visibility: a legend click hides a group by dropping its triangles, since
 # the groups no longer have a trace each (the legend entries are empty stand-in traces). The sort is by view
 # direction, not true perspective distance, which is plenty for ordering overlapping cells.
+# Several scripts of the page want to answer clicks on the legend (the cells' groups, the envelopes). Plotly takes only ONE
+# decision from all the legend-click handlers (the last one's return value, in practice), so they cannot each register
+# their own: this router, run first, is the only handler, and asks each script's route in turn; a route returns false if
+# it dealt with the click (plotly's own toggle is then skipped), true if the click is not its business. A double click
+# (which would isolate one entry, bypassing the scripts' own bookkeeping) is turned off whenever any route exists.
+THREED_WEB_LEGEND_ROUTER_SCRIPT = """
+(function () {
+  var gd = document.getElementById('{plot_id}');
+  // The busy ("hourglass") cursor: gd.__busyStart() is called the moment a control is used, so the person sees at once that
+  // the click registered, and the cursor goes back to normal when the figure has been quiet for a moment (plotly's events
+  // after each redraw keep it going while the work continues). The first wait covers plotly's own short delay before it acts
+  // on a legend click.
+  var style = document.createElement('style');
+  style.textContent = 'body.three-d-busy, body.three-d-busy * { cursor: wait !important; }';
+  document.head.appendChild(style);
+  var quiet = 0, longest = 0;
+  function busyEnd() { clearTimeout(quiet); clearTimeout(longest); document.body.classList.remove('three-d-busy'); }
+  function keepBusy(delay) {
+    if (!document.body.classList.contains('three-d-busy')) return;
+    clearTimeout(quiet);
+    quiet = setTimeout(busyEnd, delay);
+  }
+  gd.__busyStart = function () {
+    document.body.classList.add('three-d-busy');
+    keepBusy(1000);
+    clearTimeout(longest);
+    longest = setTimeout(busyEnd, 15000);   // never stuck on, whatever happens
+  };
+  ['plotly_afterplot', 'plotly_restyle', 'plotly_relayout'].forEach(function (name) {
+    gd.on(name, function () { keepBusy(450); });
+  });
+  gd.__legendRoutes = [];
+  gd.on('plotly_legendclick', function (e) {
+    var carryOn = true;
+    gd.__legendRoutes.forEach(function (route) { if (route(e) === false) carryOn = false; });
+    return carryOn;
+  });
+  gd.on('plotly_legenddoubleclick', function () { return gd.__legendRoutes.length ? false : true; });
+})();
+"""
+
+
 THREED_WEB_MESH_SCRIPT = """
 (function () {
   var gd = document.getElementById('{plot_id}');
@@ -1617,6 +1659,40 @@ THREED_WEB_MESH_SCRIPT = """
       if (gd.layout.scene) gd.layout.scene.camera = live;
     } catch (err) { /* the layout keeps its own camera */ }
   }
+  // Per-face data, computed once: each face's centre (what the Slice cut tests) and its group (what the legend hides).
+  var faceCx = new Float32Array(faceCount), faceCy = new Float32Array(faceCount), faceCz = new Float32Array(faceCount);
+  var faceGroup = new Uint8Array(faceCount);
+  for (var face = 0; face < faceCount; face++) {
+    var fa = o.i[face], fb = o.j[face], fc = o.k[face];
+    faceCx[face] = (o.x[fa] + o.x[fb] + o.x[fc]) / 3;
+    faceCy[face] = (o.y[fa] + o.y[fb] + o.y[fc]) / 3;
+    faceCz[face] = (o.z[fa] + o.z[fb] + o.z[fc]) / 3;
+    faceGroup[face] = vertexGroup[fa];
+  }
+  // The back-to-front order of ALL the faces for one viewing direction. Hiding a group or moving the Slice cut only
+  // removes faces from this order, never reorders the rest, so it is computed once per direction and filtered after that
+  // (a slider drag then costs a pass over the faces, not a sort). The sort itself packs each face's depth and index into
+  // one number so the browser's native numeric sort can do it, far faster than a comparator function.
+  var sortedAll = null, sortedDirection = null;
+  function sortAll(ex, ey, ez) {
+    var depth = new Float64Array(vertexCount);
+    for (var v = 0; v < vertexCount; v++) depth[v] = o.x[v] * ex + o.y[v] * ey + o.z[v] * ez;
+    var key = new Float64Array(faceCount), low = Infinity, high = -Infinity;
+    for (var f = 0; f < faceCount; f++) {
+      var d = depth[o.i[f]] + depth[o.j[f]] + depth[o.k[f]];
+      key[f] = d;
+      if (d < low) low = d;
+      if (d > high) high = d;
+    }
+    var bits = Math.ceil(Math.log2(faceCount + 1)), shift = Math.pow(2, bits), top = Math.pow(2, 53 - bits) - 1;
+    var scale = high > low ? top / (high - low) : 0;
+    var packed = new Float64Array(faceCount);
+    for (var g = 0; g < faceCount; g++) packed[g] = Math.floor((key[g] - low) * scale) * shift + g;
+    packed.sort();   // far (small) first, near drawn last
+    var order = new Uint32Array(faceCount);
+    for (var n = 0; n < faceCount; n++) order[n] = packed[n] - Math.floor(packed[n] / shift) * shift;
+    return order;
+  }
   function rebuild(force) {
     var scene = gd._fullLayout.scene || {};
     var camera = scene.camera || {eye: {x: 1.25, y: 1.25, z: 1.25}, center: {x: 0, y: 0, z: 0}};
@@ -1630,24 +1706,26 @@ THREED_WEB_MESH_SCRIPT = """
         direction[2] * lastDirection[2] > 0.99999) return;
     lastDirection = direction;
     var translucent = gd._fullData[meshIndex].opacity < 1;
-    var keep = [], drop = gd.__sliceDrop;  // drop: set by the Slice checkbox's script, else absent
-    for (var f = 0; f < faceCount; f++) {
-      if (hidden[vertexGroup[o.i[f]]]) continue;
-      if (drop && drop((o.x[o.i[f]] + o.x[o.j[f]] + o.x[o.k[f]]) / 3, (o.y[o.i[f]] + o.y[o.j[f]] + o.y[o.k[f]]) / 3,
-                       (o.z[o.i[f]] + o.z[o.j[f]] + o.z[o.k[f]]) / 3)) continue;
-      keep.push(f);
-    }
+    if (!force && !translucent) return;   // opaque cells need no re-sorting: a camera move changes nothing here
+    var base = null;
     if (translucent) {
-      var depth = new Float64Array(vertexCount);
-      for (var v = 0; v < vertexCount; v++) depth[v] = o.x[v] * ex + o.y[v] * ey + o.z[v] * ez;
-      var key = new Float64Array(faceCount);
-      for (var n = 0; n < keep.length; n++) { var g = keep[n]; key[g] = depth[o.i[g]] + depth[o.j[g]] + depth[o.k[g]]; }
-      var order = Uint32Array.from(keep);
-      order.sort(function (a, b) { return key[a] - key[b]; });  // far (small) first, near drawn last
-      keep = order;
+      if (!sortedAll || sortedDirection[0] * direction[0] + sortedDirection[1] * direction[1] +
+          sortedDirection[2] * direction[2] < 0.99999) {
+        sortedAll = sortAll(ex, ey, ez);
+        sortedDirection = direction;
+      }
+      base = sortedAll;
     }
-    var ni = new Int32Array(keep.length), nj = new Int32Array(keep.length), nk = new Int32Array(keep.length);
-    for (var m = 0; m < keep.length; m++) { var src = keep[m]; ni[m] = o.i[src]; nj[m] = o.j[src]; nk[m] = o.k[src]; }
+    var cut = gd.__sliceCut;   // {side, x, y, z} while the Slice checkbox is ticked, else absent
+    var keep = new Uint32Array(faceCount), count = 0;
+    for (var n = 0; n < faceCount; n++) {
+      var f = base ? base[n] : n;
+      if (hidden[faceGroup[f]]) continue;
+      if (cut && (cut.side * (faceCx[f] - cut.x) < 0 || faceCy[f] < cut.y || faceCz[f] < cut.z)) continue;
+      keep[count++] = f;
+    }
+    var ni = new Int32Array(count), nj = new Int32Array(count), nk = new Int32Array(count);
+    for (var m = 0; m < count; m++) { var src = keep[m]; ni[m] = o.i[src]; nj[m] = o.j[src]; nk[m] = o.k[src]; }
     busy = true;
     syncCamera();
     Plotly.restyle(gd, {i: [ni], j: [nj], k: [nk]}, [meshIndex]).then(function () { busy = false; }, function () { busy = false; });
@@ -1657,6 +1735,7 @@ THREED_WEB_MESH_SCRIPT = """
     clearTimeout(timer);
     timer = setTimeout(function () { var f = forced; forced = false; rebuild(f); }, 60);
   }
+  gd.__cellsTranslucent = function () { return gd._fullData[meshIndex].opacity < 1; };   // (the Spin button asks)
   gd.__rebuildCells = function () { rebuild(true); };  // the Slice checkbox's script calls this when its cut moves
   gd.on('plotly_relayout', function (e) {
     if (busy || !e) return;
@@ -1666,7 +1745,7 @@ THREED_WEB_MESH_SCRIPT = """
     if (busy || !e || !e[0]) return;
     if ('opacity' in e[0] && (!e[1] || e[1].indexOf(meshIndex) >= 0)) schedule();
   });
-  gd.on('plotly_legendclick', function (e) {
+  gd.__legendRoutes.push(function (e) {   // (see THREED_WEB_LEGEND_ROUTER_SCRIPT)
     var group = legendIndices.indexOf(e.curveNumber);
     if (group < 0) return true;  // outline / cloud entries keep the normal toggle
     hidden[group] = !hidden[group];
@@ -1674,7 +1753,6 @@ THREED_WEB_MESH_SCRIPT = """
     schedule();
     return false;
   });
-  gd.on('plotly_legenddoubleclick', function () { return false; });  // isolate-on-double-click would bypass `hidden`
 })();
 """
 
@@ -1690,6 +1768,7 @@ THREED_WEB_EDGE_SCRIPT = """
   var modes = [['cloud', 'Cloud'], ['lines', 'Lines']];
   if (roles.surfaces.length) modes.push(['surfaces', 'Surfaces']);
   var box = document.createElement('div');
+  box.className = 'background-box';   // THREED_WEB_SPIN_SCRIPT adds its button to this box
   box.style.cssText = 'position:absolute;left:14px;top:46px;z-index:20;padding:6px 10px;' +
     'background:rgba(29,32,41,0.88);color:#e6e8ee;border:1px solid #3a3f4d;border-radius:6px;font:12px sans-serif;';
   box.appendChild(document.createTextNode('Background: '));
@@ -1710,7 +1789,10 @@ THREED_WEB_EDGE_SCRIPT = """
     label.style.cssText = 'margin-right:10px;cursor:pointer;';
     var radio = document.createElement('input');
     radio.type = 'radio'; radio.name = 'background-mode'; radio.checked = mode[0] === '__DEFAULT__';
-    radio.addEventListener('change', function () { apply(mode[0]); });
+    radio.addEventListener('change', function () {   // the button is painted first, then the (slow) redraw
+      if (gd.__busyStart) gd.__busyStart();
+      setTimeout(function () { apply(mode[0]); }, 30);
+    });
     label.appendChild(radio);
     label.appendChild(document.createTextNode(' ' + mode[1]));
     box.appendChild(label);
@@ -1728,7 +1810,7 @@ THREED_WEB_EDGE_SCRIPT = """
 # Opening positions: the coronal plane at the anterior edge and the horizontal plane at the dorsal edge of the plotted
 # range (so they hide nothing) and the sagittal plane at the brain's midline (5.7 mm), which hides the near half.
 # Plotly has no clipping planes, so the page re-filters the geometry itself: triangles whose centre is cut away are
-# dropped from the shell meshes (and from the cells' mesh, through gd.__sliceDrop, see THREED_WEB_MESH_SCRIPT), and
+# dropped from the shell meshes (and from the cells' mesh, through gd.__sliceCut, see THREED_WEB_MESH_SCRIPT), and
 # points that are cut away are blanked in the line and marker traces.
 THREED_WEB_SLICE_SCRIPT = """
 (function () {
@@ -1739,9 +1821,12 @@ THREED_WEB_SLICE_SCRIPT = """
     if (index === cellMesh || !t.x || t.x.length < 2) return;
     if (t.type === 'mesh3d') {
       traces.push({index: index, kind: 'mesh', x: t.x, y: t.y, z: t.z, i: Int32Array.from(t.i), j: Int32Array.from(t.j),
-                   k: Int32Array.from(t.k)});
+                   k: Int32Array.from(t.k), lastKept: -1, modified: false});
     } else if (t.type === 'scatter3d') {
-      traces.push({index: index, kind: 'points', x: Array.from(t.x), y: Array.from(t.y), z: Array.from(t.z)});
+      // A marker-only trace can simply lose its cut points (fewer points to send is faster), together with their hover
+      // text; a line trace needs its gaps, so there the cut points are blanked instead.
+      traces.push({index: index, kind: 'points', x: Array.from(t.x), y: Array.from(t.y), z: Array.from(t.z), lastKept: -1,
+                   modified: false, compact: t.mode === 'markers', text: t.text ? Array.from(t.text) : null});
     }
   });
 
@@ -1822,42 +1907,74 @@ THREED_WEB_SLICE_SCRIPT = """
     input.style.cssText = 'width:170px;margin:3px 0 0 0;display:block;';
     function label() { text.textContent = name + ': ' + position[axis].toFixed(2) + ' mm'; }
     label();
-    input.addEventListener('input', function () { position[axis] = parseFloat(input.value); label(); request(); });
+    input.addEventListener('input', function () { position[axis] = parseFloat(input.value); label(); sliderMoved(); });
     row.appendChild(text); row.appendChild(input); sliderRows.appendChild(row);
   });
   box.appendChild(checkboxLabel); box.appendChild(sliderRows);
 
-  // --- re-filtering the geometry (one pass at a time; a slider moved meanwhile triggers one more pass afterwards)
-  var active = false, busy = false, pending = false, timer = 0;
-  function apply(restore) {
-    var meshes = {i: [], j: [], k: []}, meshIds = [], points = {x: [], y: [], z: []}, pointIds = [];
+  // --- re-filtering the geometry (one pass at a time; a slider moved meanwhile triggers one more pass afterwards).
+  // What makes a drag quick: (1) each shell's face centres are computed once; (2) an object that is not drawn (switched off in
+  // the legend) is skipped, and brought up to date when it is switched on; (3) an object whose kept set did not change (the
+  // plane is not crossing it) is not sent to plotly at all, since pushing a mesh to the graphics card is the slow part;
+  // (4) the big shell meshes are only updated once the slider has been still for a moment, while the cells follow the
+  // slider at once (the cells' own mesh is filtered by THREED_WEB_MESH_SCRIPT through gd.__sliceCut).
+  var active = false, busy = false, pending = false, timer = 0, heavyReady = true, heavyTimer = 0;
+  var cutState = {side: 1, x: 0, y: 0, z: 0};
+  function centres(t) {
+    if (t.cx) return;
+    var n = t.i.length;
+    t.cx = new Float32Array(n); t.cy = new Float32Array(n); t.cz = new Float32Array(n);
+    for (var f = 0; f < n; f++) {
+      var a = t.i[f], b = t.j[f], c = t.k[f];
+      t.cx[f] = (t.x[a] + t.x[b] + t.x[c]) / 3; t.cy[f] = (t.y[a] + t.y[b] + t.y[c]) / 3; t.cz[f] = (t.z[a] + t.z[b] + t.z[c]) / 3;
+    }
+  }
+  function apply(restore, withMeshes) {
+    cutState.side = farSide; cutState.x = position[0]; cutState.y = position[1]; cutState.z = position[2];
+    gd.__sliceCut = restore ? null : cutState;
+    var meshes = {i: [], j: [], k: []}, meshIds = [], points = {x: [], y: [], z: [], text: []}, pointIds = [];
     traces.forEach(function (t) {
+      if (restore) {   // put back whatever was filtered
+        if (!t.modified) return;
+        t.modified = false; t.lastKept = -1;
+        if (t.kind === 'mesh') { meshes.i.push(t.i); meshes.j.push(t.j); meshes.k.push(t.k); meshIds.push(t.index); }
+        else { points.x.push(t.x); points.y.push(t.y); points.z.push(t.z); points.text.push(t.text); pointIds.push(t.index); }
+        return;
+      }
+      if (gd._fullData[t.index].visible !== true) { t.lastKept = -1; return; }   // not drawn: updated when switched on
       if (t.kind === 'mesh') {
-        var ni = t.i, nj = t.j, nk = t.k;
-        if (!restore) {
-          var keep = [];
-          for (var f = 0; f < t.i.length; f++) {
-            var a = t.i[f], b = t.j[f], c = t.k[f];
-            if (!cutAway((t.x[a] + t.x[b] + t.x[c]) / 3, (t.y[a] + t.y[b] + t.y[c]) / 3, (t.z[a] + t.z[b] + t.z[c]) / 3)) keep.push(f);
-          }
-          ni = new Int32Array(keep.length); nj = new Int32Array(keep.length); nk = new Int32Array(keep.length);
-          for (var m = 0; m < keep.length; m++) { ni[m] = t.i[keep[m]]; nj[m] = t.j[keep[m]]; nk[m] = t.k[keep[m]]; }
+        if (!withMeshes) return;
+        centres(t);
+        var n = t.i.length, keep = new Uint32Array(n), count = 0;
+        for (var f = 0; f < n; f++) {
+          if (!(cutState.side * (t.cx[f] - cutState.x) < 0 || t.cy[f] < cutState.y || t.cz[f] < cutState.z)) keep[count++] = f;
         }
+        if (count === t.lastKept) return;   // the same faces as already shown
+        var ni = new Int32Array(count), nj = new Int32Array(count), nk = new Int32Array(count);
+        for (var m = 0; m < count; m++) { ni[m] = t.i[keep[m]]; nj[m] = t.j[keep[m]]; nk[m] = t.k[keep[m]]; }
+        t.lastKept = count; t.modified = true;
         meshes.i.push(ni); meshes.j.push(nj); meshes.k.push(nk); meshIds.push(t.index);
       } else {
-        var nx = t.x, ny = t.y, nz = t.z;
-        if (!restore) {
-          nx = new Array(t.x.length); ny = new Array(t.x.length); nz = new Array(t.x.length);
-          for (var q = 0; q < t.x.length; q++) {
-            var x = t.x[q], y = t.y[q], z = t.z[q];
-            var blank = x === null || y === null || z === null || cutAway(x, y, z);
-            nx[q] = blank ? null : x; ny[q] = blank ? null : y; nz[q] = blank ? null : z;
+        var total = t.x.length, nx = [], ny = [], nz = [], nt = t.text ? [] : null, blanked = 0;
+        for (var q = 0; q < total; q++) {
+          var x = t.x[q], y = t.y[q], z = t.z[q];
+          var blank = x === null || y === null || z === null || cutState.side * (x - cutState.x) < 0 ||
+                      y < cutState.y || z < cutState.z;
+          if (blank) {
+            blanked++;
+            if (t.compact) continue;
+            nx.push(null); ny.push(null); nz.push(null);
+            if (nt) nt.push(t.text[q]);
+          } else {
+            nx.push(x); ny.push(y); nz.push(z);
+            if (nt) nt.push(t.text[q]);
           }
         }
-        points.x.push(nx); points.y.push(ny); points.z.push(nz); pointIds.push(t.index);
+        if (blanked === t.lastKept) return;
+        t.lastKept = blanked; t.modified = true;
+        points.x.push(nx); points.y.push(ny); points.z.push(nz); points.text.push(nt); pointIds.push(t.index);
       }
     });
-    gd.__sliceDrop = restore ? null : function (x, y, z) { return cutAway(x, y, z); };
     busy = true;
     syncCamera();
     var jobs = [];
@@ -1867,11 +1984,33 @@ THREED_WEB_SLICE_SCRIPT = """
     function done() { busy = false; if (pending) { pending = false; request(); } }
     Promise.all(jobs).then(done, done);
   }
-  function run() { timer = 0; if (!active) return; if (busy) { pending = true; return; } apply(false); }
+  function run() { timer = 0; if (!active) return; if (busy) { pending = true; return; } apply(false, heavyReady); }
   function request() { if (active && !timer) timer = setTimeout(run, 40); }
+  function sliderMoved() {   // the shells wait until the slider has been still for a moment
+    heavyReady = false;
+    clearTimeout(heavyTimer);
+    heavyTimer = setTimeout(function () { heavyReady = true; request(); }, 180);
+    request();
+  }
+  gd.__sliceReload = function (indices) {   // some meshes were given new geometry: take it as their original
+    traces.forEach(function (t) {
+      if (indices.indexOf(t.index) < 0 || t.kind !== 'mesh') return;
+      var full = gd._fullData[t.index];
+      t.x = full.x; t.y = full.y; t.z = full.z;
+      t.i = Int32Array.from(full.i); t.j = Int32Array.from(full.j); t.k = Int32Array.from(full.k);
+      t.cx = null; t.lastKept = -1; t.modified = false;
+    });
+    if (active) { heavyReady = true; request(); }
+  };
+  gd.on('plotly_restyle', function (e) {   // an object was switched on or off: bring the newly drawn ones up to date
+    if (active && e && e[0] && 'visible' in e[0]) { heavyReady = true; request(); }
+  });
 
   gd.on('plotly_relayout', function (e) {   // the camera moved: the far side of the sagittal plane may have changed
-    if (active && e && Object.keys(e).some(function (key) { return key.indexOf('scene.camera') === 0; })) {
+    // With opaque cells (100% opacity) the cut keeps the side chosen when Slice was ticked, so a camera move costs no
+    // redraw at all; the far side follows the camera only while the cells are translucent.
+    var translucent = !!(gd.__cellsTranslucent && gd.__cellsTranslucent());
+    if (active && translucent && e && Object.keys(e).some(function (key) { return key.indexOf('scene.camera') === 0; })) {
       [120, 600].forEach(function (delay) {   // (plotly updates its matrices just after the event, when it next paints)
         setTimeout(function () { if (active && updateSide()) request(); }, delay);
       });
@@ -1879,12 +2018,188 @@ THREED_WEB_SLICE_SCRIPT = """
   });
   checkbox.addEventListener('change', function () {
     active = checkbox.checked;
+    gd.__sliceOn = active;   // (the Spin button asks)
     if (active) updateSide();
     sliderRows.style.display = active ? 'block' : 'none';
-    if (active) request(); else { clearTimeout(timer); timer = 0; apply(true); }
+    if (gd.__busyStart) gd.__busyStart();
+    if (active) { heavyReady = true; request(); } else { clearTimeout(timer); timer = 0; setTimeout(function () { apply(true, true); }, 30); }
   });
   gd.style.position = 'relative';
   gd.appendChild(box);
+})();
+"""
+
+
+# The "Spin" button, to the right of the Background radio buttons: while it is on, the camera turns smoothly around the
+# vertical axis (the azimuth advances, the angle above the horizontal and the distance stay as they are, so the user's own
+# tilt and zoom are kept, and a drag or scroll in between simply carries on from there) until the button is clicked again.
+# The frames set the live camera directly (plotly's scene.setViewport) rather than through Plotly.relayout, which would redraw the
+# whole figure and run the page's other camera handlers on every frame; the layout's camera is brought up to date with
+# a cheap camera event now and then, only while the cells are translucent (so the depth order and the Slice view's far side follow), and a proper relayout when the spin stops.
+THREED_WEB_SPIN_SCRIPT = """
+(function () {
+  var gd = document.getElementById('{plot_id}');
+  var SECONDS_PER_TURN = 24;
+  var scene = gd._fullLayout.scene._scene;
+  var box = gd.querySelector('.background-box');
+  if (!box) {   // a page without background shells has no radio box: make one for the button alone
+    box = document.createElement('div');
+    box.style.cssText = 'position:absolute;left:14px;top:46px;z-index:20;padding:6px 10px;' +
+      'background:rgba(29,32,41,0.88);color:#e6e8ee;border:1px solid #3a3f4d;border-radius:6px;font:12px sans-serif;';
+    gd.style.position = 'relative';
+    gd.appendChild(box);
+  }
+  var button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = 'Spin';
+  var IDLE = 'margin-left:6px;padding:1px 10px;font:12px sans-serif;cursor:pointer;border-radius:4px;' +
+    'background:#2b2f3b;color:#e6e8ee;border:1px solid #5a6072;';
+  var ACTIVE = IDLE.replace('background:#2b2f3b', 'background:#3b6fd4').replace('#5a6072', '#8fb0ff');
+  button.style.cssText = IDLE;
+  box.appendChild(button);
+
+  var spinning = false, last = 0, lastSync = 0;
+  // Toggling an object (a legend click, a radio button) makes plotly re-plot the scene from the camera stored in the
+  // layout, which is stale while the spin runs, so the view would jump back to where the spin began. The live camera is
+  // handed to the layout just before any such change.
+  function adoptLiveCamera() {
+    try {
+      var live = scene.getCamera();
+      gd._fullLayout.scene.camera = live;
+      if (gd.layout.scene) gd.layout.scene.camera = live;
+    } catch (err) { /* the layout keeps its own camera */ }
+  }
+  // (A press on the legend is caught as a DOM event rather than with gd.on('plotly_legendclick'): plotly takes the LAST
+  // legend-click handler's return value to decide whether to go on with its own toggle, and a handler returning nothing
+  // here overrode the cells' handler (THREED_WEB_MESH_SCRIPT) that cancels it, so a group switched off came straight back.)
+  gd.addEventListener('mousedown', function (event) {
+    if (event.target && event.target.closest && event.target.closest('.legend')) adoptLiveCamera();
+  }, true);
+  ['restyle', 'relayout', 'update'].forEach(function (name) {
+    var original = Plotly[name];
+    Plotly[name] = function () { adoptLiveCamera(); return original.apply(this, arguments); };
+  });
+  function syncLayout(full) {   // hand the live camera to the layout and let the page's camera handlers run
+    var live = scene.getCamera();
+    if (full) { Plotly.relayout(gd, {'scene.camera': live}); return; }
+    gd._fullLayout.scene.camera = live;   // cheap: no redraw, just the camera event the handlers listen to
+    if (gd.layout.scene) gd.layout.scene.camera = live;
+    gd.emit('plotly_relayout', {'scene.camera': live});
+  }
+  // The cells' back-to-front sort (and, with Slice on, the cut's far side) matters only while the cells are translucent, and
+  // the envelopes' own sort only while one is switched on, so
+  // that is the only reason to catch up while spinning (like a mouse drag, which catches up when it ends). With opaque
+  // cells nothing is done per frame beyond moving the camera, which is what keeps the spin smooth.
+  function needsCatchUp() {
+    return !!(gd.__cellsTranslucent && gd.__cellsTranslucent()) || !!(gd.__envelopesNeedSort && gd.__envelopesNeedSort());
+  }
+  function frame(now) {
+    if (!spinning) return;
+    var dt = Math.min(0.1, (now - last) / 1000);
+    last = now;
+    var camera = scene.getCamera(), c = camera.center, e = camera.eye;
+    var dx = e.x - c.x, dy = e.y - c.y, angle = 2 * Math.PI * dt / SECONDS_PER_TURN;
+    var cos = Math.cos(angle), sin = Math.sin(angle);
+    scene.setViewport({camera: {eye: {x: c.x + dx * cos - dy * sin, y: c.y + dx * sin + dy * cos, z: e.z},
+                                center: c, up: camera.up, projection: camera.projection},
+                       aspectratio: gd._fullLayout.scene.aspectratio});
+    if (now - lastSync > 700 && needsCatchUp()) { lastSync = now; syncLayout(false); }
+    requestAnimationFrame(frame);
+  }
+  button.addEventListener('click', function () {
+    spinning = !spinning;
+    button.style.cssText = spinning ? ACTIVE : IDLE;
+    if (spinning) {
+      last = performance.now(); lastSync = last;
+      requestAnimationFrame(frame);
+    } else {
+      syncLayout(true);
+    }
+  });
+})();
+"""
+
+
+# A cell group switched off in the legend has its dot drawn as an open circle in its own colour (so "off" does not depend on
+# how bright the colour was to begin with). The legend's swatches for the background objects (the surfaces, the line edges
+# in Lines mode, the envelopes) are faint, since they take the objects' own low opacity, so switching one on or off barely
+# changed them: each is now drawn as a square in the object's own colour, filled while it is on and open while it is off.
+# Drawn over plotly's own legend after every plot (plotly redraws the legend itself, which would drop anything added before).
+THREED_WEB_LEGEND_MARK_SCRIPT = """
+(function () {
+  var gd = document.getElementById('{plot_id}');
+  var SVG = 'http://www.w3.org/2000/svg';
+  function mark(parent, tag, attributes) {
+    var element = document.createElementNS(SVG, tag);
+    Object.keys(attributes).forEach(function (key) { element.setAttribute(key, attributes[key]); });
+    element.setAttribute('class', 'legend-mark');
+    element.style.pointerEvents = 'none';
+    parent.appendChild(element);
+  }
+  // A click on a legend entry is acted on by plotly only after its short wait for a possible double click, and then after the
+  // redraw: so the entry is switched in the picture AT ONCE, ahead of the real state (`pending`: trace number -> state),
+  // and the real state takes over when the redraw is done (or after a moment, if the click turned out not to count).
+  var pending = {};
+  function shownState(trace) { return pending[trace.index] !== undefined ? pending[trace.index] : trace.visible; }
+  function decorate() {
+    Array.prototype.forEach.call(gd.querySelectorAll('.legend g.traces'), function (group) {
+      var data = group.__data__, trace = data && data[0] && data[0].trace;
+      if (trace && /^[\\u200b\\s]*$/.test(trace.name || '')) {   // a blank-named stand-in trace: just a gap between legend groups
+        group.style.setProperty('visibility', 'hidden');
+        return;
+      }
+      if (trace && pending[trace.index] !== undefined) {
+        if (pending[trace.index] === trace.visible) delete pending[trace.index];   // the real state has caught up
+        else group.style.opacity = pending[trace.index] === 'legendonly' ? 0.5 : 1;
+      }
+      Array.prototype.forEach.call(group.querySelectorAll('.legend-mark'), function (old) { old.remove(); });
+      if (trace && !/ (surface|edges|envelope)$/.test(trace.name || '') && trace.marker &&
+          typeof trace.marker.color === 'string') {
+        // A cell group: its dot becomes an open circle in its own colour while the group is switched off.
+        Array.prototype.forEach.call(group.querySelectorAll('.legendpoints path'), function (dot) {
+          var saved = dot.getAttribute('data-original-style');
+          if (shownState(trace) === 'legendonly') {
+            if (saved === null) dot.setAttribute('data-original-style', dot.getAttribute('style') || '');
+            dot.style.setProperty('fill', 'none', 'important');
+            dot.style.setProperty('stroke', trace.marker.color, 'important');
+            dot.style.setProperty('stroke-width', '2px', 'important');
+          } else if (saved !== null) {   // switched back on: put back exactly what plotly had drawn
+            dot.setAttribute('style', saved);
+            dot.removeAttribute('data-original-style');
+          }
+        });
+        return;
+      }
+      if (!trace || !/ (surface|edges|envelope)$/.test(trace.name || '')) return;
+      // A background object (surface, edges, envelope): plotly's own swatch is replaced by a square in the object's own
+      // colour, filled while it is on and open (outline only) while it is off, like the cell groups' dot and open circle.
+      var color = (typeof trace.color === 'string' && trace.color) || (trace.line && trace.line.color) ||
+                  (trace.marker && typeof trace.marker.color === 'string' && trace.marker.color) || '#c9d1e0';
+      var layers = group.querySelector('.layers');
+      if (layers) layers.style.setProperty('display', 'none');
+      var swatch = group.querySelector('.legendpoints'), box = swatch && swatch.getBBox ? swatch.getBBox() : null;
+      var size = 12, x = box && box.width ? box.x : 14, y = box && box.height ? box.y : -6;
+      var off = shownState(trace) === 'legendonly';
+      mark(group, 'rect', {x: x + 1, y: y + 1, width: size - 2, height: size - 2, rx: 2, ry: 2,
+                           fill: off ? 'none' : color, stroke: color, 'stroke-width': 1.6});
+    });
+  }
+  gd.on('plotly_afterplot', decorate);
+  gd.on('plotly_restyle', function () { setTimeout(decorate, 0); });
+  // (On the press, not the 'click' event: plotly puts a cover over the page while the mouse is down and takes the release
+  // itself, so the browser never sends the toggle a 'click' of its own.)
+  gd.addEventListener('mousedown', function (event) {   // (capture phase: before plotly's own handling of the press)
+    if (event.button !== 0) return;
+    var toggle = event.target && event.target.closest && event.target.closest('.legendtoggle');
+    var group = toggle && toggle.closest('g.traces'), data = group && group.__data__;
+    var trace = data && data[0] && data[0].trace;
+    if (!trace || trace.index === undefined) return;
+    pending[trace.index] = shownState(trace) === 'legendonly' ? true : 'legendonly';
+    decorate();
+    if (gd.__busyStart) gd.__busyStart();
+    setTimeout(function () { delete pending[trace.index]; decorate(); }, 2500);   // (a click that did not count: back to the truth)
+  }, true);
+  decorate();
 })();
 """
 
@@ -1897,33 +2212,172 @@ THREED_WEB_BACKGROUND_DEFAULT = 0.2
 THREED_WEB_BRAIN_SURFACE_DEFAULT = 0.5
 THREED_WEB_SLIDER_ROW_PX = 36   # height of one slider row at the bottom of the page
 
-# A 0-100% slider for the brain shell's base opacity, drawn as a plain control that sits in the same stack as the two
-# plotly sliders, above them (the page layout reserves the room: see write_3d_group_html).
-THREED_WEB_BRAIN_SURFACE_SCRIPT = """
+# The opacity controls at the bottom-left, top to bottom: Brain surface, Background and Cell opacity, all the same kind of
+# control (a plain 0-100% slider that updates the figure as it is dragged, with 100% at the right end). Background scales
+# every background trace (cloud, wall outlines, edges, shells) from its own 100% look; Brain surface sets the brain shell's
+# own base, and the shell's opacity is that base x the Background slider's factor (so the defaults give the shell
+# 0.5 x 0.2 = 10%); Cell opacity sets the cells' traces and also scales the cell groups' envelope surfaces, which have
+# their own Envelope opacity slider (up to 100%) and two sliders, cells inside and smoothness, that swap in another
+# precomputed surface. Changes are batched (at most one redraw every few dozen ms).
+THREED_WEB_OPACITY_SCRIPT = """
 (function () {
   var gd = document.getElementById('{plot_id}');
-  var index = __BRAIN_INDEX__, base = __BASE__, factor = __FACTOR__;
-  var box = document.createElement('div');
-  box.style.cssText = 'position:absolute;left:calc(2% + 2px);bottom:__BOTTOM__px;z-index:20;color:#e6e8ee;' +
-    'font:11px sans-serif;';
-  var text = document.createElement('div');
-  var input = document.createElement('input');
-  input.type = 'range'; input.min = 0; input.max = 100; input.step = 1; input.value = Math.round(base * 100);
-  input.style.cssText = 'width:150px;margin:3px 0 0 0;display:block;';
-  box.appendChild(text); box.appendChild(input);
-  function label() { text.textContent = 'Brain surface opacity: ' + Math.round(base * 100) + '%'; }
-  function apply() {
+  var config = __CONFIG__;   // {cells: [trace indices], envelopes: {mesh, standIns, colors, base, levels, ...} | null, background, brain}
+  var env = config.envelopes;
+  var state = {cells: 1.0, background: config.background ? config.background.value : 1.0,
+               brain: config.brain ? config.brain.value : 1.0, envelope: env ? env.base : 1.0,
+               coverage: env ? env.defaultCoverage : 0, smooth: env ? env.defaultSmooth : 0};
+  var dirty = {}, timer = 0;
+  var stack = document.createElement('div');
+  stack.style.cssText = 'position:absolute;right:14px;bottom:10px;z-index:20;color:#e6e8ee;font:11px sans-serif;';
+  function addSlider(title, key, options) {
+    options = options || {};
+    var block = document.createElement('div');
+    block.style.cssText = 'height:__ROW__px;';
+    var text = document.createElement('div');
+    var input = document.createElement('input');
+    input.type = 'range'; input.step = 1;
+    input.min = options.min !== undefined ? options.min : 0;
+    input.max = options.max !== undefined ? options.max : 100;
+    input.value = options.toSlider ? options.toSlider(state[key]) : Math.round(state[key] * 100);
+    input.style.cssText = 'width:150px;margin:3px 0 0 0;display:block;';
+    function label() { text.textContent = title + ': ' + (options.show ? options.show(state[key]) : Math.round(state[key] * 100) + '%'); }
+    input.addEventListener('input', function () {
+      state[key] = options.fromSlider ? options.fromSlider(parseInt(input.value, 10)) : input.value / 100;
+      label(); dirty[key] = true;
+      if (!timer) timer = setTimeout(flush, 30);
+    });
     label();
-    Plotly.restyle(gd, {opacity: base * factor}, [index]);
+    block.appendChild(text); block.appendChild(input); stack.appendChild(block);
   }
-  input.addEventListener('input', function () { base = input.value / 100; apply(); });
-  gd.on('plotly_sliderchange', function (e) {
-    var prefix = e && e.slider && e.slider.currentvalue ? e.slider.currentvalue.prefix : '';
-    if (prefix.indexOf('Background') === 0) { factor = parseFloat(e.step.label) / 100; setTimeout(apply, 80); }
-  });
-  label();
+  function flush() {
+    timer = 0;
+    var changed = dirty; dirty = {};
+    if (changed.background) {
+      var b = config.background;
+      var opacities = b.indices.map(function (index, n) {
+        return config.brain && index === config.brain.index ? state.brain * state.background
+                                                            : Math.round(state.background * b.bases[n] * 1000) / 1000;
+      });
+      Plotly.restyle(gd, {opacity: opacities}, b.indices);
+    } else if (changed.brain) {
+      Plotly.restyle(gd, {opacity: state.brain * (config.background ? state.background : 1)}, [config.brain.index]);
+    }
+    if (changed.cells && config.cells.length) Plotly.restyle(gd, {opacity: state.cells}, config.cells);
+    if ((changed.cells || changed.envelope) && env) {   // the envelopes' opacity is their own slider's value times the cells'
+      Plotly.restyle(gd, {opacity: Math.round(state.envelope * state.cells * 1000) / 1000}, [env.mesh]);
+      relistEnvelopes(false);   // (see-through envelopes list only their near-facing triangles)
+    }
+    if ((changed.coverage || changed.smooth) && env) {   // swap every envelope's surface for the chosen pair's
+      loadShapes();
+      relistEnvelopes(true);
+    }
+  }
+  // --- the envelopes: one mesh holding every envelope (a colour per vertex), its triangles listed far to near.
+  // Plotly draws a translucent mesh's triangles in the order they are listed, so with the listing as the surface-maker left
+  // it a nearer part can be painted before a farther one and end up hidden by it; and separate traces would be painted
+  // one after another whatever their depth. So the triangles of every switched-on envelope are re-listed together, far to
+  // near for the current viewing direction, whenever the camera has stopped moving, an envelope is switched on or off,
+  // or a surface is swapped. The Slice cut, if on, takes the re-listed mesh as its own starting point (gd.__sliceReload).
+  var shapes = [], offsets = [], shown = env ? env.colors.map(function () { return false; }) : [];
+  var merged = null, sortTimer = 0;
+  function loadShapes() {   // every envelope's surface at the chosen coverage and smoothness, merged into one set of vertices
+    var x = [], y = [], z = [], color = [];
+    offsets = [];
+    shapes = env.levels.map(function (rows, g) {
+      var row = rows[Math.min(state.smooth, rows.length - 1)], mesh = row[Math.min(state.coverage, row.length - 1)];
+      offsets.push(x.length);
+      for (var v = 0; v < mesh.x.length; v++) { x.push(mesh.x[v]); y.push(mesh.y[v]); z.push(mesh.z[v]); color.push(env.colors[g]); }
+      return {x: mesh.x, y: mesh.y, z: mesh.z, i: Int32Array.from(mesh.i), j: Int32Array.from(mesh.j), k: Int32Array.from(mesh.k)};
+    });
+    merged = {x: x, y: y, z: z, color: color};
+  }
+  function viewDirection() {
+    var camera = gd._fullLayout.scene._scene.getCamera();
+    var flipZ = gd.layout.scene && gd.layout.scene.zaxis && gd.layout.scene.zaxis.autorange === 'reversed' ? -1 : 1;
+    return [camera.eye.x - camera.center.x, camera.eye.y - camera.center.y, (camera.eye.z - camera.center.z) * flipZ];
+  }
+  // While an envelope is see-through its far side only confuses the picture (it is drawn behind, yet plotly's blending lets it
+  // show through and, where the two sides overlap, appear to cover the near one), so then only the triangles facing the
+  // viewer are listed. Which way is "facing" depends on how the surface-maker wound its triangles and on the axis flips, so
+  // it is found from the surface itself: the nearest few percent of its triangles must be facing the viewer.
+  function visibleFaces(g, direction, cull, out) {   // appends envelope g's listed triangles (merged vertex numbers) and depths to out
+    var shape = shapes[g], vertexCount = shape.x.length, faceCount = shape.i.length, depth = new Float64Array(vertexCount);
+    for (var v = 0; v < vertexCount; v++) depth[v] = shape.x[v] * direction[0] + shape.y[v] * direction[1] + shape.z[v] * direction[2];
+    var key = new Float64Array(faceCount), facing = new Float64Array(faceCount), order = new Uint32Array(faceCount);
+    for (var f = 0; f < faceCount; f++) {
+      var a = shape.i[f], b = shape.j[f], c = shape.k[f];
+      key[f] = depth[a] + depth[b] + depth[c]; order[f] = f;
+      var ux = shape.x[b] - shape.x[a], uy = shape.y[b] - shape.y[a], uz = shape.z[b] - shape.z[a];
+      var wx = shape.x[c] - shape.x[a], wy = shape.y[c] - shape.y[a], wz = shape.z[c] - shape.z[a];
+      facing[f] = (uy * wz - uz * wy) * direction[0] + (uz * wx - ux * wz) * direction[1] + (ux * wy - uy * wx) * direction[2];
+    }
+    var sign = 1;
+    if (cull && faceCount) {
+      order.sort(function (p, q) { return key[p] - key[q]; });
+      var nearest = Math.max(1, Math.floor(faceCount * 0.03)), vote = 0;
+      for (var m = faceCount - nearest; m < faceCount; m++) vote += facing[order[m]] > 0 ? 1 : -1;
+      sign = vote >= 0 ? 1 : -1;
+    }
+    var base = offsets[g];
+    for (var n = 0; n < faceCount; n++) {
+      if (cull && facing[n] * sign <= 0) continue;
+      out.i.push(shape.i[n] + base); out.j.push(shape.j[n] + base); out.k.push(shape.k[n] + base); out.key.push(key[n]);
+    }
+  }
+  function relistEnvelopes(withGeometry) {
+    if (!env) return Promise.resolve();
+    var direction = viewDirection(), cull = state.envelope * state.cells < 0.995;
+    var all = {i: [], j: [], k: [], key: []};
+    shown.forEach(function (on, g) { if (on) visibleFaces(g, direction, cull, all); });
+    var count = all.key.length, order = new Uint32Array(count);
+    for (var n = 0; n < count; n++) order[n] = n;
+    order.sort(function (p, q) { return all.key[p] - all.key[q]; });   // far (small) first
+    var ni = new Int32Array(count), nj = new Int32Array(count), nk = new Int32Array(count);
+    for (var m = 0; m < count; m++) { var src = order[m]; ni[m] = all.i[src]; nj[m] = all.j[src]; nk[m] = all.k[src]; }
+    var update = {i: [ni], j: [nj], k: [nk]};
+    if (withGeometry) { update.x = [merged.x]; update.y = [merged.y]; update.z = [merged.z]; update.vertexcolor = [merged.color]; }
+    return Plotly.restyle(gd, update, [env.mesh]).then(function () { if (gd.__sliceReload) gd.__sliceReload([env.mesh]); });
+  }
+  function scheduleRelist() { clearTimeout(sortTimer); sortTimer = setTimeout(function () { relistEnvelopes(false); }, 150); }
+  gd.__envelopesNeedSort = function () {   // (the Spin button asks: it catches up only while something needs it)
+    return shown.some(function (on) { return on; });
+  };
+  if (env) {
+    loadShapes();
+    relistEnvelopes(true);   // (nothing is switched on yet: this puts the mesh in step with the page's own state)
+    gd.on('plotly_relayout', function (e) {
+      if (e && Object.keys(e).some(function (name) { return name.indexOf('scene.camera') === 0; })) scheduleRelist();
+    });
+    gd.__legendRoutes.push(function (e) {   // a click on an envelope's legend entry (see THREED_WEB_LEGEND_ROUTER_SCRIPT)
+      var g = env.standIns.indexOf(e.curveNumber);
+      if (g < 0) return true;
+      shown[g] = !shown[g];
+      Plotly.restyle(gd, {visible: shown[g] ? true : 'legendonly'}, [e.curveNumber]);
+      relistEnvelopes(false);
+      return false;
+    });
+  }
+  if (config.brain) addSlider('Brain surface opacity', 'brain');
+  if (config.background) addSlider('Background opacity', 'background');
+  if (config.cells.length) addSlider('Cell opacity', 'cells');
+  if (env) {
+    addSlider('Envelope opacity', 'envelope');
+    if (env.coverages.length > 1) {
+      addSlider('Envelope: cells inside', 'coverage', {
+        min: 1, max: env.coverages.length, toSlider: function (level) { return level + 1; },
+        fromSlider: function (value) { return value - 1; },
+        show: function (level) { return env.coverages[level] + '%'; }});
+    }
+    if (env.smoothSteps > 1) {
+      addSlider('Envelope: smoothness', 'smooth', {
+        min: 1, max: env.smoothSteps, toSlider: function (level) { return level + 1; },
+        fromSlider: function (value) { return value - 1; },
+        show: function (level) { return (level + 1) + ' of ' + env.smoothSteps; }});
+    }
+  }
   gd.style.position = 'relative';
-  gd.appendChild(box);
+  gd.appendChild(stack);
 })();
 """
 
@@ -2167,6 +2621,76 @@ def slice_contour_lines(mask, spacing_mm, step=2, sigma=0.7):
         return empty, empty, empty
     stacked = np.vstack(pieces)
     return stacked[:, 2], stacked[:, 0], stacked[:, 1]  # (ML, AP, DV) = (z_ccf, x_ccf, y_ccf)
+
+
+THREED_ENVELOPE_MAX_GROUPS = 8         # envelopes are built for at most this many groups (the ones with most cells)
+THREED_ENVELOPE_MIN_CELLS = 30         # a group with fewer cells has no meaningful envelope
+# An envelope has two independent settings, both precomputed into the page and chosen with its own slider: how many of the
+# group's cells lie inside the surface (the share), and how smooth the surface is (the width, in grid steps, of the blur
+# applied to the cells' density before the surface is cut; a small width follows every bump, a large one rounds them off).
+THREED_ENVELOPE_COVERAGES = (0.80, 0.88, 0.92, 0.95, 0.97, 0.99)   # shares of the cells inside, ascending (tightest first)
+THREED_ENVELOPE_SMOOTHNESS = (0.4, 0.5, 0.6, 0.7, 1.0, 1.5)                 # blur widths, roughest first
+THREED_ENVELOPE_DEFAULT_COVERAGE = 3   # (95%) indexes of the starting positions of the page's two sliders
+THREED_ENVELOPE_DEFAULT_SMOOTHNESS = 1
+THREED_ENVELOPE_OPACITY = 1.0          # where the page's envelope opacity slider starts (it goes up to 100%)
+
+
+def group_envelope_meshes(points):
+    """Surfaces enveloping a group of cells, for every smoothness and coverage of the settings above: a list over
+    smoothness of lists over coverage of (vertices (n, 3) float32 in the points' own axis order, faces (m, 3) int32), or
+    None when there is not enough to wrap. Each is an iso-surface of the cells' smoothed density, drawn at the level that
+    keeps that share of the cells inside (so it hugs the cloud and ignores stragglers, unlike a convex hull, which a few
+    outliers would stretch). A surface that cannot be made repeats a neighbour; the convex hull (a single surface)
+    is the fallback where scikit-image is missing."""
+    from scipy import ndimage
+    points = np.asarray(points, dtype=float)
+    points = points[np.isfinite(points).all(axis=1)]
+    if len(points) < THREED_ENVELOPE_MIN_CELLS:
+        return None
+    if len(points) > 300000:   # more than this adds nothing to a smoothed shape
+        points = points[np.random.default_rng(0).choice(len(points), 300000, replace=False)]
+    low, high = points.min(axis=0), points.max(axis=0)
+    cell = max(0.1, float(np.ptp(points, axis=0).max()) / 60)   # grid step, in the points' own units (mm)
+    pad = int(np.ceil(3 * max(THREED_ENVELOPE_SMOOTHNESS))) + 1
+    shape = np.ceil((high - low) / cell).astype(int) + 1 + 2 * pad
+    index = np.floor((points - low) / cell).astype(int) + pad
+    counts = np.zeros(shape, dtype=np.float32)
+    np.add.at(counts, tuple(index.T), 1.0)
+    grid = []
+    try:
+        from skimage import measure
+        for sigma in THREED_ENVELOPE_SMOOTHNESS:
+            density = ndimage.gaussian_filter(counts, sigma)
+            row = []
+            for share in THREED_ENVELOPE_COVERAGES:
+                try:
+                    level = float(np.percentile(density[tuple(index.T)], 100 * (1 - share)))
+                    if level <= 0:
+                        raise ValueError("empty density")
+                    vertices, faces, _n, _v = measure.marching_cubes(density, level=level, spacing=(cell,) * 3)
+                    if not len(faces):
+                        raise ValueError("no surface")
+                    row.append(((vertices + low - pad * cell).astype(np.float32), faces.astype(np.int32)))
+                except Exception:
+                    row.append(row[-1] if row else None)
+            grid.append(row)
+        known = [m for row in grid for m in row if m is not None]
+        if known:   # (a surface that failed before any other in its row takes the first one that worked)
+            return [[m if m is not None else known[0] for m in row] for row in grid]
+    except Exception:
+        pass
+    try:   # fallback: the convex hull, a single surface
+        from scipy.spatial import ConvexHull
+        hull = ConvexHull(points)
+        return [[(points[hull.vertices].astype(np.float32), _hull_faces(hull))]]
+    except Exception:
+        return None
+
+
+def _hull_faces(hull):
+    """Faces of a scipy ConvexHull re-indexed to its own vertex list (hull.vertices order), as an int32 (m, 3) array."""
+    remap = {int(v): i for i, v in enumerate(hull.vertices)}
+    return np.array([[remap[int(v)] for v in simplex] for simplex in hull.simplices], dtype=np.int32)
 
 
 def surface_mesh(mask, step, sigma=1.0):
@@ -2524,10 +3048,12 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
                      ('ventricles', THREED_EDGE_VENTRICLE_COLOR, 0.35, edges['ventricles'])]
         for name, geometry in edges['white_matter'].items():
             edge_sets.append((name, CCF_WHITE_MATTER[name][2], 0.35, geometry))
-        off_names = set(edges['white_matter'])   # the white-matter objects start switched off (a legend click shows them)
         for region_index, (name, geometry) in enumerate(edges['regions'].items()):
             edge_sets.append((name, THREED_EDGE_REGION_COLORS[region_index % len(THREED_EDGE_REGION_COLORS)], 0.30,
                               geometry))
+        # Only the brain and the ventricles start switched on; every other object (white-matter tracts, the cells'
+        # regions) starts off, and a click on its legend entry shows it.
+        off_names = {name for name, _c, _o, _g in edge_sets if name not in ('brain', 'ventricles')}
         for name, color, shell_opacity, geometry in edge_sets:
             xs, ys, zs = geometry['lines']
             if len(xs):
@@ -2554,6 +3080,61 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
                     visible=('legendonly' if name in off_names else True) if default_mode == 'surfaces' else False))
                 if name in off_names:
                     legend_off.append(len(figure.data) - 1)
+    # An envelope surface for each of the biggest cell groups, in the legend like the other surfaces but off until its
+    # entry is clicked (not part of the Background radio group, so switching that never shows or hides them).
+    import re
+    by_size = sorted(range(len(cleaned)), key=lambda i: -len(cleaned[i][0]))[:THREED_ENVELOPE_MAX_GROUPS]
+    def add_legend_spacer(count):
+        """An empty legend row (an invisible stand-in trace with a blank name; the page hides it): one line of space between
+        the legend's groups, which plotly has no way to ask for. `count` makes each spacer's name different."""
+        figure.add_trace(go.Scatter3d(x=[None], y=[None], z=[None], mode='markers', name='​' * count,
+                                      marker=dict(size=1, color='rgba(0,0,0,0)'), hoverinfo='skip', showlegend=True))
+
+    envelope_levels, envelope_colors, envelope_names = [], [], []   # per envelope: its [smoothness][coverage] surfaces etc.
+    envelope_pieces = []   # the default surfaces, merged below into ONE mesh
+    for group_index in sorted(by_size):
+        levels = group_envelope_meshes(cleaned[group_index][0])
+        if levels is None:
+            continue
+        smooth_row = levels[min(THREED_ENVELOPE_DEFAULT_SMOOTHNESS, len(levels) - 1)]
+        envelope_pieces.append(smooth_row[min(THREED_ENVELOPE_DEFAULT_COVERAGE, len(smooth_row) - 1)])
+        try:
+            envelope_color = to_hex(groups[group_index]['color'])
+        except Exception:
+            envelope_color = '#ff0000'
+        envelope_colors.append([int(envelope_color[n:n + 2], 16) for n in (1, 3, 5)])
+        envelope_names.append(re.sub(r'\s*\([\d,]+\)\s*$', '', str(groups[group_index]['label'])) + ' envelope')
+        envelope_levels.append([[{'x': np.round(v[:, 0], 2).tolist(), 'y': np.round(v[:, 1], 2).tolist(),
+                                  'z': np.round(v[:, 2], 2).tolist(), 'i': f[:, 0].tolist(), 'j': f[:, 1].tolist(),
+                                  'k': f[:, 2].tolist()} for v, f in row] for row in levels])
+    envelope_mesh = None       # trace index of the merged mesh; its triangles are listed by THREED_WEB_OPACITY_SCRIPT
+    envelope_stand_ins = []    # trace indices of the legend entries (empty stand-in traces, the page script drives them)
+    if envelope_pieces:
+        # All the envelopes are ONE mesh (a colour per vertex): plotly draws separate traces one after another whatever
+        # their depth, so one envelope would always paint over another; in a single mesh the page script can list
+        # every triangle of every switched-on envelope far to near. The mesh starts with no triangles (every envelope
+        # starts off); the legend entries are empty traces that the script reads clicks for.
+        offsets = np.cumsum([0] + [len(v) for v, _f in envelope_pieces])[:-1]
+        envelope_mesh = len(figure.data)
+        figure.add_trace(go.Mesh3d(
+            x=np.round(np.concatenate([v[:, 0] for v, _f in envelope_pieces]), 2),
+            y=np.round(np.concatenate([v[:, 1] for v, _f in envelope_pieces]), 2),
+            z=np.round(np.concatenate([v[:, 2] for v, _f in envelope_pieces]), 2),
+            i=np.zeros(0, dtype=np.int32), j=np.zeros(0, dtype=np.int32), k=np.zeros(0, dtype=np.int32),
+            vertexcolor=np.concatenate([np.tile(color, (len(v), 1)) for (v, _f), color in
+                                        zip(envelope_pieces, envelope_colors)]).astype(int),
+            opacity=THREED_ENVELOPE_OPACITY, flatshading=False,
+            lighting=dict(ambient=0.6, diffuse=0.7, specular=0.1, roughness=0.8),
+            name='envelopes', showlegend=False, hoverinfo='skip'))
+        if any(shell_traces_added for shell_traces_added in (roles['surfaces'], roles['lines'])):
+            add_legend_spacer(1)   # between the background objects and the envelopes
+        for name, color in zip(envelope_names, envelope_colors):
+            envelope_stand_ins.append(len(figure.data))
+            figure.add_trace(go.Scatter3d(x=[None], y=[None], z=[None], mode='markers', name=name,
+                                          marker=dict(size=8, color='#%02x%02x%02x' % tuple(color)), hoverinfo='skip',
+                                          showlegend=True, visible='legendonly'))
+    if roles['surfaces'] or roles['lines'] or envelope_mesh is not None:
+        add_legend_spacer(2)   # between the objects above and the cell groups
     planned = sum(keep.values())
     # Hover text on a mesh is per vertex, so it is repeated for every vertex of every sphere: with it, smoother
     # (more-vertex) spheres would multiply the file size, so they are only used when no group carries hover text.
@@ -2633,54 +3214,43 @@ def write_3d_group_html(groups, shell_xyz, outline, axis_labels, title, path, in
     scene = dict(aspectmode='data', xaxis_title=axis_labels[0], yaxis_title=axis_labels[1], zaxis_title=axis_labels[2])
     if invert_z:
         scene['zaxis'] = dict(autorange='reversed', title=axis_labels[2])
-    # Both sliders hang from the bottom edge of the plot at fixed pixel sizes and offsets (not paper fractions, which
-    # stretch with the window height): a short track with few steps, the second one pushed down by one slider's height.
-    slider_values = (1.0, 0.8, 0.6, 0.4, 0.25, 0.1)
-    background_values = (1.0, 0.8, 0.6, 0.4, THREED_WEB_BACKGROUND_DEFAULT, 0.1)
     brain_surface_index = (roles['surfaces'][0] if edges and edges['brain']['surface'] is not None and roles['surfaces']
                            else None)  # the brain's own surface is always the first one added
-    # The stack of controls at the bottom-left, top to bottom: Brain surface opacity (the plain control added by
-    # THREED_WEB_BRAIN_SURFACE_SCRIPT), Background opacity, Cell opacity: one row each. Every row hangs from the plot's
-    # bottom edge at a fixed pixel size (not paper fractions, which stretch with the window height).
+    # The opacity sliders (THREED_WEB_OPACITY_SCRIPT) float over the lower-right corner of the plot, which is empty, so
+    # they take nothing from the height available to the 3D scene.
     row = THREED_WEB_SLIDER_ROW_PX
-    rows_above = 1 if brain_surface_index is not None else 0
-    slider_style = dict(active=0, x=0.02, len=150, lenmode='pixels', y=0, yanchor='top',
-                        tickwidth=0, minorticklen=0,
-                        font=dict(size=1, color=THREED_BACKGROUND))  # step labels hidden: the title shows the value
-    opacity_steps = [dict(label=f"{value:.0%}", method='restyle', args=[{'opacity': value}, group_traces])
-                     for value in slider_values]
-    sliders = [dict(slider_style, steps=opacity_steps, pad=dict(t=8 + row * rows_above, b=0),
-                    currentvalue=dict(prefix='Cell opacity: ', font=dict(size=11, color='#e6e8ee')))]
     if background_base:
-        # Scales every background trace (cloud, wall outlines, edges, shells) from its own 100% look down to 10%,
-        # never to nothing, which is what the radio group's other modes are for. It opens at its default, so the
-        # traces start at that fraction of their own opacity.
-        indices = list(background_base)
-        for index in indices:
+        # Background traces open at the Background slider's default fraction of their own opacity.
+        for index in background_base:
             figure.data[index].opacity = round(THREED_WEB_BACKGROUND_DEFAULT * background_base[index], 3)
-        background_steps = [
-            dict(label=f"{value:.0%}", method='restyle',
-                 args=[{'opacity': [round(value * background_base[i], 3) for i in indices]}, indices])
-            for value in background_values]
-        sliders[0]['pad'] = dict(t=8 + row * (rows_above + 1), b=0)
-        sliders.insert(0, dict(slider_style, active=background_values.index(THREED_WEB_BACKGROUND_DEFAULT),
-                               steps=background_steps, pad=dict(t=8 + row * rows_above, b=0),
-                               currentvalue=dict(prefix='Background opacity: ', font=dict(size=11, color='#e6e8ee'))))
-    bottom_margin = (8 + row * (len(sliders) + rows_above) + 12) if background_base else 50
+    slider_rows = (1 if group_traces else 0) + (1 if background_base else 0) + (1 if brain_surface_index is not None else 0)
+    bottom_margin = 10
     figure.update_layout(
-        sliders=sliders,
         template='plotly_dark', scene=scene, margin=dict(l=0, r=0, t=50, b=bottom_margin),
         title=title if shown >= total else f"{title}  (showing {shown:,} of {total:,} cells)",
         legend=dict(itemsizing='constant'))
-    scripts = [post_script] if post_script else []
+    scripts = [THREED_WEB_LEGEND_ROUTER_SCRIPT] + ([post_script] if post_script else [])
     if roles['lines'] or roles['surfaces']:
         scripts.append(THREED_WEB_EDGE_SCRIPT.replace('__ROLES__', json.dumps(roles)).replace('__OFF__', json.dumps(legend_off)).replace('__DEFAULT__', default_mode))
-    if brain_surface_index is not None:
-        scripts.append(THREED_WEB_BRAIN_SURFACE_SCRIPT.replace('__BRAIN_INDEX__', str(brain_surface_index))
-                       .replace('__BASE__', str(background_base[brain_surface_index]))
-                       .replace('__FACTOR__', str(THREED_WEB_BACKGROUND_DEFAULT))
-                       .replace('__BOTTOM__', str(bottom_margin - 8 - row + 4)))
+    if slider_rows or envelope_mesh is not None:
+        opacity_config = {
+            'cells': list(group_traces),
+            'envelopes': ({'mesh': envelope_mesh, 'standIns': envelope_stand_ins, 'colors': envelope_colors,
+                           'base': THREED_ENVELOPE_OPACITY, 'levels': envelope_levels,
+                           'coverages': [round(100 * c) for c in THREED_ENVELOPE_COVERAGES][:len(envelope_levels[0][0])],
+                           'smoothSteps': len(envelope_levels[0]),
+                           'defaultCoverage': min(THREED_ENVELOPE_DEFAULT_COVERAGE, len(envelope_levels[0][0]) - 1),
+                           'defaultSmooth': min(THREED_ENVELOPE_DEFAULT_SMOOTHNESS, len(envelope_levels[0]) - 1)}
+                          if envelope_mesh is not None else None),
+            'background': ({'indices': list(background_base), 'bases': [background_base[i] for i in background_base],
+                            'value': THREED_WEB_BACKGROUND_DEFAULT} if background_base else None),
+            'brain': ({'index': brain_surface_index, 'value': background_base[brain_surface_index]}
+                      if brain_surface_index is not None else None)}
+        scripts.append(THREED_WEB_OPACITY_SCRIPT.replace('__CONFIG__', json.dumps(opacity_config))
+                       .replace('__ROW__', str(row)))
     scripts.append(THREED_WEB_SLICE_SCRIPT.replace('__MESH_INDEX__', str(mesh_index if mesh_groups else -1)))
+    scripts.append(THREED_WEB_SPIN_SCRIPT)
+    scripts.append(THREED_WEB_LEGEND_MARK_SCRIPT)
     figure.write_html(str(path), include_plotlyjs=True, full_html=True, config={'displaylogo': False},
                       post_script='\n'.join(scripts) or None)
     return Path(path)
@@ -5933,11 +6503,72 @@ def build_3d_viewer_page(abc_cache, csv_path=None, parent=None):
     return path
 
 
+THREED_LAST_CSV_FILE = CACHE_DIR / '3d_viewer_last_csv.txt'   # the launcher's last cells file, for the next run
+
+
+THREED_RECENT_CSV_FILE = CACHE_DIR / '3d_viewer_recent_csv.json'   # the launcher's recently opened cells files
+THREED_RECENT_CSV_MAX = 12
+
+
+def recent_3d_csvs():
+    """The recently opened coordinates CSVs (newest first) that still exist, as a list of path strings."""
+    try:
+        listed = json.loads(THREED_RECENT_CSV_FILE.read_text(encoding='utf-8'))
+        return [item for item in listed if isinstance(item, str) and Path(item).is_file()]
+    except (OSError, ValueError):
+        return []
+
+
+def add_recent_3d_csv(path_text):
+    """Put `path_text` first in the recent list (once), keeping at most THREED_RECENT_CSV_MAX; a failure to save is ignored."""
+    if not path_text:
+        return
+    try:
+        try:
+            listed = json.loads(THREED_RECENT_CSV_FILE.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            listed = []
+        key = os.path.normcase(os.path.normpath(path_text))
+        listed = [path_text] + [item for item in listed if isinstance(item, str)
+                                and os.path.normcase(os.path.normpath(item)) != key]
+        THREED_RECENT_CSV_FILE.parent.mkdir(parents=True, exist_ok=True)
+        THREED_RECENT_CSV_FILE.write_text(json.dumps(listed[:THREED_RECENT_CSV_MAX], indent=1), encoding='utf-8')
+    except OSError:
+        pass
+
+
+def saved_3d_csv():
+    """The path last saved for the 3D viewer launcher, whether or not that file can be found now ('' if none)."""
+    try:
+        return THREED_LAST_CSV_FILE.read_text(encoding='utf-8').strip()
+    except OSError:
+        return ''
+
+
+def remembered_3d_csv():
+    """The coordinates CSV the 3D viewer launcher last had in its box, if it still exists, else ''."""
+    text = saved_3d_csv()
+    try:
+        return text if text and Path(text).is_file() else ''
+    except OSError:
+        return ''
+
+
+def remember_3d_csv(path_text):
+    """Remember `path_text` (or forget, if empty) as the launcher's cells file; a failure to save is not worth an error."""
+    try:
+        THREED_LAST_CSV_FILE.parent.mkdir(parents=True, exist_ok=True)
+        THREED_LAST_CSV_FILE.write_text(path_text or '', encoding='utf-8')
+    except OSError:
+        pass
+
+
 def open_3d_viewer_launcher(abc_cache):
     """The window behind the opening screen's "Open 3D Viewer…" button: a box at the top for a coordinates_*.csv (drag
     it in from Windows Explorer, paste its path, or Browse): dropping or browsing a file writes the interactive page
     and opens it in the browser at once, and "Open brain only / reopen" does the same for whatever the box holds (the
-    brain alone when it is empty). Returns when the window is closed."""
+    brain alone when it is empty). The window closes itself once the page has opened (an error leaves it open, with the
+    message). Returns when the window is closed."""
     import tkinter as tk
     from tkinter import filedialog, ttk
     dnd_files = None
@@ -5947,23 +6578,35 @@ def open_3d_viewer_launcher(abc_cache):
         dnd_files = DND_FILES
     except Exception:
         root = tk.Tk()   # no tkinterdnd2: choose the file with Browse or paste its path
+    # (Every variable below is created with master=root: the opening screen has its own Tk window, and a variable made
+    # without a master would live in THAT window's interpreter, so this window's widgets would never see it.)
     root.title("3D viewer")
     root.geometry("+120+120")
     body = ttk.Frame(root, padding=12)
     body.pack(fill='both', expand=True)
-    ttk.Label(body, text="Cells: a coordinates_*.csv from the viewer's Export coordinates").pack(anchor='w')
+    ttk.Label(body, text="Cells: a coordinates_*.csv from the viewer's Export coordinates (the arrow lists recent files)").pack(
+        anchor='w')
     row = ttk.Frame(body)
     row.pack(fill='x', pady=(4, 0))
-    path_var = tk.StringVar()
-    entry = ttk.Entry(row, textvariable=path_var, width=70)
+    path_var = tk.StringVar(master=root, value=remembered_3d_csv())   # last run's file, there to reopen with one click
+    # Whatever lands in the box is remembered at once, whether it was dropped, chosen with Browse, pasted or typed (and
+    # whether or not the page then opens); only a file that still exists is offered again next time.
+    path_var.trace_add('write', lambda *_args: remember_3d_csv(path_var.get().strip().strip('"')))
+    # An editable drop-down: type or paste a path, or pick one of the recently opened files from the list.
+    entry = ttk.Combobox(row, textvariable=path_var, values=recent_3d_csvs(), width=70)
     entry.pack(side='left', fill='x', expand=True)
-    status_var = tk.StringVar(value="No cells loaded: the page will show the brain alone.")
+    missing_saved = saved_3d_csv() if not path_var.get() else ''
+    status_var = tk.StringVar(
+        master=root, value=("Last run's file is in the box: press Open to reopen it, or drop another." if path_var.get()
+               else (f"The file used last time cannot be found now (is its drive connected?): {missing_saved}"
+                     if missing_saved else "No cells loaded: the page will show the brain alone.")))
 
     def set_status(text):
         status_var.set(text)
         root.update_idletasks()
 
     busy = {'on': False}
+    open_button = {}   # the "Open brain only / reopen" button (made below), greyed out while a page is being prepared
 
     def open_view():
         if busy['on']:
@@ -5973,6 +6616,8 @@ def open_3d_viewer_launcher(abc_cache):
             set_status(f"Not a file: {wanted}")
             return
         busy['on'] = True
+        if 'widget' in open_button:   # greyed out, so it is clear the page is already being made (a drop starts it too)
+            open_button['widget'].state(['disabled'])
         set_status("Preparing the 3D page… (the first time can take a minute or two)")
         try:
             page = build_3d_viewer_page(abc_cache, wanted or None, parent=root)
@@ -5980,8 +6625,10 @@ def open_3d_viewer_launcher(abc_cache):
                 set_status("Cancelled: the CCF coordinates are needed for the brain background.")
             else:
                 open_with_default_viewer(page)
-                set_status(f"Opened {page.name} in your browser (saved in {page.parent})."
-                           + ("" if wanted else " No cells: drop a coordinates_*.csv above to add them."))
+                remember_3d_csv(wanted)
+                add_recent_3d_csv(wanted)
+                print(f"Opened {page.name} in your browser (saved in {page.parent}).")
+                root.after(200, root.destroy)   # the page is open: this window has done its job
         except ImportError:
             set_status("The 3D viewer needs plotly: run  python -m pip install plotly  and try again.")
         except Exception as e:
@@ -5989,6 +6636,11 @@ def open_3d_viewer_launcher(abc_cache):
             print(f"Could not open the 3D view: {e}")
         finally:
             busy['on'] = False
+            try:
+                if 'widget' in open_button:
+                    open_button['widget'].state(['!disabled'])
+            except tk.TclError:
+                pass   # (the window has already closed)
 
     def browse():
         current = path_var.get().strip().strip('"')
@@ -6010,7 +6662,7 @@ def open_3d_viewer_launcher(abc_cache):
         return event.action
 
     ttk.Button(row, text="Browse…", command=browse).pack(side='left', padx=(6, 0))
-    ttk.Button(row, text="Clear", command=lambda: (path_var.set(''), set_status(
+    ttk.Button(row, text="Clear", command=lambda: (path_var.set(''), remember_3d_csv(''), set_status(
         "No cells loaded: the page will show the brain alone."))).pack(side='left', padx=(4, 0))
     entry.bind('<Return>', lambda e: open_view())
     if dnd_files is not None:
@@ -6027,7 +6679,8 @@ def open_3d_viewer_launcher(abc_cache):
     buttons = ttk.Frame(body)
     buttons.pack(fill='x', pady=(12, 0))
     ttk.Button(buttons, text="Close", command=root.destroy).pack(side='right')
-    ttk.Button(buttons, text="Open brain only / reopen", command=open_view).pack(side='right', padx=(0, 6))
+    open_button['widget'] = ttk.Button(buttons, text="Open brain only / reopen", command=open_view)
+    open_button['widget'].pack(side='right', padx=(0, 6))
     entry.focus_set()
     root.lift()
     try:
