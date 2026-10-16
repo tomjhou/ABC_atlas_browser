@@ -683,21 +683,50 @@ def categorical_to_float(series):
     return np.where(codes >= 0, values[np.clip(codes, 0, None)], np.nan)
 
 
+def neuroinfo_channel_names(header_line):
+    """The channel intensity columns of a NeuroInfo marker export, from its second header line
+    (",x,y,z,strength,channel gad2,channel foxp1,x,y,z,name,acronym,id,hemisphere"): the fields between
+    'strength' and the atlas 'x', without the "channel " prefix. Exports have as many as the image had channels."""
+    fields = [f.strip() for f in header_line.rstrip('\r\n').split(',')]
+    try:
+        start = fields.index('strength') + 1
+        end = fields.index('x', start)
+    except ValueError:
+        return ['DAPI', 'EGFP', 'AF594']   # the three-channel layout this reader first supported
+    raw = [(f[len('channel '):].strip() if f.lower().startswith('channel ') else f) or f'channel {k + 1}'
+           for k, f in enumerate(fields[start:end])]
+    # Repeated names (e.g. "channel RGB" three times in exports of RGB images) are numbered: RGB 1, RGB 2, ...
+    seen = {}
+    names = []
+    for name in raw:
+        if raw.count(name) > 1:
+            seen[name] = seen.get(name, 0) + 1
+            name = f'{name} {seen[name]}'
+        names.append(name)
+    taken = {'Marker', 'strength', 'region', 'acronym', 'region_id', 'hemisphere', 'ex', 'ey', 'ez',
+             'ml_um', 'dv_um', 'ap_um'}
+    return [f'{n} (channel)' if n in taken else n for n in names]
+
+
 def read_neuroinfo_markers(path, progress=None):
     """The marker export of MBF NeuroInfo: two header lines, then one row per detection with its experiment position,
-    channel intensities, atlas position (um: x left-right, y dorsal-ventral, z anterior-posterior) and region. A region
-    name containing a comma makes a row one field longer, which is repaired here rather than dropped."""
-    names = ['Marker', 'ex', 'ey', 'ez', 'strength', 'DAPI', 'EGFP', 'AF594', 'ml_um', 'dv_um', 'ap_um',
-             'c11', 'c12', 'c13', 'c14', 'c15']
-    wanted = ['Marker', 'strength', 'DAPI', 'EGFP', 'AF594', 'ml_um', 'dv_um', 'ap_um', 'c11', 'c12', 'c13', 'c14', 'c15']
-    kinds = {'Marker': 'category', 'strength': 'float32', 'DAPI': 'float32', 'EGFP': 'float32', 'AF594': 'float32',
-             'ml_um': 'float32', 'dv_um': 'float32', 'ap_um': 'float32'}
-    kinds.update({c: 'category' for c in ('c11', 'c12', 'c13', 'c14', 'c15')})
+    channel intensities (one column per image channel, named in the second header line), atlas position (um: x
+    left-right, y dorsal-ventral, z anterior-posterior) and region. A region name containing a comma makes a row one
+    field longer, which is repaired here rather than dropped."""
+    with open(path, 'rb') as handle:
+        handle.readline()
+        channels = neuroinfo_channel_names(handle.readline().decode('utf-8-sig', errors='replace'))
+    region_columns = ['c_name', 'c_acronym', 'c_id', 'c_hemisphere', 'c_extra']
+    names = ['Marker', 'ex', 'ey', 'ez', 'strength'] + channels + ['ml_um', 'dv_um', 'ap_um'] + region_columns
+    wanted = ['Marker', 'strength'] + channels + ['ml_um', 'dv_um', 'ap_um'] + region_columns
+    kinds = {'Marker': 'category', 'strength': 'float32', 'ml_um': 'float32', 'dv_um': 'float32', 'ap_um': 'float32'}
+    kinds.update({c: 'float32' for c in channels})
+    kinds.update({c: 'category' for c in region_columns})
     from pandas.api.types import union_categoricals
     size = max(1, Path(path).stat().st_size)
     pieces = []
     import io
-    dummy = b',' * (len(names) - 1) + bytes([10])   # a full-width first row, so every block is parsed as 16 fields wide
+    dummy = b',' * (len(names) - 1) + bytes([10])   # a full-width first row, so every block is parsed full width
     with open(path, 'rb') as handle:
         handle.readline()
         handle.readline()
@@ -721,7 +750,7 @@ def read_neuroinfo_markers(path, progress=None):
             columns[column] = pd.concat(parts, ignore_index=True)
     frame = pd.DataFrame(columns)
     del pieces
-    long_rows = frame['c15'].notna().to_numpy()  # name had a comma: name, name-rest, acronym, id, hemisphere
+    long_rows = frame['c_extra'].notna().to_numpy()  # name had a comma: name, name-rest, acronym, id, hemisphere
 
     def repaired(normal, long_form):
         column = normal.copy()
@@ -731,16 +760,17 @@ def read_neuroinfo_markers(path, progress=None):
             column[long_rows] = fixed.to_numpy()
         return column
 
-    name = repaired(frame['c11'], frame['c11'].astype(str) + ',' + frame['c12'].astype(str)) if long_rows.any() \
-        else frame['c11']
-    acronym = repaired(frame['c12'], frame['c13']) if long_rows.any() else frame['c12']
-    hemisphere = repaired(frame['c14'], frame['c15']) if long_rows.any() else frame['c14']
-    region_id = categorical_to_float(frame['c13'])
+    name = repaired(frame['c_name'], frame['c_name'].astype(str) + ',' + frame['c_acronym'].astype(str)) \
+        if long_rows.any() else frame['c_name']
+    acronym = repaired(frame['c_acronym'], frame['c_id']) if long_rows.any() else frame['c_acronym']
+    hemisphere = repaired(frame['c_hemisphere'], frame['c_extra']) if long_rows.any() else frame['c_hemisphere']
+    region_id = categorical_to_float(frame['c_id'])
     if long_rows.any():
-        region_id[long_rows] = categorical_to_float(frame['c14'])[long_rows]
-    table = pd.DataFrame({'Marker': frame['Marker'], 'strength': frame['strength'], 'DAPI': frame['DAPI'],
-                          'EGFP': frame['EGFP'], 'AF594': frame['AF594'], 'region': name, 'acronym': acronym,
-                          'region_id': region_id, 'hemisphere': hemisphere})
+        region_id[long_rows] = categorical_to_float(frame['c_hemisphere'])[long_rows]
+    columns = {'Marker': frame['Marker'], 'strength': frame['strength']}
+    columns.update({c: frame[c] for c in channels})
+    columns.update({'region': name, 'acronym': acronym, 'region_id': region_id, 'hemisphere': hemisphere})
+    table = pd.DataFrame(columns)
     skipped = max(0, count_lines(path) - 2 - len(frame))
     return {'table': table, 'ap': frame['ap_um'].to_numpy(np.float32), 'dv': frame['dv_um'].to_numpy(np.float32),
             'ml': frame['ml_um'].to_numpy(np.float32), 'default_group': 'Marker', 'kind': 'NeuroInfo markers',
