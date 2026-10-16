@@ -13,6 +13,10 @@ Explorer into it (dropped anywhere else, a file goes into the next empty slot, e
 Each group of cells (the group_id, or the marker) gets its own colour and marker shape. A floating info window beside
 the image shows the slice, the cursor's coordinates and region, and the cell nearest the cursor.
 
+"Generate meshes" makes the surface meshes (.vtk, as in the meshes_coronal folder of MBF's Allen2017 atlas for NeuroInfo)
+of regions added to an atlas, e.g. with the Paint panel; see atlas_meshes.py. It needs the vtk library (offered on first
+use).
+
 Run:  python CCF_browser.py
 Mouse: shift+wheel = next/previous slice (ctrl+shift: 10 slices); wheel = zoom about the cursor (Settings can swap it
 with ctrl+wheel); +/- also zoom; drag = pan; 0 = fit to window.
@@ -1331,6 +1335,7 @@ class CCFBrowser:
         ttk.Button(controls, text="Info window", command=lambda: self.info.show()).pack(side='left', padx=(10, 0))
         ttk.Button(controls, text="Paint panel", command=self.open_paint).pack(side='left', padx=(4, 0))
         ttk.Button(controls, text="Copy section from", command=self.restore_section).pack(side='left', padx=(4, 0))
+        ttk.Button(controls, text="Generate meshes", command=self.open_mesh_dialog).pack(side='left', padx=(4, 0))
         for variable in (self.slab_var, self.dot_var):
             variable.trace_add('write', lambda *a: self.refresh_all())
         self.message = ttk.Label(controls, text="", foreground='#7a3b00')
@@ -1835,6 +1840,207 @@ class CCFBrowser:
         self.update_paint_status()
         self.message.configure(text=f"Copied {len(flat):,} voxels of the {view} section {index + 1} from "
                                     f"{path.name} (Undo is in the Paint panel).")
+
+    # ---- region meshes for an MBF (NeuroInfo) atlas
+    def open_mesh_dialog(self):
+        """Make the surface meshes (.vtk, as in an MBF atlas's meshes_coronal folder) of regions added to an atlas: the
+        new regions are those in the annotation's ontology but not in the reference atlas's; the reference atlas's own
+        meshes are copied across unchanged (see atlas_meshes.py)."""
+        import importlib.util
+        if importlib.util.find_spec('vtk') is None:
+            if not messagebox.askyesno(
+                    "Generate meshes",
+                    "Making meshes needs the 'vtk' library, which isn't installed in this Python:\n"
+                    f"{sys.executable}\n\nInstall it now (a download of about 100 MB)?", parent=self.root):
+                return
+
+            def install():
+                subprocess.run([sys.executable, '-m', 'pip', 'install', '--only-binary', ':all:', 'vtk'], check=True)
+                importlib.invalidate_caches()
+                import site
+                user_site = site.getusersitepackages()
+                if site.ENABLE_USER_SITE and os.path.isdir(user_site) and user_site not in sys.path:
+                    site.addsitedir(user_site)
+
+            def installed(_result, error):
+                if error is not None or importlib.util.find_spec('vtk') is None:
+                    messagebox.showerror("Generate meshes", f"Could not install vtk:\n{error}", parent=self.root)
+                    return
+                self.open_mesh_dialog()
+            self.run_in_thread("Installing vtk…", install, installed)
+            return
+        if getattr(self, 'mesh_window', None) is not None and self.mesh_window.winfo_exists():
+            self.mesh_window.lift()
+            return
+        import atlas_meshes
+        win = self.mesh_window = tk.Toplevel(self.root)
+        win.title("Generate meshes")
+        win.transient(self.root)
+        frame = ttk.Frame(win, padding=10)
+        frame.pack(fill='both', expand=True)
+        frame.columnconfigure(1, weight=1)
+
+        loaded = self.loaded_atlas_path if str(self.loaded_atlas_path).lower().endswith('.nrrd') else ''
+        annotation = tk.StringVar(value=self.settings.get('mesh_annotation') or loaded)
+        ontology = tk.StringVar()
+        reference = tk.StringVar(value=self.settings.get('mesh_reference', ''))
+        output = tk.StringVar()
+        copy_existing = tk.BooleanVar(value=bool(self.settings.get('mesh_copy_existing', True)))
+        auto = {'ontology': True, 'output': True}   # follow the annotation until the user edits them
+
+        def follow_annotation(*_args):
+            folder = Path(annotation.get().strip().strip('"')).parent
+            if auto['ontology']:
+                found = atlas_meshes.find_ontology(folder) if folder.is_dir() else None
+                ontology.set(str(found) if found else '')
+            if auto['output']:
+                output.set(str(folder / atlas_meshes.MESH_FOLDER_NAME) if annotation.get().strip() else '')
+            invalidate()
+
+        state = {'plan': None}
+
+        def invalidate(*_args):
+            state['plan'] = None
+            generate_button.configure(state='disabled')
+
+        def browse_file(var, title, types, key=None):
+            start = Path(var.get()).parent if var.get() else None
+            chosen = filedialog.askopenfilename(title=title, parent=win, filetypes=types,
+                                                initialdir=str(start) if start and start.is_dir() else None)
+            if chosen:
+                if key:
+                    auto[key] = False
+                var.set(str(Path(chosen)))
+
+        def browse_folder(var, title, key=None):
+            start = var.get() if var.get() and Path(var.get()).is_dir() else None
+            chosen = filedialog.askdirectory(title=title, parent=win, initialdir=start)
+            if chosen:
+                if key:
+                    auto[key] = False
+                var.set(str(Path(chosen)))
+
+        rows = (("Annotation volume", annotation,
+                 lambda: browse_file(annotation, "Annotation volume with the new regions",
+                                     [("NRRD volumes", "*.nrrd"), ("All files", "*.*")])),
+                ("Ontology", ontology,
+                 lambda: browse_file(ontology, "Ontology CSV with the new regions",
+                                     [("CSV files", "*.csv"), ("All files", "*.*")], 'ontology')),
+                ("Reference atlas folder", reference,
+                 lambda: browse_folder(reference, "Original atlas folder (with meshes_coronal and its ontology)")),
+                ("Output folder", output,
+                 lambda: browse_folder(output, "Folder to write the meshes into", 'output')))
+        for r, (label, var, command) in enumerate(rows):
+            ttk.Label(frame, text=label).grid(row=r, column=0, sticky='e', padx=(0, 6), pady=2)
+            entry = ttk.Entry(frame, textvariable=var, width=80)
+            entry.grid(row=r, column=1, sticky='ew', pady=2)
+            if var is ontology:
+                entry.bind('<Key>', lambda e: auto.update(ontology=False))
+            if var is output:
+                entry.bind('<Key>', lambda e: auto.update(output=False))
+            ttk.Button(frame, text="Browse…", command=command).grid(row=r, column=2, padx=(6, 0), pady=2)
+        ttk.Checkbutton(frame, text="Copy the reference atlas's existing meshes into the output folder too",
+                        variable=copy_existing, command=invalidate).grid(row=4, column=1, sticky='w', pady=(4, 0))
+        ttk.Label(frame, foreground='gray30', justify='left', wraplength=620, text=(
+            "Meshes are made only for regions that are in the ontology but not in the reference atlas's ontology. "
+            "A region's mesh covers its sub-regions too. Existing meshes are never rewritten.")).grid(
+            row=5, column=0, columnspan=3, sticky='w', pady=(6, 4))
+        report = tk.Text(frame, height=14, width=100, wrap='word', state='disabled', font=('Consolas', 9))
+        report.grid(row=6, column=0, columnspan=3, sticky='nsew')
+        frame.rowconfigure(6, weight=1)
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=7, column=0, columnspan=3, sticky='e', pady=(8, 0))
+        check_button = ttk.Button(buttons, text="Check")
+        check_button.pack(side='left')
+        generate_button = ttk.Button(buttons, text="Generate", state='disabled')
+        generate_button.pack(side='left', padx=6)
+        ttk.Button(buttons, text="Close", command=win.destroy).pack(side='left')
+
+        def show(text):
+            report.configure(state='normal')
+            report.delete('1.0', 'end')
+            report.insert('end', text)
+            report.configure(state='disabled')
+
+        def inputs():
+            values = [v.get().strip().strip('"') for v in (annotation, ontology, reference, output)]
+            names = ("annotation volume", "ontology", "reference atlas folder", "output folder")
+            for value, name in zip(values, names):
+                if not value:
+                    raise ValueError(f"Choose the {name}.")
+            if not Path(values[0]).is_file():
+                raise ValueError(f"Annotation volume not found:\n{values[0]}")
+            if not Path(values[1]).is_file():
+                raise ValueError(f"Ontology not found:\n{values[1]}")
+            if not Path(values[2]).is_dir():
+                raise ValueError(f"Reference atlas folder not found:\n{values[2]}")
+            return values
+
+        def check():
+            if self.busy_label:
+                show("Still busy with something else; try again when it finishes.")
+                return
+            try:
+                ann, ont, ref, out = inputs()
+            except ValueError as e:
+                show(str(e))
+                return
+            notes = []
+            if (self.loaded_atlas_path and Path(ann) == Path(self.loaded_atlas_path)
+                    and self.edit_version != self.saved_version):
+                notes.append("NOTE: the atlas on screen has painted changes that haven't been saved; the meshes are "
+                             "made from the file on disk. Use Save volume… in the Paint panel first to include them.\n")
+            self.settings.update(mesh_annotation=ann, mesh_reference=ref, mesh_copy_existing=copy_existing.get())
+            show("Reading the volumes…")
+
+            def done(result, error):
+                if not win.winfo_exists():
+                    return
+                if error is not None:
+                    show(f"Could not plan the meshes:\n{error}")
+                    return
+                state['plan'] = result
+                text = "\n".join(notes) + atlas_meshes.describe_plan(result)
+                existing = [atlas_meshes.mesh_file_name(a, r) for r, a, _n, _v in result['new']
+                            if (result['output'] / atlas_meshes.mesh_file_name(a, r)).exists()]
+                if existing:
+                    text += "\n\nAlready in the output folder (will be replaced): " + ", ".join(existing)
+                if result['new'] or result['copy']:
+                    generate_button.configure(state='normal')
+                else:
+                    text += "\n\nNothing to do."
+                show(text)
+            self.run_in_thread("Planning meshes…",
+                               lambda: atlas_meshes.plan(ann, ont, ref, out, copy_existing.get()), done)
+
+        def generate():
+            p = state['plan']
+            if p is None or self.busy_label:
+                return
+            generate_button.configure(state='disabled')
+
+            def progress(text):
+                self.progress_text = text
+
+            def done(result, error):
+                if not win.winfo_exists():
+                    return
+                if error is not None:
+                    show(f"Mesh generation failed:\n{error}")
+                    return
+                show(atlas_meshes.describe_plan(p) + "\n\nDone. Wrote:\n" + "\n".join(f"   {f}" for f in result)
+                     + (f"\nand copied {p['copy']} existing meshes." if p['copy'] else ""))
+                self.message.configure(text=f"Wrote {len(result)} new mesh(es) to {p['output']}")
+                state['plan'] = None
+            self.run_in_thread("Generating meshes…", lambda: atlas_meshes.generate(p, progress), done)
+
+        check_button.configure(command=check)
+        generate_button.configure(command=generate)
+        annotation.trace_add('write', follow_annotation)
+        for var in (ontology, reference, output):
+            var.trace_add('write', invalidate)
+        follow_annotation()
+        show("Choose the files, then press Check to see what will be made.")
 
     def undo(self):
         if not self.undo_stack:
