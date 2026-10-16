@@ -5,6 +5,28 @@
 - `tifs_to_jp2.py`: per-channel Leica TIFFs to NeuroInfo JP2 (notes below).
 - `tools/jp2_boxdump.py`: prints a JPEG2000 file's boxes, XMP and codestream header.
   Use it to compare our output with NeuroInfo's own files.
+- `neuroinfo_stack.py` + `jpx_aligner.py` (GUI): re-align NeuroInfo serial section assembler
+  stacks (stage 1 only; stage 2 atlas registration is edited in NeuroInfo). See below.
+
+# jpx_aligner / neuroinfo_stack
+
+- NeuroInfo only reads the .jpx (confirmed by the user); .xml/.h5 are used only to recover
+  NeuroInfo's alignment from a fresh NeuroInfo stack.
+- Alignment recovery: fit case-file outline (source um) -> reconstruction.xml outline (stack um),
+  matched by contour GUID and point index; exact (~0.004 um). Do NOT decode the CaseFile ITK
+  transform chain: its Reflection2D steps don't match the real mirroring.
+- Pixel convention, verified by rendering (corr ~0.997, offset < 0.4 px vs NeuroInfo frames):
+  source (col,row) = (px*col, -px*row) um; canvas (u,v) = (px*u, -px*v) um; px = 0.575.
+- Edit = rotation/shift/flip in stack um about the base outline centroid, on top of the base
+  transform. Exports carry a JSON description in a private 'uuid' box (ALIGNER_UUID) appended at
+  the end of the file; all other boxes are copied verbatim from the opened file. Only sections whose
+  edit changed are re-rendered (default 60 dB); others' codestreams are copied byte for byte.
+- Canvas is fixed (NeuroInfo's size); export warns if a section extends past it.
+- Previews are cached in %LOCALAPPDATA%\JhouLab\jpx_aligner_cache (keyed by path, size, mtime).
+- Test GUI changes headless: build `Aligner()`, `root.withdraw()`, patch `canvas.winfo_width/height`
+  and the dialogs, then grab `ImageTk.getimage(app.photo)`. Never show windows unannounced.
+- CONFIRMED (2026-10-16): NeuroInfo 2026.1.1 opens JPX files written this way, including the
+  aligner's uuid box at the end and OpenJPEG codestreams in place of Kakadu's.
 
 # tifs_to_jp2 — NeuroInfo JP2 converter
 
@@ -22,8 +44,21 @@ names and pixel size. Replaces NeuroInfo's own converter, which is buggy.
   precincts, COM markers "MBF Bioscience", "MBF_DIMT:1", "MBF_DIMZ:1".
 - NeuroInfo's own output is NOT ground truth: it duplicated channels ("Vgat_copy") and
   wrote 0.575 um for half-resolution pyramid data that is really 1.15 um.
-- OPEN QUESTION: not yet confirmed that NeuroInfo displays our layer names/colors.
-  Ask before assuming it works.
+- CONFIRMED (2026-10-15): NeuroInfo 2026.1.1 reads our layer names and colors. It built a
+  Reconstruction.jpx from our 2-channel JP2s (Tyler, Sequence 001) and kept "gad2"/"foxp1"
+  and green/red.
+
+## NeuroInfo Reconstruction.jpx / .xml (aligned section stack)
+- JPX (`ftyp` jpx, `rreq`), one `uuid` XMP for the whole stack, then per section a
+  `jpch` + `jplh` (both empty) and a `jp2c` codestream. Every frame has the same canvas size
+  (sections padded with zeros), 16-bit, Kakadu 20:1. Extract by walking the top-level boxes
+  and passing each `jp2c` payload to `imagecodecs.jpeg2k_decode`.
+- XMP `xmp:Images` has one entry per frame (Rotation/Translation 0: alignment is baked into
+  the pixels; PixelWidth; SizeZ = section spacing in um). Application="NeuroInfo".
+- Reconstruction.xml (MBF XML, appname NeuroInfo): `<images>` points at the .jpx (path may use
+  a different drive letter); one `SectionOutline` `<contour>` per section, points in um with
+  `sid="S<n>"`; `<filefacts>` lists sections with `top` (z, um) and cut thickness. Sections are
+  renumbered 1..N, so they don't map by name to the source files.
 
 ## Source data facts
 - Leica TIFFs are 12-bit values (max 4095) in 16-bit files, so they look dark;

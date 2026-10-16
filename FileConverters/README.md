@@ -88,3 +88,18 @@ command-line version.
 
 `tools/jp2_boxdump.py <file.jp2>` prints a JPEG2000 file's header boxes and codestream settings, for
 comparing converted files with NeuroInfo's own.
+
+## JPX ALIGNER (adjust NeuroInfo section stacks)
+
+NeuroInfo's serial section assembler can't revise an alignment once it's made. `jpx_aligner.py`
+(double-click `RUN_jpx_aligner.bat`) opens a NeuroInfo `reconstruction.jpx` (with the
+`reconstruction.xml` and `CaseFile.H5` NeuroInfo writes beside it) and lets you move, rotate and
+flip individual sections against their neighbors, then exports a new JPX that NeuroInfo opens.
+
+- Sections are re-rendered from the original section JP2 files, so repeated edits don't add
+  resampling or compression losses; unchanged sections are copied byte for byte.
+- Exported files remember their edits, so they can be reopened in the aligner and adjusted again.
+- Brightness controls are display-only; exported pixel values come from the original images.
+
+`neuroinfo_stack.py` is the library behind it; `python neuroinfo_stack.py info <stack.jpx>` lists a
+stack's sections and their alignment.
