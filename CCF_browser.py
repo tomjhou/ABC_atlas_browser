@@ -578,11 +578,20 @@ IMAGE_MAX_NEIGHBOUR_SAME = 0.5   # below this share of equal neighbours, a volum
 
 def neighbour_same_share(volume):
     """The share of voxels that equal the next voxel along the fastest axis, counting only pairs with at least one
-    non-zero voxel (the empty background is the same value in every kind of volume). A map of regions is made of
-    large patches, so this is high (about 0.9 for the Allen CCF); in a greyscale image neighbouring voxels rarely hold
-    exactly the same value (about 0.0005 for a Nissl template). Every second plane is used, which is plenty."""
+    voxel that isn't background (the empty background is the same value in every kind of volume). The background is
+    taken to be the most common value rather than 0: MBF's Allen2017 template (AllenCoronal_25um.nrrd) fills the space
+    around the brain with 1, which counted as background-free made it look like a map of regions. A map of regions is
+    made of large patches, so this is high (about 0.9 for the Allen CCF); in a greyscale image neighbouring voxels
+    rarely hold exactly the same value (about 0.0005 for a Nissl template, 0.14 for that Allen2017 template, which has
+    only 516 grey levels). Every second plane is used, which is plenty."""
     a, b = volume[::2, :, 1:], volume[::2, :, :-1]
-    pairs = (a > 0) | (b > 0)
+    sample = a[::4, ::4, ::4].ravel()
+    if sample.dtype.kind in 'iub' and sample.size:
+        values, counts = np.unique(sample, return_counts=True)
+        background = values[np.argmax(counts)]
+    else:
+        background = 0
+    pairs = (a != background) | (b != background)
     return float((a == b)[pairs].mean()) if pairs.any() else 1.0
 
 
