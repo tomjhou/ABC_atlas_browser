@@ -193,7 +193,9 @@ class Tooltip:
         self.tip.wm_overrideredirect(True)
         tk.Label(self.tip, text=self.text, justify=tk.LEFT, background="#ffffe0", relief=tk.SOLID, borderwidth=1,
                  wraplength=260, padx=4, pady=2).pack()
-        self.tip.wm_geometry(f"+{self.widget.winfo_rootx() - 100}+{self.widget.winfo_rooty() + self.widget.winfo_height() + 4}")
+        self.tip.update_idletasks()
+        x = min(self.widget.winfo_rootx(), self.widget.winfo_screenwidth() - self.tip.winfo_reqwidth() - 4)   # (kept on screen)
+        self.tip.wm_geometry(f"+{max(x, 0)}+{self.widget.winfo_rooty() + self.widget.winfo_height() + 4}")
 
     def hide(self, event=None):
         if self.job:
@@ -228,6 +230,7 @@ class Aligner:
         self.root.geometry("1500x950")
         self.stack = None
         self.previews = {}          # section index -> (img, kx, ky)
+        self.thumbs = {}            # .czi path -> (PhotoImage, (x0, y0, k)): the slide scan's thumbnail, for the picture above the list
         self.frame_previews = set()  # indices of sections whose preview is the JPX's own frame (not rendered from a source image)
         self.cur = 0
         self.undo = []              # steps: each a list of (section index, Edit before the change)
@@ -265,6 +268,7 @@ class Aligner:
         self.var_quality = tk.StringVar(self.root, f"{ns.DEFAULT_QUALITY_DB:g}")
         self.var_rerender = tk.BooleanVar(self.root, True)   # every image is written again, so each JPX file has all of its images
         self.var_background = tk.BooleanVar(self.root, bool(load_settings().get("background_loading", True)))
+        self.var_advanced = tk.BooleanVar(self.root, bool(load_settings().get("advanced_mode", False)))
         self.var_crosshair = tk.BooleanVar(self.root, True)
         self.var_follow = tk.BooleanVar(self.root, False)   # an edit also moves the sections after it
         self.var_status = tk.StringVar(self.root, "Open a reconstruction.jpx to start (File > Open).")
@@ -290,6 +294,7 @@ class Aligner:
         om = tk.Menu(fm, tearoff=0)
         om.add_checkbutton(label="Load images in the background", variable=self.var_background,
                            command=self.background_option_changed)
+        om.add_checkbutton(label="Advanced mode", variable=self.var_advanced, command=self.advanced_option_changed)
         fm.add_cascade(label="Options", menu=om)
         fm.add_separator()
         fm.add_command(label="Exit", command=self.quit)
@@ -311,7 +316,7 @@ class Aligner:
         self.paned = tk.PanedWindow(main, orient=tk.HORIZONTAL, sashwidth=7, sashrelief=tk.RAISED, bd=0,
                                     opaqueresize=True, background="gray70")
         self.paned.grid(row=0, column=0, sticky="nsew")
-        left = ttk.Frame(self.paned, padding=5)
+        left = self.left_pane = ttk.Frame(self.paned, padding=5)
         draw = ttk.LabelFrame(left, text="Drawing", padding=6)
         draw.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
         ttk.Label(draw, textvariable=self.var_draw_info, justify=tk.LEFT).pack(anchor="w")
@@ -325,12 +330,22 @@ class Aligner:
                        "click elsewhere: deselect").pack(anchor="w")
         ttk.Label(left, text="* changed since opened\n~ edited  |  F flipped", foreground="gray30",
                   justify=tk.LEFT).pack(side=tk.BOTTOM, anchor="w", pady=(4, 0))
-        ttk.Label(left, text="Sections").pack(anchor="w")
+        self.var_sections_title = tk.StringVar(self.root, "Sections")   # (shows the loading progress while images load)
+        self.label_sections = ttk.Label(left, textvariable=self.var_sections_title)
+        self.label_sections.pack(anchor="w")
+        # Where the current section lies on the slide (for stacks whose sections come from a slide scan: their names are all
+        # alike). Packed above the label when there is a picture to show.
+        self.thumb_canvas = tk.Canvas(left, bg="black", highlightthickness=0)
+        self.thumb_shown = False
         order = ttk.Frame(left)   # under the list (packed before it, so the list takes what is left)
         order.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
-        for text, command in (("Move up", lambda: self.move_section(-1)), ("Move down", lambda: self.move_section(1)),
-                              ("Delete", self.delete_section)):
-            ttk.Button(order, text=text, command=command).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
+        for text, command, tip in (
+                ("Move up", lambda: self.move_section(-1), "Move selected section earlier in the sequence order"),
+                ("Move down", lambda: self.move_section(1), "Move selected section later in the sequence order"),
+                ("Delete", self.delete_section, "Remove section from sequence")):
+            button = ttk.Button(order, text=text, command=command)
+            button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
+            Tooltip(button, tip)
         self.listbox = tk.Listbox(left, width=30, height=12, exportselection=False, activestyle="none",
                                   font=("Segoe UI", 10))
         self.listbox.pack(fill=tk.BOTH, expand=True)
@@ -375,8 +390,9 @@ class Aligner:
     def build_right(self, right):
         f = ttk.LabelFrame(right, text="Current section", padding=6)
         f.pack(fill=tk.X, pady=(0, 6))
-        ttk.Checkbutton(f, text="Edits also move the following sections", variable=self.var_follow).grid(
-            row=0, column=0, columnspan=4, sticky="w", pady=(0, 4))
+        # (advanced mode only)
+        self.follow_check = ttk.Checkbutton(f, text="Edits also move subsequent sections", variable=self.var_follow)
+        self.follow_check.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 4))
         self.label_section = ttk.Label(f, text="-", font=("Segoe UI", 10, "bold"))
         self.label_section.grid(row=1, column=0, columnspan=4, sticky="w")
         for r, (text, var) in enumerate((("Rotation (deg, clockwise)", self.var_rot), ("Shift x (um)", self.var_dx),
@@ -410,17 +426,18 @@ class Aligner:
         for text, val in (("Previous section", "previous"), ("Next section", "next"), ("Nothing", "none")):
             ttk.Radiobutton(f, text=text, value=val, variable=self.var_ref,
                             command=self.redraw).pack(anchor="w")
-        ttk.Separator(f).pack(fill=tk.X, pady=4)
-        ttk.Radiobutton(f, text="Blend (true colors)", value="blend", variable=self.var_mode,
+        self.mode_frame = ttk.Frame(f)   # the blending modes: advanced mode only (otherwise the sections are always blended)
+        ttk.Separator(self.mode_frame).pack(fill=tk.X, pady=4)
+        ttk.Radiobutton(self.mode_frame, text="Blend (true colors)", value="blend", variable=self.var_mode,
                         command=self.redraw).pack(anchor="w")
-        ttk.Radiobutton(f, text="Overlay (this = magenta, other = cyan)", value="overlay",
+        ttk.Radiobutton(self.mode_frame, text="Overlay (this = magenta, other = cyan)", value="overlay",
                         variable=self.var_mode, command=self.redraw).pack(anchor="w")
-        ttk.Label(f, text="Opacity of this section").pack(anchor="w", pady=(4, 0))
+        self.label_opacity = ttk.Label(f, text="Opacity of this section")
+        self.label_opacity.pack(anchor="w", pady=(4, 0))
         ttk.Scale(f, from_=0, to=1, variable=self.var_opacity,
                   command=lambda v: self.redraw()).pack(fill=tk.X)
 
-        f = ttk.LabelFrame(right, text="View", padding=6)
-        f.pack(fill=tk.X, pady=(0, 6))
+        self.view_frame = f = ttk.LabelFrame(right, text="View", padding=6)   # (advanced mode only)
         ttk.Checkbutton(f, text="Crosshair at the centre of the view", variable=self.var_crosshair,
                         command=self.redraw).pack(anchor="w")
 
@@ -430,12 +447,18 @@ class Aligner:
 
         f = ttk.LabelFrame(right, text="Export", padding=6)
         f.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(f, text="Quality (dB, max ~96)").grid(row=0, column=0, sticky="e")   # 16-bit frames: nothing above ~96 dB changes the file
-        ttk.Entry(f, textvariable=self.var_quality, width=6).grid(row=0, column=1, sticky="w", padx=4)
-        ttk.Checkbutton(f, text="Re-render unchanged sections too", variable=self.var_rerender).grid(
-            row=1, column=0, columnspan=2, sticky="w")
+        # (the quality and re-render choices are for advanced mode only; the defaults are the sensible ones)
+        self.export_advanced = [
+            ttk.Label(f, text="Quality (dB, max ~96)"),   # 16-bit frames: nothing above ~96 dB changes the file
+            ttk.Entry(f, textvariable=self.var_quality, width=6),
+            ttk.Checkbutton(f, text="Re-render unchanged sections too", variable=self.var_rerender)]
+        self.export_advanced[0].grid(row=0, column=0, sticky="e")
+        self.export_advanced[1].grid(row=0, column=1, sticky="w", padx=4)
+        self.export_advanced[2].grid(row=1, column=0, columnspan=2, sticky="w")
         ttk.Button(f, text="Export JPX...", command=self.export_dialog).grid(row=2, column=0, columnspan=2,
                                                                               pady=(6, 0), sticky="ew")
+
+        self.apply_advanced_mode()   # (all the widgets it shows or hides exist now)
 
         help_text = ("drag: move   Shift/right-drag: rotate\n"
                      "Ctrl/middle-drag: pan   wheel: zoom\n"
@@ -456,8 +479,32 @@ class Aligner:
             hexcol = "#%02x%02x%02x" % tuple(ch.color)
             row = ttk.Frame(self.chan_frame)
             row.pack(fill=tk.X, pady=(4 if i else 0, 0))
-            tk.Label(row, bg=hexcol, width=2).pack(side=tk.LEFT)
-            ttk.Checkbutton(row, text=ch.name, variable=vis, command=self.redraw).pack(side=tk.LEFT, padx=4)
+            # The colored square is the show/hide checkbox: while the channel is shown, two thin lines join its opposite corners
+            # (black, or white on a very dark color so that they can be seen).
+            dark = 0.299 * ch.color[0] + 0.587 * ch.color[1] + 0.114 * ch.color[2] < 60
+            size = round(22 * self.root.winfo_fpixels("1i") / 96)
+            square = tk.Canvas(row, width=size, height=size, bg=hexcol, cursor="hand2", highlightthickness=1,
+                               highlightbackground="gray40")
+            square.pack(side=tk.LEFT)
+
+            def toggle(event=None, vis=vis):
+                vis.set(not vis.get())
+                self.redraw()
+
+            def show_x(*_, vis=vis, square=square, size=size, line="white" if dark else "black"):
+                square.delete("x")
+                if vis.get():
+                    m = 1   # (the lines run from corner to corner of the square, inside its 1-pixel border)
+                    square.create_line(m, m, size, size, fill=line, tags="x")
+                    square.create_line(m, size, size, m, fill=line, tags="x")
+
+            vis.trace_add("write", show_x)
+            show_x()
+            square.bind("<Button-1>", toggle)
+            Tooltip(square, "Show / hide this channel")
+            name = ttk.Label(row, text=ch.name, cursor="hand2")
+            name.pack(side=tk.LEFT, padx=4)
+            name.bind("<Button-1>", toggle)
             for text, var in (("black", vlo), ("white", vhi)):
                 r = ttk.Frame(self.chan_frame)
                 r.pack(fill=tk.X)
@@ -476,6 +523,33 @@ class Aligner:
     @busy.setter
     def busy(self, value):
         self._busy = value
+
+    def apply_advanced_mode(self):
+        """Show the features meant for experienced users only in advanced mode (and use the plain ones otherwise)."""
+        if self.var_advanced.get():
+            self.mode_frame.pack(fill=tk.X, before=self.label_opacity)
+            self.view_frame.pack(fill=tk.X, pady=(0, 6), before=self.chan_frame)
+            for w in self.export_advanced:
+                w.grid()
+            self.follow_check.grid()
+        else:
+            # what is hidden goes back to its default, so nothing unseen keeps affecting the picture or the export
+            self.mode_frame.pack_forget()
+            self.view_frame.pack_forget()
+            for w in self.export_advanced:
+                w.grid_remove()
+            self.follow_check.grid_remove()
+            self.var_follow.set(False)
+            self.var_mode.set("blend")
+            self.var_crosshair.set(True)
+            self.var_quality.set(f"{ns.DEFAULT_QUALITY_DB:g}")
+            self.var_rerender.set(True)
+
+    def advanced_option_changed(self):
+        save_settings(advanced_mode=bool(self.var_advanced.get()))
+        self.apply_advanced_mode()
+        if self.stack:
+            self.redraw()
 
     def background_option_changed(self):
         save_settings(background_loading=bool(self.var_background.get()))
@@ -597,6 +671,8 @@ class Aligner:
         self.stack = stack
         self.previews = {}
         self.frame_previews = set()
+        self.thumbs = {}
+        self.draw_thumbnail()
         self.undo = []
         self.outline_undo = []
         self.sel_outline, self.sel_vertices, self.odrag = False, set(), None
@@ -621,8 +697,24 @@ class Aligner:
         self.calibrating = any(s.source_path.lower().endswith(".czi") and s.czi_origin is None for s in todo)
         self.update_cursor()
         self.refresh_list()   # (sections not loaded yet are grey)
+        self.update_sections_title()
         # load the current section and its neighbors first
         todo.sort(key=lambda s: abs(s.index - self.cur))
+
+        czi_paths = sorted({s.source_path for s in todo if s.source_path.lower().endswith(".czi")})
+        if czi_paths:
+            max_px = max(150, self.left_pane.winfo_width() - 14)   # (the width of the pane, less its padding)
+
+            def thumbs():
+                ns.lower_thread_priority()
+                for path in czi_paths:
+                    try:
+                        img, geometry = ns.czi_slide_thumbnail(path, max_px)
+                    except Exception:
+                        continue   # (the picture is only a convenience)
+                    self.msgs.put(("thumb", (stack, path, img, geometry)))
+
+            threading.Thread(target=thumbs, daemon=True).start()
 
         posted, lock, czi_scenes = set(), threading.Lock(), {}
 
@@ -703,9 +795,15 @@ class Aligner:
                     if stack is self.stack:   # (a stack opened since has its own loading under way)
                         self.loading_previews = False
                         self.update_cursor()
+                        self.update_sections_title()
                         self.refresh_list()
                         self.update_controls()
                         self.var_status.set(text)
+                elif kind == "thumb":
+                    stack, path, img, geometry = payload
+                    if stack is self.stack:
+                        self.thumbs[path] = (ImageTk.PhotoImage(Image.fromarray(img)), geometry)
+                        self.draw_thumbnail()
                 elif kind == "czi_ready":
                     stack, problems = payload
                     if stack is self.stack:
@@ -729,6 +827,7 @@ class Aligner:
                         self.progress.config(value=n)
                         if not self.levels_set:
                             self.auto_levels(pv[0])
+                        self.update_sections_title()
                         sec = self.by_frame(idx)
                         if sec is not None:
                             self.refresh_list_item(sec.index)
@@ -776,6 +875,43 @@ class Aligner:
         self.listbox.selection_set(self.cur)
         self.listbox.see(self.cur)
 
+    def draw_thumbnail(self):
+        """The slide scan's picture above the section list, with the outlines of the located sections (the current one bright):
+        the sections can be told apart by where they lie on the slide."""
+        c = self.thumb_canvas
+        sec = self.stack.sections[self.cur] if self.stack and self.stack.sections else None
+        path = sec.source_path if sec is not None and sec.source_path in self.thumbs else next(iter(self.thumbs), None)
+        if not self.stack or path is None:
+            if self.thumb_shown:
+                c.pack_forget()
+                self.thumb_shown = False
+            return
+        photo, (gx0, gy0, k) = self.thumbs[path]
+        if not self.thumb_shown:
+            c.pack(before=self.label_sections, anchor="w", pady=(0, 6))
+            self.thumb_shown = True
+        c.config(width=photo.width(), height=photo.height())
+        c.delete("all")
+        c.create_image(0, 0, image=photo, anchor="nw")
+        for s in self.stack.sections:
+            if s.source_path != path or s.czi_origin is None or not len(s.case_points):
+                continue
+            X = s.case_points[:, 0] / self.stack.pixel_um + s.czi_origin[0]
+            Y = -s.case_points[:, 1] / self.stack.pixel_um + s.czi_origin[1]
+            pts = np.column_stack([(X - gx0) / k, (Y - gy0) / k])
+            here = s is sec
+            c.create_polygon(*pts.ravel().tolist(), outline="#ff3030" if here else "#a08000", fill="", width=2 if here else 1)
+            if here:
+                cx, cy = pts.mean(0)
+                c.create_text(cx, cy, text=str(s.index + 1), fill="#ff3030", font=("Segoe UI", 11, "bold"))
+
+    def update_sections_title(self):
+        """"Sections", with how many pictures have been loaded while they are loading."""
+        text = "Sections"
+        if self.stack and self.loading_previews:
+            text += f" (loaded {sum(1 for s in self.stack.sections if self.loaded(s))} of {len(self.stack.sections)})"
+        self.var_sections_title.set(text)
+
     def loaded(self, s):
         """The section's picture has been loaded."""
         return s.frame in self.previews
@@ -814,6 +950,7 @@ class Aligner:
     def update_controls(self):
         if not self.stack:
             return
+        self.draw_thumbnail()
         s = self.stack.sections[self.cur]
         self.label_section.config(text=f"{self.cur + 1}. {s.name}")
         e = s.edit
@@ -841,7 +978,7 @@ class Aligner:
             return None
         if self.calibrating and self.var_follow.get() and any(
                 f.source_path.lower().endswith(".czi") and f.czi_origin is None for f in self.stack.sections[s.index + 1:]):
-            self.var_status.set("Following sections are still being located: wait, or turn off \"also move the following sections\".")
+            self.var_status.set("Following sections are still being located: wait, or turn off \"Edits also move subsequent sections\".")
             return None
         return s
 
@@ -850,7 +987,7 @@ class Aligner:
         return [f for f in self.stack.sections[s.index + 1:] if f.renderable]
 
     def push_undo(self, s):
-        """Remember the edit of `s` (and, with "also move the following sections" on, of the sections after it, which an edit
+        """Remember the edit of `s` (and, with "Edits also move subsequent sections" on, of the sections after it, which an edit
         of `s` will move too) as one undo step."""
         step = [(s.frame, copy.copy(s.edit))]
         if self.var_follow.get():
@@ -875,7 +1012,7 @@ class Aligner:
         return ns.Edit(angle, float(d[0]), float(d[1]), flip)
 
     def set_edit(self, s, edit, start=None):
-        """Give section `s` the edit. With "also move the following sections" on, every later section is moved by the same rigid
+        """Give section `s` the edit. With "Edits also move subsequent sections" on, every later section is moved by the same rigid
         change that took `s` from its placement in `start` (the state before the edit began; taken now if not given) to its
         new one, so the sections after it keep their positions relative to it. With it off only `s` changes; the sections'
         transforms are independent of each other, so nothing needs to be undone on the others."""
@@ -1005,6 +1142,7 @@ class Aligner:
         self.undo = [step for step in ([(f, e) for f, e in step if f != s.frame] for step in self.undo) if step]
         self.outline_undo = [u for u in self.outline_undo if u[0] != s.frame]
         self.renumber()
+        self.update_sections_title()
         self.cur = min(i, len(secs) - 1)
         self.sel_outline, self.sel_vertices, self.odrag, self.hover = False, set(), None, None
         self.refresh_list()

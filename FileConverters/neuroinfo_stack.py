@@ -683,6 +683,26 @@ def section_source_offset(section, stack):
     return float(section.czi_origin[0] - x0), float(section.czi_origin[1] - y0)
 
 
+def czi_slide_thumbnail(path, max_px=300):
+    """A small picture of the whole slide scan (the scenes put side by side where they lie): (8-bit image, (x0, y0, k)) where
+    slide pixel (X, Y) is at ((X - x0) / k, (Y - y0) / k) in the image."""
+    boxes = czi_scenes(path)
+    gx0, gy0 = min(b[0] for b in boxes), min(b[1] for b in boxes)
+    gx1, gy1 = max(b[0] + b[2] for b in boxes), max(b[1] + b[3] for b in boxes)
+    k = max(gx1 - gx0, gy1 - gy0) / max_px
+    out = np.zeros((int(np.ceil((gy1 - gy0) / k)), int(np.ceil((gx1 - gx0) / k))), np.float32)
+    for i, (x0, y0, w, h) in enumerate(boxes):
+        level = int(min(max(np.floor(np.log2(max(k, 1))), 0), czi_levels(path, i) - 1))
+        img = czi_read(path, i, level).astype(np.float32).mean(2)
+        tw, th = max(1, round(w / k)), max(1, round(h / k))
+        img = cv2.resize(img, (tw, th), interpolation=cv2.INTER_AREA)
+        px, py = round((x0 - gx0) / k), round((y0 - gy0) / k)
+        region = out[py:py + th, px:px + tw]
+        region[...] = img[:region.shape[0], :region.shape[1]]
+    hi = max(float(np.percentile(out[out > 0], 99.5)) if (out > 0).any() else 1.0, 1.0)
+    return (np.clip(out / hi, 0, 1) ** 0.6 * 255).astype(np.uint8), (gx0, gy0, k)
+
+
 def czi_preview(section, stack, max_px):
     """(image H x W x C, k) for a section's scene at the coarsest pyramid level that is still at least max_px on its long
     side (k source pixels per image pixel), as (img, kx, ky) like the aligner's other previews."""
