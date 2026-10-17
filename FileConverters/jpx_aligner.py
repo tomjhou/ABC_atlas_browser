@@ -166,6 +166,17 @@ class Aligner:
         self.view = None            # (scale view px per canvas px, ox, oy)
         self.fitted = True          # the view is the fit-to-window one (not panned or zoomed by hand since)
         self.last_size = None       # canvas size at the last redraw, to scale the view when the window is resized
+        self.sel_outline = False    # the current section's outline is selected (its vertices show as squares)
+        self.image_selected = False  # what sel_outline was when the picture was last drawn (the opacity depends on it)
+        self.sel_vertices = set()   # indices of the selected vertices of that outline (red squares)
+        self.odrag = None           # an outline gesture in progress (moving vertices, or a rubber band)
+        self.prov_sel = set()       # vertices inside the rubber band while it is being dragged
+        self.outline_undo = []      # steps of the Drawing panel's Undo: (section index, its outline before the change)
+        self.last_ref = None        # the comparison section and opacity of the last redraw, for the overlay
+        self.last_alpha = 0.5
+        self.var_draw_info = tk.StringVar(self.root, "")
+        self.var_draw_sel = tk.StringVar(self.root, "")   # second, indented line: how many vertices are selected
+        self.hover = None           # ('vertex', i) or ('edge', i) under the pointer, for the current outline
         self.opening = False        # a stack is being opened
         self.loading_previews = False   # section images are still being loaded in the background
         self.levels = []            # per channel [lo, hi] (display only)
@@ -217,25 +228,45 @@ class Aligner:
 
         main = ttk.Frame(root)
         main.pack(fill=tk.BOTH, expand=True)
-        main.columnconfigure(1, weight=1)
+        main.columnconfigure(0, weight=1)
         main.rowconfigure(0, weight=1)
 
-        left = ttk.Frame(main, padding=5)
-        left.grid(row=0, column=0, sticky="ns")
-        ttk.Label(left, text="Sections").pack(anchor="w")
-        self.listbox = tk.Listbox(left, width=30, exportselection=False, activestyle="none",
-                                  font=("Segoe UI", 10))
-        self.listbox.pack(fill=tk.Y, expand=True)
-        self.listbox.bind("<<ListboxSelect>>", self.on_list_select)
+        # The left pane and the image sit in a paned window: drag the bar between them to give the pane more room for its text
+        # or the image more room. The pane keeps the width it has (text changing inside it cannot widen it).
+        self.paned = tk.PanedWindow(main, orient=tk.HORIZONTAL, sashwidth=7, sashrelief=tk.RAISED, bd=0,
+                                    opaqueresize=True, background="gray70")
+        self.paned.grid(row=0, column=0, sticky="nsew")
+        left = ttk.Frame(self.paned, padding=5)
+        draw = ttk.LabelFrame(left, text="Drawing", padding=6)
+        draw.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+        ttk.Label(draw, textvariable=self.var_draw_info, justify=tk.LEFT).pack(anchor="w")
+        ttk.Label(draw, textvariable=self.var_draw_sel, justify=tk.LEFT).pack(anchor="w", padx=(18, 0))
+        self.button_undo_outline = ttk.Button(draw, text="Undo", command=self.undo_outline, state="disabled")
+        self.button_undo_outline.pack(anchor="w", pady=(4, 4))
+        ttk.Label(draw, foreground="gray30", justify=tk.LEFT,
+                  text="click an outline: select it\nthen: drag a square = move it\n"
+                       "drag a box = select squares\ndrag a selection = move the group\n"
+                       "double-click a line = add a vertex\nDelete = remove vertex / outline\n"
+                       "click elsewhere: deselect").pack(anchor="w")
         ttk.Label(left, text="* changed since opened\n~ edited  |  F flipped", foreground="gray30",
-                  justify=tk.LEFT).pack(anchor="w", pady=(4, 0))
+                  justify=tk.LEFT).pack(side=tk.BOTTOM, anchor="w", pady=(4, 0))
+        ttk.Label(left, text="Sections").pack(anchor="w")
+        self.listbox = tk.Listbox(left, width=30, height=12, exportselection=False, activestyle="none",
+                                  font=("Segoe UI", 10))
+        self.listbox.pack(fill=tk.BOTH, expand=True)
+        self.listbox.bind("<<ListboxSelect>>", self.on_list_select)
 
-        self.canvas = tk.Canvas(main, bg="black", highlightthickness=0, cursor="fleur")
-        self.canvas.grid(row=0, column=1, sticky="nsew")
+        self.canvas = tk.Canvas(self.paned, bg="black", highlightthickness=0, cursor="fleur")
+        self.paned.add(left, minsize=180, stretch="never")
+        self.paned.add(self.canvas, minsize=300, stretch="always")
+        self.root.after_idle(lambda: self.paned.paneconfigure(left, width=left.winfo_reqwidth()))   # fix the pane's width
         c = self.canvas
         c.bind("<Configure>", self.on_resize)
-        c.bind("<ButtonPress-1>", lambda e: self.press(e, "rotate" if e.state & 0x1 else
-                                                       "pan" if e.state & 0x4 else "move"))
+        c.bind("<ButtonPress-1>", self.on_left_press)
+        c.bind("<Motion>", self.on_hover)
+        c.bind("<Leave>", self.on_leave_canvas)
+        c.bind("<Double-Button-1>", self.on_double_click)
+        c.bind("<Triple-Button-1>", self.on_double_click)
         c.bind("<ButtonPress-3>", lambda e: self.press(e, "rotate"))
         c.bind("<ButtonPress-2>", lambda e: self.press(e, "pan"))
         for b in ("<B1-Motion>", "<B2-Motion>", "<B3-Motion>"):
@@ -245,7 +276,7 @@ class Aligner:
         c.bind("<MouseWheel>", self.wheel)
 
         right = ttk.Frame(main, padding=5)
-        right.grid(row=0, column=2, sticky="ns")
+        right.grid(row=0, column=1, sticky="ns")
         self.build_right(right)
 
         bottom = ttk.Frame(root, padding=(5, 2))
@@ -358,7 +389,7 @@ class Aligner:
     # ---------------------------------------------------------------- opening
 
     def confirm_discard(self):
-        if self.stack is not None and self.stack.dirty:
+        if self.stack is not None and self.stack.changed:
             return messagebox.askyesno("Unsaved changes",
                                        "Some sections have changes that haven't been exported.\n"
                                        "Discard them?", parent=self.root)
@@ -429,6 +460,8 @@ class Aligner:
         self.stack = stack
         self.previews = {}
         self.undo = []
+        self.outline_undo = []
+        self.sel_outline, self.sel_vertices, self.odrag = False, set(), None
         self.cur = 0
         self.view = None
         self.levels = [[0.0, 65535.0] for _ in range(stack.channels)]
@@ -510,7 +543,7 @@ class Aligner:
     # ---------------------------------------------------------------- list / controls
 
     def section_label(self, s):
-        marks = ("*" if s.dirty else " ") + ("~" if not s.edit.is_identity() else " ") + \
+        marks = ("*" if s.changed else " ") + ("~" if not s.edit.is_identity() else " ") + \
                 ("F" if s.edit.flip else " ")
         return f"{marks}  {s.index + 1}. {os.path.splitext(s.name)[0]}"
 
@@ -542,6 +575,8 @@ class Aligner:
         if not self.stack:
             return
         i = max(0, min(len(self.stack.sections) - 1, i))
+        if i != self.cur:
+            self.sel_outline, self.sel_vertices, self.odrag, self.hover = False, set(), None, None
         self.cur = i
         self.listbox.selection_clear(0, tk.END)
         self.listbox.selection_set(i)
@@ -709,6 +744,9 @@ class Aligner:
                 self.drag["a0"] = math.atan2(-(event.y - cy), event.x - cx)
 
     def motion(self, event):
+        if self.odrag:
+            self.outline_motion(event)
+            return
         d = self.drag
         if not d or not self.view:
             return
@@ -733,6 +771,9 @@ class Aligner:
         self.redraw()
 
     def release(self, _event):
+        if self.odrag:
+            self.outline_release(_event)
+            return
         d, self.drag = self.drag, None
         if d and "edit" in d:
             s = self.stack.sections[self.cur]
@@ -755,6 +796,18 @@ class Aligner:
         if isinstance(event.widget, (tk.Entry, ttk.Entry)) or not self.stack:
             return
         k = event.keysym
+        if event.widget is self.canvas and self.sel_outline:   # (with an outline selected on the image)
+            if k == "Delete":
+                self.delete_selection()
+                return "break"
+            if k == "Escape":
+                self.sel_outline, self.sel_vertices = False, set()
+                self.draw_overlay()
+                return "break"
+            if k in ("Left", "Right", "Up", "Down") and self.sel_vertices:   # the arrows move the selected vertices
+                step = NUDGE_BIG_UM if event.state & 0x1 else NUDGE_UM
+                self.nudge_vertices({"Left": -step, "Right": step}.get(k, 0), {"Up": step, "Down": -step}.get(k, 0))
+                return "break"
         # The arrow keys nudge the image only while the focus is on the image itself; anywhere else (the section list, say)
         # they are left to the widget that has the focus, so in the list they just change the selection. The list's own
         # Page Up / Page Down / Home / End do the same there, so they must not also move the section from here.
@@ -879,7 +932,8 @@ class Aligner:
 
         cur_img, cur_m = self.warp_section(cur, vw, vh)
         ref_img, ref_m = self.warp_section(ref, vw, vh) if ref else (None, None)
-        alpha = float(self.var_opacity.get())
+        alpha = self.effective_opacity()
+        self.image_selected = self.sel_outline
         if self.var_mode.get() == "overlay":
             out = np.zeros((vh, vw, 3), np.float32)
             if ref_img is not None:
@@ -891,9 +945,10 @@ class Aligner:
             rc = self.colorize(ref_img) if ref_img is not None else None
             cc = self.colorize(cur_img) if cur_img is not None else None
             if rc is not None and cc is not None:
-                both = (cur_m & ref_m)[..., None]
-                out = np.where(both, rc * (1 - alpha) + cc * alpha,
-                               np.where(cur_m[..., None], cc, rc))
+                # A true cross-fade in which the empty space outside a section counts as black: where this section is absent the
+                # other one is only (1 - opacity) strong, so at 90% a larger neighbouring section is mostly hidden, not shown
+                # at full strength around this one.
+                out = (np.where(ref_m[..., None], rc, 0.0) * (1 - alpha) + np.where(cur_m[..., None], cc, 0.0) * alpha)
             elif cc is not None:
                 out = cc
             elif rc is not None:
@@ -904,11 +959,42 @@ class Aligner:
         self.photo = ImageTk.PhotoImage(Image.fromarray(rgb))
         c.create_image(0, 0, image=self.photo, anchor="nw")
 
-        # canvas boundary, outlines and pivot
+        self.last_ref, self.last_alpha = ref, alpha
+        self.draw_overlay()
+
+    OUTLINE_EDIT_MIN_OPACITY = 0.9
+
+    def effective_opacity(self):
+        """The opacity slider's value, except that while an outline is selected for editing it is at least 90% for the time being
+        (the neighbouring section then does not clutter the view); the slider itself is not moved."""
+        alpha = float(self.var_opacity.get())
+        return max(alpha, self.OUTLINE_EDIT_MIN_OPACITY) if self.sel_outline else alpha
+
+    def sync_picture_to_selection(self):
+        """Selecting or deselecting an outline changes the opacity the picture is drawn with: redraw it when that matters.
+        Returns True if it redrew (which also redrew the overlay)."""
+        if self.sel_outline == self.image_selected or not self.stack or not self.view:
+            return False
+        if float(self.var_opacity.get()) >= self.OUTLINE_EDIT_MIN_OPACITY:
+            self.image_selected = self.sel_outline   # (already at least 90%: nothing changes)
+            return False
+        self.redraw()
+        return True
+
+    def draw_overlay(self):
+        """Everything drawn over the picture (canvas edge, outlines, pivot cross, vertex squares); can be redrawn alone."""
+        if self.sync_picture_to_selection():
+            return
+        c = self.canvas
+        c.delete("overlay")
+        if not self.stack or not self.view:
+            return
+        vw, vh = c.winfo_width(), c.winfo_height()
+        cur, ref, alpha = self.stack.sections[self.cur], self.last_ref, self.last_alpha
         st = self.stack
         x0, y0 = self.um_to_view((0, 0))
         x1, y1 = self.um_to_view((st.canvas_w * st.pixel_um, -st.canvas_h * st.pixel_um))
-        c.create_rectangle(x0, y0, x1, y1, outline="gray50", dash=(4, 4))
+        c.create_rectangle(x0, y0, x1, y1, outline="gray50", dash=(4, 4), tags="overlay")
         # The outlines (and the pivot cross) fade with their section's opacity: the canvas has no transparency, so each is drawn
         # in its colour dimmed toward the black background by the same weight the image gets (this section: the opacity
         # slider's value, the other one: its complement; with nothing to compare with, this section is at full strength).
@@ -917,10 +1003,260 @@ class Aligner:
             self.draw_outline(ref, shade("#00e5ff", 1 - alpha), dash=(5, 3))
         self.draw_outline(cur, cur_color)
         px, py = self.um_to_view(cur.center + [cur.edit.dx_um, cur.edit.dy_um])
-        c.create_line(px - 8, py, px + 8, py, fill=cur_color)
-        c.create_line(px, py - 8, px, py + 8, fill=cur_color)
+        c.create_line(px - 8, py, px + 8, py, fill=cur_color, tags="overlay")
+        c.create_line(px, py - 8, px, py + 8, fill=cur_color, tags="overlay")
+        self.draw_vertex_marks()
         if cur.index not in self.previews and cur.source_path:
-            c.create_text(vw / 2, 20, text="loading preview...", fill="white")
+            c.create_text(vw / 2, 20, text="loading preview...", fill="white", tags="overlay")
+
+    # ---------------------------------------------------------------- outline editing
+
+    HIT_PX = 8   # how close (screen pixels) a click must be to a vertex or an edge of the outline
+
+    def outline_view_points(self, sec):
+        """The outline's vertices in canvas pixels, an (n, 2) array."""
+        P = sec.stack_points
+        if not len(P) or not self.view:
+            return np.zeros((0, 2))
+        s, ox, oy = self.view
+        px = self.stack.pixel_um
+        return np.column_stack([ox + P[:, 0] / px * s, oy - P[:, 1] / px * s])
+
+    def view_to_source(self, sec, x, y):
+        """A canvas pixel as a point in the section's source coordinates (um)."""
+        s, ox, oy = self.view
+        px = self.stack.pixel_um
+        stack_pt = np.array([(x - ox) / s * px, -(y - oy) / s * px])
+        R, t = sec.effective()
+        return np.linalg.solve(R, stack_pt - t)
+
+    def stack_delta_to_source(self, sec, dx_um, dy_um):
+        R, _ = sec.effective()
+        return np.linalg.solve(R, np.array([dx_um, dy_um]))
+
+    def hit_test(self, x, y):
+        """('vertex', i) or ('edge', i, (x, y) nearest point on the edge from vertex i to the next) for a click at canvas pixel
+        (x, y) near the current section's outline, else None. A vertex wins over an edge."""
+        V = self.outline_view_points(self.stack.sections[self.cur])
+        n = len(V)
+        if not n:
+            return None
+        d = np.hypot(V[:, 0] - x, V[:, 1] - y)
+        i = int(np.argmin(d))
+        if d[i] <= self.HIT_PX:
+            return ("vertex", i)
+        best = None
+        for j in range(n if n > 2 else 1):
+            a, b = V[j], V[(j + 1) % n]
+            ab = b - a
+            L2 = float(ab @ ab)
+            u = 0.0 if L2 == 0 else min(max(float((np.array([x, y]) - a) @ ab) / L2, 0.0), 1.0)
+            q = a + u * ab
+            dist = math.hypot(q[0] - x, q[1] - y)
+            if dist <= self.HIT_PX - 2 and (best is None or dist < best[0]):
+                best = (dist, j, (float(q[0]), float(q[1])))
+        return ("edge", best[1], best[2]) if best else None
+
+    def push_outline_undo(self, sec):
+        self.outline_undo.append((sec.index, sec.case_points.copy()))
+        if len(self.outline_undo) > 500:
+            self.outline_undo.pop(0)
+
+    def undo_outline(self):
+        if not self.outline_undo or not self.stack or self.busy:
+            return
+        i, points = self.outline_undo.pop()
+        self.stack.sections[i].case_points = points
+        self.sel_outline, self.sel_vertices, self.odrag = False, set(), None
+        if i != self.cur:
+            self.select(i)
+        self.refresh_list_item(i)
+        self.draw_overlay()
+
+    def draw_vertex_marks(self, provisional=None):
+        """White squares on the current outline's vertices while it is selected or the pointer is within reach of it (the
+        preview of what a click would select); selected vertices are red, the one under the pointer is orange and larger.
+        `provisional` replaces the selection while a rubber band is being dragged. Also updates the Drawing panel's text
+        (two lines, so the panel never needs to be wider) and its Undo button."""
+        if self.sync_picture_to_selection():
+            return
+        c = self.canvas
+        c.delete("vmarks")
+        sec = self.stack.sections[self.cur] if self.stack else None
+        n = len(sec.case_points) if sec is not None else 0
+        hover = self.hover if (sec is not None and n and self.hover is not None) else None
+        if sec is not None and n and (self.sel_outline or hover is not None):
+            selected = self.sel_vertices if provisional is None else provisional
+            V = self.outline_view_points(sec)
+            if hover is not None and hover[0] == "edge" and hover[1] < n and n > 1:
+                a, b = V[hover[1]], V[(hover[1] + 1) % n]
+                c.create_line(a[0], a[1], b[0], b[1], fill="white", width=3, tags=("overlay", "vmarks"))
+            for i, (x, y) in enumerate(V):
+                red = i in selected
+                over = hover is not None and hover[0] == "vertex" and hover[1] == i
+                half = 6 if over else 4
+                c.create_rectangle(x - half, y - half, x + half, y + half,
+                                   fill="red" if red else "#ff9900" if over else "white", outline="black",
+                                   tags=("overlay", "vmarks"))
+        if sec is None:
+            info, sel_text = "", ""
+        elif not n:
+            info, sel_text = "This section has no outline.", ""
+        elif not self.sel_outline:
+            info, sel_text = f"Outline: {n} vertices", ""
+        else:
+            sel = len(self.sel_vertices if provisional is None else provisional)
+            info, sel_text = f"Outline selected: {n} vertices", (f"{sel} selected" if sel else "")
+        self.var_draw_info.set(info)
+        self.var_draw_sel.set(sel_text)
+        self.button_undo_outline.config(state="normal" if self.outline_undo and self.stack else "disabled")
+
+    def on_hover(self, event):
+        """The pointer moved over the image (no button down): note whether it is within reach of the current outline's vertex
+        or edge, and redraw the squares when that changes."""
+        if self.odrag or self.drag or not self.stack or not self.view:
+            return
+        sec = self.stack.sections[self.cur]
+        hit = self.hit_test(event.x, event.y) if len(sec.case_points) else None
+        hover = None if hit is None else (hit[0], hit[1])
+        if hover != self.hover:
+            self.hover = hover
+            self.draw_vertex_marks()
+
+    def on_leave_canvas(self, _event=None):
+        if self.hover is not None:
+            self.hover = None
+            if self.stack and self.view:
+                self.draw_vertex_marks()
+
+    def on_left_press(self, event):
+        """A plain left press: with the current outline selected, or on it, this works on the outline; anywhere else it moves
+        the section as before (Shift rotates and Ctrl pans, so those never touch the outline)."""
+        mode = "rotate" if event.state & 0x1 else "pan" if event.state & 0x4 else "move"
+        if not self.stack or not self.view or mode != "move":
+            return self.press(event, mode)
+        sec = self.stack.sections[self.cur]
+        if not len(sec.case_points):
+            return self.press(event, mode)
+        hit = self.hit_test(event.x, event.y)
+        if not self.sel_outline and hit is None:
+            return self.press(event, mode)
+        self.canvas.focus_set()
+        ctx = {"x0": event.x, "y0": event.y, "moved": False, "kind": "none"}
+        if hit is not None and hit[0] == "vertex":
+            i = hit[1]
+            if not self.sel_outline:
+                self.sel_outline, self.sel_vertices = True, {i}
+            elif i not in self.sel_vertices:
+                self.sel_vertices = {i}
+            ctx.update(kind="vertex", clicked=i, start=sec.case_points.copy(), idx=sorted(self.sel_vertices))
+        elif not self.sel_outline:
+            self.sel_outline, self.sel_vertices = True, set()   # (pressed on a line: just select the outline)
+        elif hit is None:
+            ctx.update(kind="rubber")
+            self.prov_sel = set()
+        self.odrag = ctx
+        self.draw_vertex_marks()
+
+    def on_double_click(self, event):
+        """Double-click on a line of the current outline: add a vertex there."""
+        if not self.stack or not self.view or event.state & 0x5:
+            return self.on_left_press(event)
+        sec = self.stack.sections[self.cur]
+        hit = self.hit_test(event.x, event.y) if len(sec.case_points) else None
+        if hit is None or hit[0] != "edge":
+            return self.on_left_press(event)
+        j, (qx, qy) = hit[1], hit[2]
+        self.push_outline_undo(sec)
+        pts = sec.case_points
+        sec.case_points = np.insert(pts, j + 1, self.view_to_source(sec, qx, qy), axis=0)
+        self.sel_outline, self.sel_vertices, self.odrag = True, {j + 1}, None
+        self.canvas.focus_set()
+        self.refresh_list_item(sec.index)
+        self.draw_overlay()
+
+    def outline_motion(self, event):
+        d = self.odrag
+        sec = self.stack.sections[self.cur]
+        if not d["moved"] and math.hypot(event.x - d["x0"], event.y - d["y0"]) > 4:
+            d["moved"] = True
+            if d["kind"] == "vertex":
+                self.push_outline_undo(sec)
+                sec.case_points = d["start"].copy()
+        if not d["moved"]:
+            return
+        if d["kind"] == "vertex":
+            s = self.view[0]
+            px = self.stack.pixel_um
+            delta = self.stack_delta_to_source(sec, (event.x - d["x0"]) / s * px, -(event.y - d["y0"]) / s * px)
+            pts = d["start"].copy()
+            pts[d["idx"]] += delta
+            sec.case_points = pts
+            self.draw_overlay()
+        elif d["kind"] == "rubber":
+            self.canvas.delete("rubber")
+            self.canvas.create_rectangle(d["x0"], d["y0"], event.x, event.y, outline="white", dash=(3, 3),
+                                         tags=("overlay", "rubber"))
+            V = self.outline_view_points(sec)
+            lo_x, hi_x = sorted((d["x0"], event.x))
+            lo_y, hi_y = sorted((d["y0"], event.y))
+            inside = (V[:, 0] >= lo_x) & (V[:, 0] <= hi_x) & (V[:, 1] >= lo_y) & (V[:, 1] <= hi_y)
+            self.prov_sel = set(int(i) for i in np.flatnonzero(inside))
+            self.draw_vertex_marks(provisional=self.prov_sel)
+
+    def outline_release(self, event):
+        d, self.odrag = self.odrag, None
+        sec = self.stack.sections[self.cur]
+        if d["kind"] == "vertex":
+            if not d["moved"]:
+                self.sel_vertices = {d["clicked"]}   # a click on a vertex: just that one
+            else:
+                self.refresh_list_item(sec.index)
+        elif d["kind"] == "rubber":
+            self.canvas.delete("rubber")
+            if d["moved"]:
+                self.sel_vertices = set(self.prov_sel)   # the outline stays selected
+            else:
+                self.sel_outline, self.sel_vertices = False, set()   # a click on empty image: back to moving the section
+        self.prov_sel = set()
+        self.draw_overlay()
+
+    def delete_selection(self):
+        """Delete: the selected vertices, or, with only the outline selected, the whole outline (after asking)."""
+        sec = self.stack.sections[self.cur]
+        n = len(sec.case_points)
+        if not (self.sel_outline and n):
+            return
+        whole, asked = not self.sel_vertices, False
+        if self.sel_vertices and n - len(self.sel_vertices) < 3:
+            if not messagebox.askyesno(
+                    "Delete the outline?", f"Deleting these {len(self.sel_vertices)} vertices would leave fewer than 3, "
+                    "which is no longer an outline. Delete the whole outline instead?", icon="warning", parent=self.root):
+                return
+            whole, asked = True, True   # (that question already was the warning)
+        if whole and not asked and not messagebox.askyesno(
+                "Delete the whole outline?", f"Delete the entire outline of section {sec.index + 1} ({n} vertices)?"
+                "\n\nThe Undo button in the Drawing panel can bring it back.", icon="warning", parent=self.root):
+            return
+        self.push_outline_undo(sec)
+        if whole:
+            sec.case_points = np.zeros((0, 2))
+            self.sel_outline = False
+        else:
+            keep = [i for i in range(n) if i not in self.sel_vertices]
+            sec.case_points = sec.case_points[keep]
+        self.sel_vertices = set()
+        self.refresh_list_item(sec.index)
+        self.draw_overlay()
+
+    def nudge_vertices(self, dx_um, dy_um):
+        sec = self.stack.sections[self.cur]
+        self.push_outline_undo(sec)
+        pts = sec.case_points.copy()
+        pts[sorted(self.sel_vertices)] += self.stack_delta_to_source(sec, dx_um, dy_um)
+        sec.case_points = pts
+        self.refresh_list_item(sec.index)
+        self.draw_overlay()
 
     def draw_crosshair(self, rgb):
         """One-pixel dashed vertical and horizontal lines meeting at the centre of the canvas, blended into the picture at
@@ -935,16 +1271,19 @@ class Aligner:
 
     def draw_outline(self, sec, color, dash=None):
         pts = sec.stack_points
+        if len(pts) < 2:
+            return
         coords = []
         for p in np.vstack([pts, pts[:1]]):
             coords.extend(self.um_to_view(p))
-        self.canvas.create_line(*coords, fill=color, width=2, dash=dash)
+        self.canvas.create_line(*coords, fill=color, width=2, dash=dash, tags="overlay")
 
     # ---------------------------------------------------------------- export
 
     def export_dialog(self):
         if not self.stack or self.busy:
             return
+        print("Preparing for JPX export", flush=True)   # (the checks and questions below can take a few seconds to appear)
         st = self.stack
         try:
             quality = float(self.var_quality.get())
@@ -953,7 +1292,7 @@ class Aligner:
             return
         rerender_all = self.var_rerender.get()
         todo = [s for s in st.sections if rerender_all or s.dirty]
-        if not any(s.dirty for s in st.sections):   # (also when "re-render unchanged sections too" would still write every image)
+        if not any(s.changed for s in st.sections):   # (also when "re-render unchanged sections too" would still write every image)
             same = ("every image would be re-rendered, but with the same placement as before" if rerender_all
                     else "the images would be copied unchanged")
             if not messagebox.askyesno("Nothing changed",
@@ -979,7 +1318,7 @@ class Aligner:
             return
         out = filedialog.asksaveasfilename(
             parent=self.root, title="Export JPX", initialdir=st.folder,
-            initialfile=ns.next_free_name(st.folder), defaultextension=".jpx",
+            initialfile=os.path.basename(st.jpx_path), defaultextension=".jpx",   # (the dialog asks before overwriting)
             filetypes=[("JPX stacks", "*.jpx")])
         if not out:
             return
@@ -1018,6 +1357,7 @@ class Aligner:
             messagebox.showerror("Export failed", error, parent=self.root)
             return
         self.progress.config(value=self.progress["maximum"])
+        add_recent(out)   # the exported file joins the File > Open recent list (an existing entry just moves to the top)
         self.var_status.set(f"Exported {os.path.basename(out)} in {seconds:.0f} s. "
                             "Now editing the exported file.")
         # Continue from the exported file, so later exports only re-render later changes
@@ -1030,6 +1370,8 @@ class Aligner:
         self.stack = stack
         self.previews, self.view, self.cur = keep_previews, keep_view, cur
         self.undo = []
+        self.outline_undo = []
+        self.sel_outline, self.sel_vertices, self.odrag = False, set(), None
         self.root.title(f"JPX aligner - {os.path.basename(out)}")
         self.refresh_list()
         self.update_controls()

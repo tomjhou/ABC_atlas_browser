@@ -86,7 +86,7 @@ XMP_UUID = bytes.fromhex("be7acfcb97a942e89c71999491e3afac")
 # Private box holding this tool's JSON description of the stack
 ALIGNER_UUID = bytes.fromhex("4a686f754c61624a5058416c69676e31")  # "JhouLabJPXAlign1"
 JSON_FORMAT = "jhoulab-jpx-aligner"
-JSON_VERSION = 1
+JSON_VERSION = 2   # the newest alignment data this version can read (2: edited outlines, with a fixed edit pivot)
 
 
 class UserCanceled(Exception):
@@ -224,6 +224,16 @@ class Section:
     edit: Edit = field(default_factory=Edit)
     saved_edit: Edit = field(default_factory=Edit)  # what the opened file's frame shows
     source_abs_hint: str = ""                        # path recorded in the file
+    pivot_src: np.ndarray = None   # the edit pivot in source um (fixed when first opened, so editing the outline does not move it)
+    saved_points: np.ndarray = None  # the outline as the opened file has it (to tell whether it was edited)
+
+    def __post_init__(self):
+        self.case_points = np.asarray(self.case_points, float).reshape(-1, 2)
+        if self.pivot_src is None:
+            self.pivot_src = self.case_points.mean(0) if len(self.case_points) else np.zeros(2)
+        self.pivot_src = np.asarray(self.pivot_src, float)
+        if self.saved_points is None:
+            self.saved_points = self.case_points.copy()
 
     @property
     def base_stack_points(self):
@@ -231,8 +241,9 @@ class Section:
 
     @property
     def center(self):
-        """Edit pivot: centroid of the outline under the base transform."""
-        return self.base_stack_points.mean(0)
+        """Edit pivot: the centroid of the outline as first opened, under the base transform (not recomputed when the outline
+        is edited, or the image would jump)."""
+        return self.R @ self.pivot_src + self.t
 
     def effective(self):
         """(R, t) including the edit: source um -> stack um."""
@@ -257,7 +268,17 @@ class Section:
 
     @property
     def dirty(self):
+        """The placement was edited: the image has to be rendered again."""
         return not self.edit.same_as(self.saved_edit)
+
+    @property
+    def outline_dirty(self):
+        """The outline was edited (vertices moved, added or removed, or the whole outline deleted)."""
+        return not (self.case_points.shape == self.saved_points.shape and np.array_equal(self.case_points, self.saved_points))
+
+    @property
+    def changed(self):
+        return self.dirty or self.outline_dirty
 
 
 @dataclass
@@ -287,12 +308,18 @@ class Stack:
     def dirty(self):
         return any(s.dirty for s in self.sections)
 
+    @property
+    def changed(self):
+        return any(s.changed for s in self.sections)
+
     def out_of_canvas(self):
         """Sections whose outline extends past the canvas, with the overhang in um."""
         w_um, h_um = self.canvas_w * self.pixel_um, self.canvas_h * self.pixel_um
         bad = []
         for s in self.sections:
             P = s.stack_points
+            if not len(P):
+                continue
             over = max(-P[:, 0].min(), P[:, 0].max() - w_um, P[:, 1].max(), -h_um - P[:, 1].min(), 0)
             if over > 0:
                 bad.append((s, over))
@@ -433,8 +460,9 @@ def _load_aligner(jpx_path, doc):
         e = Edit(**d["edit"])
         stack.sections.append(Section(
             i, d["name"], resolve_source(folder, d["name"], d.get("source_relative", ""), d.get("source_absolute", "")),
-            np.array(d["case_points"], float), np.array(d["base_R"], float), np.array(d["base_t"], float),
-            edit=copy.copy(e), saved_edit=copy.copy(e), source_abs_hint=d.get("source_absolute", "")))
+            np.array(d["case_points"], float).reshape(-1, 2), np.array(d["base_R"], float), np.array(d["base_t"], float),
+            edit=copy.copy(e), saved_edit=copy.copy(e), source_abs_hint=d.get("source_absolute", ""),
+            pivot_src=d.get("pivot_src")))
     frames = [b for b in read_boxes(jpx_path) if b.kind == b"jp2c"]
     if len(stack.sections) != len(frames):
         raise ValueError("Alignment data doesn't match the number of images in this JPX")
@@ -476,10 +504,15 @@ def stack_json(stack, out_path):
             "base_R": np.round(s.R, 12).tolist(),
             "base_t": np.round(s.t, 6).tolist(),
             "case_points": np.round(s.case_points, 4).tolist(),
+            "pivot_src": np.round(s.pivot_src, 6).tolist(),
             "edit": asdict(s.edit),
         })
+    # Version 2 only when needed (an outline was edited or removed, so the pivot is no longer the outline's centroid);
+    # otherwise the file stays readable by the first version of this tool.
+    needs_v2 = any(not len(s.case_points) or not np.allclose(s.pivot_src, s.case_points.mean(0), atol=1e-4)
+                   for s in stack.sections)
     return {
-        "format": JSON_FORMAT, "version": JSON_VERSION,
+        "format": JSON_FORMAT, "version": 2 if needs_v2 else 1,
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
         "origin": stack.origin, "pixel_um": stack.pixel_um,
         "canvas": [stack.canvas_w, stack.canvas_h], "channels": stack.channels,
