@@ -136,6 +136,35 @@ def clear_recent():
         pass
 
 
+def load_frame_preview(jpx_path, frame_box, index):
+    """Downsampled copy of one frame of the JPX itself (the same kind of tuple as load_preview), cached on disk. Used for
+    sections whose source image this tool cannot read: the frame is already on the stack canvas, so it is shown as it is."""
+    st = os.stat(jpx_path)
+    key = f"frame|{os.path.abspath(jpx_path).lower()}|{st.st_size}|{st.st_mtime_ns}|{index}|{PREVIEW_MAX_PX}"
+    path = os.path.join(CACHE_DIR, hashlib.sha1(key.encode()).hexdigest() + ".npz")
+    if os.path.isfile(path):
+        try:
+            with np.load(path) as d:
+                return d["img"], float(d["kx"]), float(d["ky"])
+        except Exception:
+            pass  # rebuild a damaged cache file
+    with open(jpx_path, "rb") as f:
+        full = imagecodecs.jpeg2k_decode(ns.read_payload(f, frame_box))
+    if full.ndim == 2:
+        full = full[..., None]
+    h, w = full.shape[:2]
+    k = max(1, math.ceil(max(h, w) / PREVIEW_MAX_PX))
+    pw, ph = max(1, round(w / k)), max(1, round(h / k))
+    img = np.stack([cv2.resize(full[..., c], (pw, ph), interpolation=cv2.INTER_AREA)
+                    for c in range(full.shape[2])], -1)
+    del full
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    tmp = path + ".partial.npz"
+    np.savez(tmp, img=img, kx=w / pw, ky=h / ph)
+    os.replace(tmp, path)
+    return img, w / pw, h / ph
+
+
 def human_gb(n):
     return f"{n / 1e9:.1f} GB" if n >= 1e8 else f"{n / 1e6:.0f} MB"
 
@@ -160,6 +189,7 @@ class Aligner:
         self.root.geometry("1500x950")
         self.stack = None
         self.previews = {}          # section index -> (img, kx, ky)
+        self.frame_previews = set()  # indices of sections whose preview is the JPX's own frame (not rendered from a source image)
         self.cur = 0
         self.undo = []              # steps: each a list of (section index, Edit before the change)
         self.drag = None
@@ -448,7 +478,28 @@ class Aligner:
                 "These section images weren't found, so they can't be shown or re-rendered "
                 "(their current images in the JPX are kept as they are):\n\n" + "\n".join(missing),
                 parent=self.root)
-        need = [s for s in stack.sections if s.source_path and not preview_is_cached(s.source_path)]
+        if stack.source_pixel_um and abs(stack.source_pixel_um / stack.pixel_um - 1) > 0.01:
+            if messagebox.askyesno(
+                    "Pixel size doesn't match the source images",
+                    f"This reconstruction is labelled with a pixel size of {stack.pixel_um:g} um (in reconstruction.xml and the "
+                    f"JPX's metadata), but its source images have {stack.source_pixel_um:g} um (from CaseFile.H5). The outlines "
+                    "show that NeuroInfo laid the images out one source pixel to one stack pixel, so the label looks wrong "
+                    "(typically because the size was typed in by hand when the stack was built).\n\n"
+                    f"Correct the pixel size to {stack.source_pixel_um:g} um?\n\n"
+                    "If you choose Yes, all lengths here (shifts, outlines) are shown in the corrected units, and the next "
+                    "export writes the corrected pixel size into the JPX's metadata. reconstruction.xml is not changed.",
+                    icon="warning", parent=self.root):
+                stack.apply_pixel_size(stack.source_pixel_um)
+        unreadable = sorted({os.path.basename(s.source_path) for s in stack.sections if s.source_path and not s.renderable})
+        if unreadable:
+            messagebox.showinfo(
+                "Source images this tool can't read",
+                f"{sum(1 for s in stack.sections if s.source_path and not s.renderable)} of the {len(stack.sections)} sections "
+                "come from source images that are not JPEG 2000 files (for example Zeiss .czi):\n\n"
+                + "\n".join(unreadable[:6]) + ("\n..." if len(unreadable) > 6 else "")
+                + "\n\nFor those sections the picture is the JPX's own frame, their alignment can't be edited here, and "
+                "their outlines can. Exporting copies their frames unchanged.", parent=self.root)
+        need = [s for s in stack.sections if s.renderable and not preview_is_cached(s.source_path)]
         online = [s for s in need if ns.is_online_only(s.source_path)]
         if online:
             size = sum(os.path.getsize(s.source_path) for s in online)
@@ -459,6 +510,7 @@ class Aligner:
                 return
         self.stack = stack
         self.previews = {}
+        self.frame_previews = set()
         self.undo = []
         self.outline_undo = []
         self.sel_outline, self.sel_vertices, self.odrag = False, set(), None
@@ -477,7 +529,7 @@ class Aligner:
 
     def start_preview_loading(self):
         stack = self.stack
-        todo = [s for s in stack.sections if s.source_path]
+        todo = list(stack.sections)
         self.progress.config(maximum=max(len(todo), 1), value=0)
         self.loading_previews = bool(todo)
         self.update_cursor()
@@ -485,18 +537,26 @@ class Aligner:
         todo.sort(key=lambda s: abs(s.index - self.cur))
 
         def work():
+            frame_boxes = None
             for n, s in enumerate(todo, 1):
                 if self.stack is not stack:
                     return
-                cached = preview_is_cached(s.source_path)
-                self.msgs.put(("status", f"{'Loading' if cached else 'Building'} preview of {s.name} "
-                                         f"({n} of {len(todo)})..."))
+                is_frame = not s.renderable
                 try:
-                    pv = load_preview(s.source_path)
+                    if is_frame:
+                        if frame_boxes is None:
+                            frame_boxes = [b for b in ns.read_boxes(stack.jpx_path) if b.kind == b"jp2c"]
+                        self.msgs.put(("status", f"Loading the frame of {s.name} (section {s.index + 1}; {n} of {len(todo)})..."))
+                        pv = load_frame_preview(stack.jpx_path, frame_boxes[s.index], s.index)
+                    else:
+                        cached = preview_is_cached(s.source_path)
+                        self.msgs.put(("status", f"{'Loading' if cached else 'Building'} preview of {s.name} "
+                                                 f"({n} of {len(todo)})..."))
+                        pv = load_preview(s.source_path)
                 except Exception as e:
                     self.msgs.put(("status", f"Couldn't read {s.name}: {e}"))
                     continue
-                self.msgs.put(("preview", (stack, s.index, pv, n)))
+                self.msgs.put(("preview", (stack, s.index, pv, n, is_frame)))
             self.msgs.put(("loaded", (stack, f"Ready. {len(todo)} sections loaded.")))
 
         threading.Thread(target=work, daemon=True).start()
@@ -514,9 +574,11 @@ class Aligner:
                         self.update_cursor()
                         self.var_status.set(text)
                 elif kind == "preview":
-                    stack, idx, pv, n = payload
+                    stack, idx, pv, n, is_frame = payload
                     if stack is self.stack:
                         self.previews[idx] = pv
+                        if is_frame:
+                            self.frame_previews.add(idx)
                         self.progress.config(value=n)
                         if not self.levels_set:
                             self.auto_levels(pv[0])
@@ -554,7 +616,7 @@ class Aligner:
         for s in self.stack.sections:
             self.listbox.insert(tk.END, self.section_label(s))
             if not s.source_path:
-                self.listbox.itemconfig(tk.END, foreground="gray60")
+                self.listbox.itemconfig(tk.END, foreground="gray60")   # (no source image: only its frame can be shown)
         self.listbox.selection_clear(0, tk.END)
         self.listbox.selection_set(self.cur)
         self.listbox.see(self.cur)
@@ -597,7 +659,10 @@ class Aligner:
         self.label_detail.config(
             text=f"Edit is relative to NeuroInfo's alignment\n(base: {base}).\n"
                  f"Net: rotation {-s.rotation_deg:+.2f}° (clockwise), {'mirrored' if s.mirrored else 'not mirrored'}"
-                 + ("" if s.source_path else "\nSource image not found: can't edit."))
+                 + ("" if s.renderable else
+                    "\nSource image not found: can't edit." if not s.source_path else
+                    "\nSource image is not a JPEG 2000 file: the picture is the JPX's own frame; "
+                    "alignment can't be edited, the outline can."))
 
     # ---------------------------------------------------------------- editing
 
@@ -605,11 +670,11 @@ class Aligner:
         if not self.stack or self.busy:
             return None
         s = self.stack.sections[self.cur]
-        return s if s.source_path else None
+        return s if s.renderable else None
 
     def followers(self, s):
-        """The sections after `s` that can be edited (their source image was found)."""
-        return [f for f in self.stack.sections[s.index + 1:] if f.source_path]
+        """The sections after `s` whose alignment can be edited (their source image was found and can be read)."""
+        return [f for f in self.stack.sections[s.index + 1:] if f.renderable]
 
     def push_undo(self, s):
         """Remember the edit of `s` (and, with "also move the following sections" on, of the sections after it, which an edit
@@ -881,8 +946,11 @@ class Aligner:
         img, kx, ky = pv
         s, ox, oy = self.view
         A = np.array([[1 / s, 0, -ox / s], [0, 1 / s, -oy / s], [0, 0, 1]])        # view -> canvas px
-        R, t = sec.effective()
-        M = np.vstack([ns.canvas_to_source_matrix(R, t, self.stack.pixel_um), [0, 0, 1]])  # -> source px
+        if sec.index in self.frame_previews:   # the JPX's own frame: already on the canvas, so canvas px = frame px
+            M = np.eye(3)
+        else:
+            R, t = sec.effective()
+            M = np.vstack([ns.canvas_to_source_matrix(R, t, self.stack.pixel_um), [0, 0, 1]])  # -> source px
         P = np.array([[1 / kx, 0, 0.5 / kx - 0.5], [0, 1 / ky, 0.5 / ky - 0.5], [0, 0, 1]])  # -> preview px
         T = (P @ M @ A)[:2]
         flags = cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP
@@ -1006,7 +1074,7 @@ class Aligner:
         c.create_line(px - 8, py, px + 8, py, fill=cur_color, tags="overlay")
         c.create_line(px, py - 8, px, py + 8, fill=cur_color, tags="overlay")
         self.draw_vertex_marks()
-        if cur.index not in self.previews and cur.source_path:
+        if cur.index not in self.previews and self.loading_previews:
             c.create_text(vw / 2, 20, text="loading preview...", fill="white", tags="overlay")
 
     # ---------------------------------------------------------------- outline editing
@@ -1291,8 +1359,8 @@ class Aligner:
             messagebox.showerror("Quality", "Quality must be a number of dB, e.g. 60.", parent=self.root)
             return
         rerender_all = self.var_rerender.get()
-        todo = [s for s in st.sections if rerender_all or s.dirty]
-        if not any(s.changed for s in st.sections):   # (also when "re-render unchanged sections too" would still write every image)
+        todo = [s for s in st.sections if s.renderable and (rerender_all or s.dirty)]   # (others: frames copied as they are)
+        if not st.changed:   # (also when "re-render unchanged sections too" would still write every image)
             same = ("every image would be re-rendered, but with the same placement as before" if rerender_all
                     else "the images would be copied unchanged")
             if not messagebox.askyesno("Nothing changed",

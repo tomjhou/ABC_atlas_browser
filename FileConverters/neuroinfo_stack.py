@@ -84,6 +84,7 @@ import numpy as np  # noqa: E402
 DEFAULT_QUALITY_DB = 60.0
 XMP_UUID = bytes.fromhex("be7acfcb97a942e89c71999491e3afac")
 # Private box holding this tool's JSON description of the stack
+JP2_EXTENSIONS = (".jp2", ".j2k", ".j2c", ".jpx")   # the section images this tool can re-render (others, e.g. Zeiss .czi, cannot)
 ALIGNER_UUID = bytes.fromhex("4a686f754c61624a5058416c69676e31")  # "JhouLabJPXAlign1"
 JSON_FORMAT = "jhoulab-jpx-aligner"
 JSON_VERSION = 2   # the newest alignment data this version can read (2: edited outlines, with a fixed edit pivot)
@@ -240,6 +241,12 @@ class Section:
         return (self.R @ self.case_points.T).T + self.t
 
     @property
+    def renderable(self):
+        """The source image was found and is one this tool can read, so the section can be re-rendered (and its alignment
+        edited). Otherwise the section only has its frame in the JPX, which is shown as it is; its outline can still be edited."""
+        return bool(self.source_path) and self.source_path.lower().endswith(JP2_EXTENSIONS)
+
+    @property
     def center(self):
         """Edit pivot: the centroid of the outline as first opened, under the base transform (not recomputed when the outline
         is edited, or the image would jump)."""
@@ -299,6 +306,25 @@ class Stack:
     channel_info: list = field(default_factory=list)
     origin: str = ""         # the original NeuroInfo jpx this descends from
     from_aligner: bool = False
+    source_pixel_um: float = 0.0     # the source images' pixel size, when it differs from pixel_um (the stack's label)
+    pixel_corrected: bool = False    # pixel_um was changed here: the next export writes it into the JPX's own metadata
+
+    def apply_pixel_size(self, new_um):
+        """Relabel the stack with pixel size `new_um` (the source images' true pixel size). Every length in um follows: the
+        outlines, the pivots, the base transforms' shifts and the edits' shifts are multiplied by new/old, so everything stays
+        where it is in pixels. The next export writes the new size into the JPX's metadata."""
+        f = float(new_um) / self.pixel_um
+        for sec in self.sections:
+            sec.case_points = sec.case_points * f
+            sec.saved_points = sec.saved_points * f
+            sec.pivot_src = sec.pivot_src * f
+            sec.t = sec.t * f
+            for name in ("edit", "saved_edit"):
+                e = getattr(sec, name)
+                setattr(sec, name, Edit(e.rotation_deg, e.dx_um * f, e.dy_um * f, e.flip))
+        self.pixel_um = float(new_um)
+        self.source_pixel_um = 0.0
+        self.pixel_corrected = True
 
     @property
     def folder(self):
@@ -310,7 +336,7 @@ class Stack:
 
     @property
     def changed(self):
-        return any(s.changed for s in self.sections)
+        return self.pixel_corrected or any(s.changed for s in self.sections)
 
     def out_of_canvas(self):
         """Sections whose outline extends past the canvas, with the overhang in um."""
@@ -442,6 +468,17 @@ def _load_neuroinfo(jpx_path):
                 raise ValueError(f"{name}: outline in {xml_name} missing or doesn't match CaseFile.H5")
             R, t, err = fit_rigid(P, Q)
             if err > 1.0:
+                # Some source images (e.g. Zeiss .czi slides) have a different pixel size from the stack's (0.65 um against
+                # 0.575 in the example this was worked out from): NeuroInfo maps one source pixel to one stack pixel, so the
+                # outline in um differs by the ratio of the pixel sizes. Expressing the source outline in um at the stack's
+                # pixel size makes the fit rigid again (error ~0.004 um), and the section's source "um" then are the stack's.
+                spacing = c["ImageFile"].attrs.get("SpacingXY")
+                scale = pixel_um / float(np.mean(spacing)) if spacing is not None and float(np.mean(spacing)) > 0 else 1.0
+                R2, t2, err2 = fit_rigid(P * scale, Q)
+                if err2 <= 1.0:
+                    P, R, t, err = P * scale, R2, t2, err2
+                    stack.source_pixel_um = round(float(np.mean(spacing)), 6)   # (offered to the user as a correction, see the aligner)
+            if err > 1.0:
                 raise ValueError(f"{name}: outlines don't fit a rigid transform (error {err:.2f} um)")
             stack.sections.append(Section(i, name, resolve_source(folder, name, absolute=recorded),
                                           P, R, t, source_abs_hint=recorded))
@@ -455,7 +492,7 @@ def _load_aligner(jpx_path, doc):
         raise ValueError("Unrecognized alignment data in this JPX (made by a newer version?)")
     folder = os.path.dirname(os.path.abspath(jpx_path))
     stack = Stack(jpx_path, doc["canvas"][0], doc["canvas"][1], doc["channels"], doc["pixel_um"],
-                  origin=doc.get("origin", ""), from_aligner=True)
+                  origin=doc.get("origin", ""), from_aligner=True, source_pixel_um=float(doc.get("source_pixel_um", 0.0)))
     for i, d in enumerate(doc["sections"]):
         e = Edit(**d["edit"])
         stack.sections.append(Section(
@@ -515,6 +552,7 @@ def stack_json(stack, out_path):
         "format": JSON_FORMAT, "version": 2 if needs_v2 else 1,
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
         "origin": stack.origin, "pixel_um": stack.pixel_um,
+        "source_pixel_um": stack.source_pixel_um,
         "canvas": [stack.canvas_w, stack.canvas_h], "channels": stack.channels,
         "sections": secs,
     }
@@ -561,7 +599,16 @@ def encode_frame(image, quality_db=DEFAULT_QUALITY_DB):
     return add_com_markers(cs, ["MBF Bioscience"])
 
 
-def write_jpx_like(template_path, codestreams, out_path, extra_payloads=()):
+def patch_xmp_pixel_size(payload, pixel_um):
+    """The MBF XMP (a uuid box payload, UUID first) with its images' PixelWidth/PixelHeight set to `pixel_um`."""
+    text = payload[16:].decode("utf-8", "replace")
+    value = f"{pixel_um:.6f}"
+    text = re.sub(r'(\sxmp:PixelWidth=")[^"]*(")', lambda m: m.group(1) + value + m.group(2), text)
+    text = re.sub(r'(\sxmp:PixelHeight=")[^"]*(")', lambda m: m.group(1) + value + m.group(2), text)
+    return payload[:16] + text.encode("utf-8")
+
+
+def write_jpx_like(template_path, codestreams, out_path, extra_payloads=(), pixel_um=None):
     """Copy template_path's boxes verbatim, replacing its jp2c codestreams in
     order with `codestreams` (bytes, or callables returning bytes), dropping
     any old aligner box and appending `extra_payloads` as uuid boxes."""
@@ -580,6 +627,9 @@ def write_jpx_like(template_path, codestreams, out_path, extra_payloads=()):
                     i += 1
                     continue
                 if b.kind == b"uuid" and read_payload(src, b, 16) == ALIGNER_UUID:
+                    continue
+                if pixel_um is not None and b.kind == b"uuid" and read_payload(src, b, 16) == XMP_UUID:
+                    dst.write(box_bytes(b"uuid", patch_xmp_pixel_size(read_payload(src, b), pixel_um)))   # corrected pixel size
                     continue
                 src.seek(b.offset)
                 dst.write(src.read(b.length))
@@ -600,7 +650,8 @@ def export_stack(stack, out_path, quality_db=DEFAULT_QUALITY_DB, rerender_all=Fa
     the opened file are copied unchanged unless rerender_all.
     progress(i, n, text) is called before each section."""
     frames = [b for b in read_boxes(stack.jpx_path) if b.kind == b"jp2c"]
-    todo = [s for s in stack.sections if rerender_all or s.dirty]
+    # (a section whose source image cannot be read, e.g. a .czi, is never re-rendered: its frame is copied as it is)
+    todo = [s for s in stack.sections if s.renderable and (rerender_all or s.dirty)]
     missing = [s.name for s in todo if not s.source_path]
     if missing:
         raise FileNotFoundError("Source images not found: " + ", ".join(missing))
@@ -625,7 +676,8 @@ def export_stack(stack, out_path, quality_db=DEFAULT_QUALITY_DB, rerender_all=Fa
             log(f"  {s.name}: re-rendered ({len(cs) / 1e6:.1f} MB, {time.time() - t0:.0f} s)")
     doc = stack_json(stack, out_path)
     write_jpx_like(stack.jpx_path, codestreams, out_path,
-                   extra_payloads=[ALIGNER_UUID + json.dumps(doc, separators=(",", ":")).encode("utf-8")])
+                   extra_payloads=[ALIGNER_UUID + json.dumps(doc, separators=(",", ":")).encode("utf-8")],
+                   pixel_um=stack.pixel_um if stack.pixel_corrected else None)
     log(f"Wrote {out_path} ({os.path.getsize(out_path) / 1e6:.0f} MB; {n_render} re-rendered, "
         f"{len(stack.sections) - n_render} copied)")
     return n_render
