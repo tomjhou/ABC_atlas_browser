@@ -57,6 +57,14 @@ CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
                          "JhouLab", "jpx_aligner_cache")
 SETTINGS_FILE = os.path.join(os.path.dirname(CACHE_DIR), "jpx_aligner_settings.json")
 RECENT_MAX = 10
+
+# The pointer over the image says what a drag would do (Tk's built-in cursor names).
+CURSOR_MOVE = "fleur"          # drag moves the section
+CURSOR_ROTATE = "exchange"     # Shift held: drag rotates it
+CURSOR_PAN = "hand1"           # Ctrl held: drag pans the view
+CURSOR_SELECT = "crosshair"    # outline selected, over empty space: drag makes a selection box
+CURSOR_GRAB = "hand2"          # over a vertex (or the outline): click selects, drag moves it
+CURSOR_ADD = "plus"            # over a line of the outline: double-click adds a vertex
 NUDGE_UM, NUDGE_BIG_UM = 5.0, 50.0
 ROT_STEP, ROT_BIG_STEP = 0.1, 1.0
 
@@ -249,6 +257,9 @@ class Aligner:
         self.var_draw_info = tk.StringVar(self.root, "")
         self.var_draw_sel = tk.StringVar(self.root, "")   # second, indented line: how many vertices are selected
         self.hover = None           # ('vertex', i) or ('edge', i) under the pointer, for the current outline
+        self.mod_shift = self.mod_ctrl = False   # Shift / Ctrl are held (for the cursor)
+        self.pointer_in_canvas = False           # the pointer is over the image (for the hint in the status bar)
+        self.canvas_cursor_now = None
         self.opening = False        # a stack is being opened
         self.loading_previews = False   # section images are still being loaded in the background
         self.levels = []            # per channel [lo, hi] (display only)
@@ -317,12 +328,13 @@ class Aligner:
                                     opaqueresize=True, background="gray70")
         self.paned.grid(row=0, column=0, sticky="nsew")
         left = self.left_pane = ttk.Frame(self.paned, padding=5)
-        draw = ttk.LabelFrame(left, text="Drawing", padding=6)
+        draw = ttk.LabelFrame(left, text="Outline drawing", padding=6)
         draw.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
         ttk.Label(draw, textvariable=self.var_draw_info, justify=tk.LEFT).pack(anchor="w")
         ttk.Label(draw, textvariable=self.var_draw_sel, justify=tk.LEFT).pack(anchor="w", padx=(18, 0))
         self.button_undo_outline = ttk.Button(draw, text="Undo", command=self.undo_outline, state="disabled")
         self.button_undo_outline.pack(anchor="w", pady=(4, 4))
+        Tooltip(self.button_undo_outline, "Undo most recent change to section outline")
         ttk.Label(draw, foreground="gray30", justify=tk.LEFT,
                   text="click an outline: select it\nthen: drag a square = move it\n"
                        "drag a box = select squares\ndrag a selection = move the group\n"
@@ -362,7 +374,7 @@ class Aligner:
         c.bind("<Leave>", self.on_leave_canvas)
         c.bind("<Double-Button-1>", self.on_double_click)
         c.bind("<Triple-Button-1>", self.on_double_click)
-        c.bind("<ButtonPress-3>", lambda e: self.press(e, "rotate"))
+        c.bind("<ButtonPress-3>", self.on_right_press)
         c.bind("<ButtonPress-2>", lambda e: self.press(e, "pan"))
         for b in ("<B1-Motion>", "<B2-Motion>", "<B3-Motion>"):
             c.bind(b, self.motion)
@@ -380,12 +392,20 @@ class Aligner:
         self.progress.pack(side=tk.RIGHT)
         self.button_cancel = ttk.Button(bottom, text="Cancel", command=self.stop_event.set, state="disabled")
         self.button_cancel.pack(side=tk.RIGHT, padx=5)
-        ttk.Label(bottom, textvariable=self.var_status, anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # The status text, or (instead of it, while there is one) a hint about what is under the pointer on the image.
+        self.var_hint = tk.StringVar(self.root, "")
+        self.status_label = ttk.Label(bottom, textvariable=self.var_status, anchor="w")
+        self.hint_label = ttk.Label(bottom, textvariable=self.var_hint, anchor="w", foreground="#0050a0")
+        self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         for seq, fn in (("<Control-o>", self.open_dialog), ("<Control-s>", self.export_dialog),
                         ("<Control-z>", self.do_undo)):
             root.bind(seq, lambda e, f=fn: f())
         root.bind("<Key>", self.key)
+        for key in ("Shift_L", "Shift_R", "Control_L", "Control_R"):
+            root.bind(f"<KeyPress-{key}>", lambda e: self.modifier_key(e, True), add="+")
+            root.bind(f"<KeyRelease-{key}>", lambda e: self.modifier_key(e, False), add="+")
+        root.bind("<FocusOut>", lambda e: self.modifier_lost(), add="+")
 
     def build_right(self, right):
         f = ttk.LabelFrame(right, text="Current section", padding=6)
@@ -407,7 +427,7 @@ class Aligner:
         undo = ttk.Button(ab, text="Undo", command=self.do_undo)
         undo.pack(fill=tk.BOTH, expand=True)
         Tooltip(undo, "Undoes the last alignment edit (rotation, shift, flip). Shortcut: Ctrl+Z.\n"
-                      "Outline edits have their own Undo, in the Drawing panel.")
+                      "Outline edits have their own Undo, in the Outline drawing panel.")
         bf = ttk.Frame(f)
         bf.grid(row=5, column=0, columnspan=4, pady=(6, 0))
         for text, deg in (("-1°", -1), ("-0.1°", -0.1), ("+0.1°", 0.1), ("+1°", 1)):   # (+ is clockwise)
@@ -438,7 +458,7 @@ class Aligner:
                   command=lambda v: self.redraw()).pack(fill=tk.X)
 
         self.view_frame = f = ttk.LabelFrame(right, text="View", padding=6)   # (advanced mode only)
-        ttk.Checkbutton(f, text="Crosshair at the centre of the view", variable=self.var_crosshair,
+        ttk.Checkbutton(f, text="Crosshair at the centre of the canvas", variable=self.var_crosshair,
                         command=self.redraw).pack(anchor="w")
 
         self.chan_frame = ttk.LabelFrame(right, text="Display brightness (view only)", padding=6)
@@ -477,15 +497,19 @@ class Aligner:
             vhi = tk.DoubleVar(self.root, hi)
             self.chan_vars.append((vis, vlo, vhi))
             hexcol = "#%02x%02x%02x" % tuple(ch.color)
-            row = ttk.Frame(self.chan_frame)
-            row.pack(fill=tk.X, pady=(4 if i else 0, 0))
+            # One grid for all the channels, so that the squares and the sliders line up whatever the names' widths: each channel
+            # has two rows, the square (with the channel's name under it) at the left and the two sliders beside it.
+            row = self.chan_frame
+            row.columnconfigure(2, weight=1)
+            sq_col = ttk.Frame(row)
+            sq_col.grid(row=2 * i, column=0, rowspan=2, sticky="nw", padx=(0, 4), pady=(4 if i else 0, 0))
             # The colored square is the show/hide checkbox: while the channel is shown, two thin lines join its opposite corners
             # (black, or white on a very dark color so that they can be seen).
             dark = 0.299 * ch.color[0] + 0.587 * ch.color[1] + 0.114 * ch.color[2] < 60
             size = round(22 * self.root.winfo_fpixels("1i") / 96)
-            square = tk.Canvas(row, width=size, height=size, bg=hexcol, cursor="hand2", highlightthickness=1,
+            square = tk.Canvas(sq_col, width=size, height=size, bg=hexcol, cursor="hand2", highlightthickness=1,
                                highlightbackground="gray40")
-            square.pack(side=tk.LEFT)
+            square.pack(anchor="w")
 
             def toggle(event=None, vis=vis):
                 vis.set(not vis.get())
@@ -502,15 +526,14 @@ class Aligner:
             show_x()
             square.bind("<Button-1>", toggle)
             Tooltip(square, "Show / hide this channel")
-            name = ttk.Label(row, text=ch.name, cursor="hand2")
-            name.pack(side=tk.LEFT, padx=4)
+            name = ttk.Label(sq_col, text=ch.name, cursor="hand2")
+            name.pack(anchor="w")
             name.bind("<Button-1>", toggle)
-            for text, var in (("black", vlo), ("white", vhi)):
-                r = ttk.Frame(self.chan_frame)
-                r.pack(fill=tk.X)
-                ttk.Label(r, text=text, width=6).pack(side=tk.LEFT)
-                ttk.Scale(r, from_=0, to=65535, variable=var,
-                          command=lambda v: self.redraw()).pack(side=tk.LEFT, fill=tk.X, expand=True)
+            for r, (text, var) in enumerate((("black", vlo), ("white", vhi))):
+                pad = (4 if i and r == 0 else 0, 0)
+                ttk.Label(row, text=text).grid(row=2 * i + r, column=1, sticky="w", padx=(0, 4), pady=pad)
+                ttk.Scale(row, from_=0, to=65535, variable=var,
+                          command=lambda v: self.redraw()).grid(row=2 * i + r, column=2, sticky="ew", pady=pad)
 
     # ---------------------------------------------------------------- busy cursor
 
@@ -564,7 +587,76 @@ class Aligner:
         opening, its section images are loading or an export is running; the normal cursors otherwise."""
         busy = self.opening or self.busy
         self.root.config(cursor="watch" if busy else "")
-        self.canvas.config(cursor="watch" if busy else "fleur")
+        self.canvas_cursor_now = None
+        self.canvas.config(cursor="watch" if busy else self.canvas_cursor())
+        self.canvas_cursor_now = None if busy else self.canvas.cget("cursor")
+
+    def canvas_cursor(self):
+        """The cursor for the image for the current state: Shift and Ctrl show what they change (rotating, panning); with an
+        outline selected a drag no longer moves the section, so the cursor is a crosshair (selection box) or, over the
+        outline, a hand (a vertex) or a plus (a line, where a double-click adds a vertex)."""
+        if self.mod_shift:
+            return CURSOR_ROTATE
+        if self.mod_ctrl:
+            return CURSOR_PAN
+        if self.hover is not None:
+            return CURSOR_ADD if self.hover[0] == "edge" else CURSOR_GRAB
+        if self.sel_outline:
+            return CURSOR_SELECT
+        return CURSOR_MOVE
+
+    def refresh_canvas_cursor(self):
+        """Set the image's cursor to match the state (nothing is done while the hourglass is showing, or when it is already right)."""
+        if self.opening or self.busy:
+            return
+        self.update_hint()
+        name = self.canvas_cursor()
+        if name != self.canvas_cursor_now:
+            self.canvas_cursor_now = name
+            self.canvas.config(cursor=name)
+
+    def hint_text(self):
+        """What the pointer is over on the image and what can be done there ("" when not over the image or no stack)."""
+        if not self.stack or not self.pointer_in_canvas or self.busy:
+            return ""
+        if self.mod_shift:
+            return "Drag to rotate the section"
+        if self.mod_ctrl:
+            return "Drag to pan the view"
+        if self.hover is not None:
+            if self.hover[0] == "vertex":
+                return ("Drag point to move, DEL key to delete" if self.sel_outline else
+                        "Click to select the outline and this point")
+            return ("Double-click on line to add point" if self.sel_outline else
+                    "Click to select the outline; double-click on line to add point")
+        if self.sel_outline:
+            return "Drag to select several points; click elsewhere to deselect"
+        return ""
+
+    def update_hint(self):
+        """Show the hint in the status bar in place of the status text (and bring the status text back when there is none)."""
+        text = self.hint_text()
+        self.var_hint.set(text)
+        if text and not self.hint_label.winfo_ismapped():
+            self.status_label.pack_forget()
+            self.hint_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        elif not text and self.hint_label.winfo_ismapped():
+            self.hint_label.pack_forget()
+            self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+    def modifier_lost(self):
+        """The window lost the keyboard focus: any key released elsewhere is not seen, so forget Shift and Ctrl."""
+        if self.mod_shift or self.mod_ctrl:
+            self.mod_shift = self.mod_ctrl = False
+            self.refresh_canvas_cursor()
+
+    def modifier_key(self, event, down):
+        """Shift or Ctrl pressed or released (the pointer need not move for the cursor to change)."""
+        if event.keysym.startswith("Shift"):
+            self.mod_shift = down
+        else:
+            self.mod_ctrl = down
+        self.refresh_canvas_cursor()
 
     # ---------------------------------------------------------------- opening
 
@@ -1184,7 +1276,7 @@ class Aligner:
             return
         if d["mode"] == "pan":
             s, ox, oy = d["view"]
-            self.view = (s, ox + event.x - d["x"], oy + event.y - d["y"])
+            self.view = self.clamp_view((s, ox + event.x - d["x"], oy + event.y - d["y"]))
             self.fitted = False
             self.redraw()
             return
@@ -1203,6 +1295,7 @@ class Aligner:
         self.redraw()
 
     def release(self, _event):
+        self.root.after_idle(self.refresh_canvas_cursor)   # (after the release has been handled)
         if self.odrag:
             self.outline_release(_event)
             return
@@ -1220,7 +1313,7 @@ class Aligner:
         f = 1.2 ** (event.delta / 120)
         u, v = (event.x - ox) / s, (event.y - oy) / s
         s2 = min(max(s * f, 0.005), 8.0)
-        self.view = (s2, event.x - u * s2, event.y - v * s2)
+        self.view = self.clamp_view((s2, event.x - u * s2, event.y - v * s2))
         self.fitted = False
         self.redraw()
 
@@ -1282,12 +1375,40 @@ class Aligner:
         px = self.stack.pixel_um
         return ox + p[0] / px * s, oy - p[1] / px * s
 
+    def view_bounds(self):
+        """The part of the plane the view may show, in canvas pixels (x0, y0, x1, y1): the canvas, and beyond it whatever
+        outlines hang over its edge (so that an overhang can be seen, and never blank space that is not needed)."""
+        st = self.stack
+        x0, y0, x1, y1 = 0.0, 0.0, float(st.canvas_w), float(st.canvas_h)
+        for sec in st.sections:
+            P = sec.stack_points
+            if len(P):
+                u, v = P[:, 0] / st.pixel_um, -P[:, 1] / st.pixel_um
+                x0, y0 = min(x0, float(u.min())), min(y0, float(v.min()))
+                x1, y1 = max(x1, float(u.max())), max(y1, float(v.max()))
+        return x0, y0, x1, y1
+
     def fit_view(self):
         w, h = max(self.canvas.winfo_width(), 50), max(self.canvas.winfo_height(), 50)
-        st = self.stack
-        s = 0.96 * min(w / st.canvas_w, h / st.canvas_h)
-        self.view = (s, (w - st.canvas_w * s) / 2, (h - st.canvas_h * s) / 2)
+        x0, y0, x1, y1 = self.view_bounds()
+        s = min(w / (x1 - x0), h / (y1 - y0))
+        self.view = (s, (w - (x1 - x0) * s) / 2 - x0 * s, (h - (y1 - y0) * s) / 2 - y0 * s)
         self.fitted = True
+
+    def clamp_view(self, view, w=None, h=None):
+        """`view` (scale, ox, oy) kept so that there is never blank space around the picture that could be avoided: it is not
+        zoomed out beyond the whole of view_bounds() fitting the window, and an axis along which that is larger than the window
+        cannot be panned past its edge (along one that is smaller, it is centred)."""
+        w = w or max(self.canvas.winfo_width(), 50)
+        h = h or max(self.canvas.winfo_height(), 50)
+        x0, y0, x1, y1 = self.view_bounds()
+        s, ox, oy = view
+        s = max(s, min(w / (x1 - x0), h / (y1 - y0)))
+        out = []
+        for size, lo, hi, o in ((w, x0, x1, ox), (h, y0, y1, oy)):
+            extent = (hi - lo) * s
+            out.append((size - extent) / 2 - lo * s if extent <= size else min(-lo * s, max(o, size - hi * s)))
+        return (s, out[0], out[1])
 
     def on_resize(self, event):
         """The window was resized: a fitted view is fitted again; one the user has panned or zoomed is scaled about the
@@ -1302,7 +1423,7 @@ class Aligner:
                 s, ox, oy = self.view
                 ratio = min(w / old[0], h / old[1])
                 u, v = (old[0] / 2 - ox) / s, (old[1] / 2 - oy) / s   # the image point at the old centre
-                self.view = (s * ratio, w / 2 - u * s * ratio, h / 2 - v * s * ratio)
+                self.view = self.clamp_view((s * ratio, w / 2 - u * s * ratio, h / 2 - v * s * ratio), w, h)
         self.redraw(fit_if_needed=True)
 
     def warp_section(self, sec, vw, vh):
@@ -1523,6 +1644,7 @@ class Aligner:
         preview of what a click would select); selected vertices are red, the one under the pointer is orange and larger.
         `provisional` replaces the selection while a rubber band is being dragged. Also updates the Drawing panel's text
         (two lines, so the panel never needs to be wider) and its Undo button."""
+        self.refresh_canvas_cursor()   # (the selection or the hover changed)
         if self.sync_picture_to_selection():
             return
         c = self.canvas
@@ -1561,18 +1683,23 @@ class Aligner:
         or edge, and redraw the squares when that changes."""
         if self.odrag or self.drag or not self.stack or not self.view:
             return
+        self.mod_shift, self.mod_ctrl = bool(event.state & 0x1), bool(event.state & 0x4)
+        self.pointer_in_canvas = True
         sec = self.stack.sections[self.cur]
         hit = self.hit_test(event.x, event.y) if len(sec.case_points) else None
         hover = None if hit is None else (hit[0], hit[1])
         if hover != self.hover:
             self.hover = hover
             self.draw_vertex_marks()
+        self.refresh_canvas_cursor()
 
     def on_leave_canvas(self, _event=None):
+        self.pointer_in_canvas = False
         if self.hover is not None:
             self.hover = None
             if self.stack and self.view:
                 self.draw_vertex_marks()
+        self.refresh_canvas_cursor()
 
     def on_left_press(self, event):
         """A plain left press: with the current outline selected, or on it, this works on the outline; anywhere else it moves
@@ -1666,6 +1793,25 @@ class Aligner:
         self.prov_sel = set()
         self.draw_overlay()
 
+    def on_right_press(self, event):
+        """A right press on a selected vertex of the outline opens a menu to delete it (as in NeuroInfo); anywhere else it
+        starts a rotation, as before."""
+        if self.stack and self.view and self.sel_outline and self.sel_vertices and not self.odrag and not self.drag:
+            sec = self.stack.sections[self.cur]
+            hit = self.hit_test(event.x, event.y) if len(sec.case_points) else None
+            if hit is not None and hit[0] == "vertex" and hit[1] in self.sel_vertices:
+                self.canvas.focus_set()
+                n = len(self.sel_vertices)
+                menu = tk.Menu(self.root, tearoff=0)
+                menu.add_command(label=f"Delete {'point' if n == 1 else f'{n} points'} (can also use DEL key)",
+                                 command=self.delete_selection)
+                try:
+                    menu.tk_popup(event.x_root, event.y_root)
+                finally:
+                    menu.grab_release()
+                return "break"
+        return self.press(event, "rotate")
+
     def delete_selection(self):
         """Delete: the selected vertices, or, with only the outline selected, the whole outline (after asking)."""
         sec = self.stack.sections[self.cur]
@@ -1681,7 +1827,7 @@ class Aligner:
             whole, asked = True, True   # (that question already was the warning)
         if whole and not asked and not messagebox.askyesno(
                 "Delete the whole outline?", f"Delete the entire outline of section {sec.index + 1} ({n} vertices)?"
-                "\n\nThe Undo button in the Drawing panel can bring it back.", icon="warning", parent=self.root):
+                "\n\nThe Undo button in the Outline drawing panel can bring it back.", icon="warning", parent=self.root):
             return
         self.push_outline_undo(sec)
         if whole:
@@ -1704,15 +1850,19 @@ class Aligner:
         self.draw_overlay()
 
     def draw_crosshair(self, rgb):
-        """One-pixel dashed vertical and horizontal lines meeting at the centre of the canvas, blended into the picture at
-        50% white (the canvas cannot draw see-through lines, so they are put into the image itself)."""
+        """One-pixel dashed vertical and horizontal lines meeting at the centre of the stack canvas (so they move with the image
+        when it is panned or zoomed, and may be out of view), blended into the picture at 50% white (the canvas cannot draw
+        see-through lines, so they are put into the image itself)."""
         h, w = rgb.shape[:2]
-        cx, cy = w // 2, h // 2
+        s, ox, oy = self.view
+        cx, cy = int(round(ox + self.stack.canvas_w / 2 * s)), int(round(oy + self.stack.canvas_h / 2 * s))
         dash = 3   # pixels on, then as many off
-        on_y = (np.arange(h) // dash) % 2 == 0
-        on_x = (np.arange(w) // dash) % 2 == 0
-        rgb[on_y, cx] = (rgb[on_y, cx] // 2 + 128).astype(np.uint8)
-        rgb[cy, on_x] = (rgb[cy, on_x] // 2 + 128).astype(np.uint8)
+        if 0 <= cx < w:
+            on_y = (np.arange(h) // dash) % 2 == 0
+            rgb[on_y, cx] = (rgb[on_y, cx] // 2 + 128).astype(np.uint8)
+        if 0 <= cy < h:
+            on_x = (np.arange(w) // dash) % 2 == 0
+            rgb[cy, on_x] = (rgb[cy, on_x] // 2 + 128).astype(np.uint8)
 
     def draw_outline(self, sec, color, dash=None):
         pts = sec.stack_points
