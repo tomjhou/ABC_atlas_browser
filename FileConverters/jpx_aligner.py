@@ -106,34 +106,43 @@ def load_preview(src):
     return img, w / pw, h / ph
 
 
-def load_recent():
-    """The recently opened stacks (newest first) from the settings file; [] if there is none or it cannot be read."""
+def load_settings():
+    """The settings file's contents as a dict ({} if there is none or it cannot be read)."""
     try:
         with open(SETTINGS_FILE, encoding="utf-8") as f:
-            return [p for p in json.load(f).get("recent", []) if isinstance(p, str)]
-    except (OSError, ValueError, AttributeError):
-        return []
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(**changes):
+    """Update the given settings in the file, keeping the others; failures to save are ignored."""
+    data = load_settings()
+    data.update(changes)
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1)
+    except OSError:
+        pass
+
+
+def load_recent():
+    """The recently opened stacks (newest first) from the settings file; [] if there is none or it cannot be read."""
+    recent = load_settings().get("recent", [])
+    return [p for p in recent if isinstance(p, str)] if isinstance(recent, list) else []
 
 
 def add_recent(path):
     """Put `path` first in the recent list (once, whatever the letter case), keeping RECENT_MAX; failures to save are ignored."""
     key = os.path.normcase(os.path.abspath(path))
     recent = [os.path.abspath(path)] + [p for p in load_recent() if os.path.normcase(os.path.abspath(p)) != key]
-    try:
-        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump({"recent": recent[:RECENT_MAX]}, f, indent=1)
-    except OSError:
-        pass
+    save_settings(recent=recent[:RECENT_MAX])
 
 
 def clear_recent():
-    try:
-        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump({"recent": []}, f)
-    except OSError:
-        pass
+    save_settings(recent=[])
 
 
 def load_frame_preview(jpx_path, frame_box, index):
@@ -241,7 +250,8 @@ class Aligner:
         self.loading_previews = False   # section images are still being loaded in the background
         self.levels = []            # per channel [lo, hi] (display only)
         self.levels_set = False
-        self.busy = False
+        self._busy = False
+        self.calibrating = False    # the .czi sections are being located on their slide scans
         self.msgs = queue.Queue()
         self.stop_event = threading.Event()
         self.photo = None
@@ -254,6 +264,7 @@ class Aligner:
         self.var_dy = tk.StringVar(self.root, "0")
         self.var_quality = tk.StringVar(self.root, f"{ns.DEFAULT_QUALITY_DB:g}")
         self.var_rerender = tk.BooleanVar(self.root, True)   # every image is written again, so each JPX file has all of its images
+        self.var_background = tk.BooleanVar(self.root, bool(load_settings().get("background_loading", True)))
         self.var_crosshair = tk.BooleanVar(self.root, True)
         self.var_follow = tk.BooleanVar(self.root, False)   # an edit also moves the sections after it
         self.var_status = tk.StringVar(self.root, "Open a reconstruction.jpx to start (File > Open).")
@@ -276,6 +287,10 @@ class Aligner:
         fm.add_cascade(label="Open recent", menu=self.recent_menu)
         fm.config(postcommand=self.fill_recent_menu)   # (refreshed each time the File menu opens)
         fm.add_command(label="Export JPX...", command=self.export_dialog, accelerator="Ctrl+S")
+        om = tk.Menu(fm, tearoff=0)
+        om.add_checkbutton(label="Load images in the background", variable=self.var_background,
+                           command=self.background_option_changed)
+        fm.add_cascade(label="Options", menu=om)
         fm.add_separator()
         fm.add_command(label="Exit", command=self.quit)
         menu.add_cascade(label="File", menu=fm)
@@ -452,10 +467,28 @@ class Aligner:
 
     # ---------------------------------------------------------------- busy cursor
 
+    @property
+    def busy(self):
+        """Something is running that rules out editing: an export, or (with background loading switched off) the loading of
+        the section images."""
+        return self._busy or (self.loading_previews and not self.var_background.get())
+
+    @busy.setter
+    def busy(self, value):
+        self._busy = value
+
+    def background_option_changed(self):
+        save_settings(background_loading=bool(self.var_background.get()))
+        self.update_cursor()
+        self.refresh_list()
+        if self.stack:
+            self.update_controls()
+            self.redraw()
+
     def update_cursor(self):
         """The hourglass over the whole window (the image canvas has a cursor of its own, so it is set too) while a stack is
         opening, its section images are loading or an export is running; the normal cursors otherwise."""
-        busy = self.opening or self.loading_previews or self.busy
+        busy = self.opening or self.busy
         self.root.config(cursor="watch" if busy else "")
         self.canvas.config(cursor="watch" if busy else "fleur")
 
@@ -585,29 +618,61 @@ class Aligner:
         todo = list(stack.sections)
         self.progress.config(maximum=max(len(todo), 1), value=0)
         self.loading_previews = bool(todo)
+        self.calibrating = any(s.source_path.lower().endswith(".czi") and s.czi_origin is None for s in todo)
         self.update_cursor()
+        self.refresh_list()   # (sections not loaded yet are grey)
         # load the current section and its neighbors first
         todo.sort(key=lambda s: abs(s.index - self.cur))
 
+        posted, lock, czi_scenes = set(), threading.Lock(), {}
+
+        def post(s, pv, is_frame):
+            """Hand a section's picture to the window (once), which shows it and un-greys the section."""
+            with lock:
+                if s.frame in posted:
+                    return
+                posted.add(s.frame)
+                n = len(posted)
+            self.msgs.put(("preview", (stack, s.frame, pv, n, is_frame)))
+
+        def czi_picture(s):
+            key = (s.source_path, ns.czi_scene_of(s, stack))
+            with lock:
+                pv = czi_scenes.get(key)
+            if pv is None:
+                pv = ns.czi_preview(s, stack, PREVIEW_MAX_PX)
+                with lock:
+                    czi_scenes[key] = pv
+            return pv
+
+        def located(s):
+            """A .czi section was just located on its scan: its picture can be shown now, before the others are done."""
+            try:
+                post(s, czi_picture(s), False)
+            except Exception as e:
+                self.msgs.put(("status", f"Couldn't read the scan of section {s.index + 1}: {e}"))
+
         def work():
+            ns.lower_thread_priority()   # (the window stays responsive while the images load)
             frame_boxes = None
             if any(s.source_path.lower().endswith(".czi") and s.czi_origin is None for s in todo):
                 self.msgs.put(("status", "Preparing the Zeiss .czi reader (installed first if it is missing)..."))
-                problems = ns.calibrate_stack_czi(stack, progress=lambda i, n, text: self.msgs.put(("progress", (i, n, text))))
-                self.msgs.put(("progress", (0, len(todo), "")))
+                try:
+                    problems = ns.calibrate_stack_czi(stack, progress=lambda i, n, text: self.msgs.put(("status", text)),
+                                                      on_located=located)
+                except BaseException as e:   # (a failed install of the reader library, for one)
+                    problems = {"the .czi scans": str(e) or type(e).__name__}
                 self.msgs.put(("czi_ready", (stack, {k: v for k, v in problems.items() if v})))
-            czi_scenes = {}
-            for n, s in enumerate(todo, 1):
+            for s in todo:
                 if self.stack is not stack:
                     return
+                if s.frame in posted:
+                    continue
                 is_frame = not s.renderable
                 try:
                     if not is_frame and s.source_path.lower().endswith(".czi"):
-                        key = (s.source_path, ns.czi_scene_of(s, stack))
                         self.msgs.put(("status", f"Loading section {s.index + 1} of {len(stack.sections)}..."))
-                        if key not in czi_scenes:
-                            czi_scenes[key] = ns.czi_preview(s, stack, PREVIEW_MAX_PX)
-                        pv = czi_scenes[key]
+                        pv = czi_picture(s)
                     elif is_frame:
                         if frame_boxes is None:
                             frame_boxes = [b for b in ns.read_boxes(stack.jpx_path) if b.kind == b"jp2c"]
@@ -618,10 +683,10 @@ class Aligner:
                         self.msgs.put(("status", f"{'Loading' if cached else 'Building (first time only)'} section {s.index + 1} of {len(stack.sections)}..."))
                         pv = load_preview(s.source_path)
                 except Exception as e:
-                    self.msgs.put(("status", f"Couldn't read {s.name}: {e}"))
+                    self.msgs.put(("status", f"Couldn't read section {s.index + 1}: {e}"))
                     continue
-                self.msgs.put(("preview", (stack, s.frame, pv, n, is_frame)))
-            self.msgs.put(("loaded", (stack, f"Ready. {len(todo)} sections loaded.")))
+                post(s, pv, is_frame)
+            self.msgs.put(("loaded", (stack, f"Ready. {len(posted)} of {len(todo)} sections loaded.")))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -638,10 +703,13 @@ class Aligner:
                     if stack is self.stack:   # (a stack opened since has its own loading under way)
                         self.loading_previews = False
                         self.update_cursor()
+                        self.refresh_list()
+                        self.update_controls()
                         self.var_status.set(text)
                 elif kind == "czi_ready":
                     stack, problems = payload
                     if stack is self.stack:
+                        self.calibrating = False
                         self.refresh_list()
                         self.update_controls()
                         if problems:
@@ -661,7 +729,14 @@ class Aligner:
                         self.progress.config(value=n)
                         if not self.levels_set:
                             self.auto_levels(pv[0])
-                        self.redraw()
+                        sec = self.by_frame(idx)
+                        if sec is not None:
+                            self.refresh_list_item(sec.index)
+                            if sec.index == self.cur:
+                                self.update_controls()
+                        # (redrawing is the costly part: only when the new picture is one of those on view)
+                        if sec is not None and abs(sec.index - self.cur) <= 1:
+                            self.redraw()
                 elif kind == "progress":
                     i, n, text = payload
                     self.progress.config(maximum=n, value=i)
@@ -696,16 +771,25 @@ class Aligner:
             return
         for s in self.stack.sections:
             self.listbox.insert(tk.END, self.section_label(s))
-            if not s.source_path:
-                self.listbox.itemconfig(tk.END, foreground="gray60")   # (no source image: only its frame can be shown)
+            self.style_list_item(s)
         self.listbox.selection_clear(0, tk.END)
         self.listbox.selection_set(self.cur)
         self.listbox.see(self.cur)
+
+    def loaded(self, s):
+        """The section's picture has been loaded."""
+        return s.frame in self.previews
+
+    def style_list_item(self, s):
+        """Grey: no source image (only its frame can be shown), or its picture has not been loaded yet."""
+        grey = not s.source_path or (self.loading_previews and not self.loaded(s))
+        self.listbox.itemconfig(s.index, foreground="gray60" if grey else "")
 
     def refresh_list_item(self, i):
         sel = self.listbox.curselection()
         self.listbox.delete(i)
         self.listbox.insert(i, self.section_label(self.stack.sections[i]))
+        self.style_list_item(self.stack.sections[i])
         if sel:
             self.listbox.selection_set(sel[0])
 
@@ -742,6 +826,7 @@ class Aligner:
                  f"Net: rotation {-s.rotation_deg:+.2f}° (clockwise), {'mirrored' if s.mirrored else 'not mirrored'}"
                  + ("" if s.renderable else
                     "\nSource image not found: can't edit." if not s.source_path else
+                    "\nStill loading: can't edit yet." if self.loading_previews else
                     ("\nCouldn't be located on the slide scan" if s.source_path.lower().endswith(".czi")
                      else "\nSource image is not a JPEG 2000 file")
                     + ": the picture is the JPX's own frame; alignment can't be edited, the outline can."))
@@ -752,7 +837,13 @@ class Aligner:
         if not self.stack or self.busy:
             return None
         s = self.stack.sections[self.cur]
-        return s if s.renderable else None
+        if not s.renderable or not self.loaded(s):
+            return None
+        if self.calibrating and self.var_follow.get() and any(
+                f.source_path.lower().endswith(".czi") and f.czi_origin is None for f in self.stack.sections[s.index + 1:]):
+            self.var_status.set("Following sections are still being located: wait, or turn off \"also move the following sections\".")
+            return None
+        return s
 
     def followers(self, s):
         """The sections after `s` whose alignment can be edited (their source image was found and can be read)."""

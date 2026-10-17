@@ -60,6 +60,17 @@ REQUIRED_PACKAGES = {"numpy": "numpy", "h5py": "h5py", "imagecodecs": "imagecode
 CZI_PACKAGES = {"czifile": "czifile"}   # the Zeiss .czi reader, installed only when a stack needs it
 
 
+def lower_thread_priority():
+    """Make the calling thread yield to the rest of the program (Windows: below-normal priority), so that long background work
+    does not make the window sluggish. No effect elsewhere."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetThreadPriority(ctypes.windll.kernel32.GetCurrentThread(), -1)
+        except Exception:
+            pass
+
+
 def ensure_packages(required=None, exit_on_failure=True):
     """Install any missing packages ({import name: pip name}) into this
     interpreter's environment."""
@@ -624,11 +635,19 @@ def czi_file(path):
         return _czi_files[key]
 
 
+_czi_boxes = {}
+
+
 def czi_scenes(path):
-    """Position of each scene in the slide's pixel grid: [(x0, y0, width, height), ...]."""
-    with _czi_lock:
-        cz = czi_file(path)
-        return [tuple(int(v) for v in cz.scenes[i].bbox) for i in range(len(cz.scenes))]
+    """Position of each scene in the slide's pixel grid: [(x0, y0, width, height), ...]. Remembered, and answered without
+    taking the reader's lock once known: the window asks for it on every redraw, and must not wait for a scene being read."""
+    key = os.path.normcase(os.path.abspath(path))
+    boxes = _czi_boxes.get(key)
+    if boxes is None:
+        with _czi_lock:
+            cz = czi_file(path)
+            boxes = _czi_boxes[key] = [tuple(int(v) for v in cz.scenes[i].bbox) for i in range(len(cz.scenes))]
+    return boxes
 
 
 def czi_levels(path, scene=0):
@@ -774,14 +793,14 @@ def czi_refine(stack, czi_path, section, frame, scene, X0, Y0, steps=((2, 16, No
     return float(X0), float(Y0), float(score)
 
 
-def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progress=None):
+def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progress=None, on_located=None):
     """Locate the sections of every .czi source of the stack that have no czi_origin yet, so that they can be rendered.
 
     NeuroInfo's slide coordinates relate to the scan by an offset (X0, Y0) that it does not record, found here by matching each
     section's frame in the JPX against the scan. X0 is the same for the whole scan; Y0 turns out to differ a little between
     sections, so each section gets its own. Ambiguous matches (a faint section can resemble the wrong scene) are resolved by
     taking the X0 the clear matches agree on. Returns {file name: error text or ""}. progress(done, total, text) is called as
-    the sections are located."""
+    the sections are located, and on_located(section) as soon as each one has its czi_origin (possibly from another thread)."""
     frames = [b for b in read_boxes(stack.jpx_path) if b.kind == b"jp2c"]
 
     def load_frame(sec):
@@ -799,7 +818,7 @@ def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progr
         try:
             coarse = {}
             cands, done = {}, [0]
-            sizes = {sec.index: max(np.ptp(sec.saved_points[:, 0]), np.ptp(sec.saved_points[:, 1])) for sec in todo}
+            sizes = {sec.frame: max(np.ptp(sec.saved_points[:, 0]), np.ptp(sec.saved_points[:, 1])) for sec in todo}
             typical = float(np.median(list(sizes.values())))
             total = [len(todo)]
             lock = threading.Lock()
@@ -825,13 +844,20 @@ def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progr
                     X0, Y0, score = czi_refine(stack, path, sec, frame, scene, X0, Y0)
                     if score >= accept:
                         sec.czi_origin = (X0, Y0)
+                        if on_located:
+                            on_located(sec)
                 active.discard(sec.index)
                 report()
                 return sec, found
 
-            with ThreadPoolExecutor(max_workers=2) as pool:   # (decoding and matching run beside each other)
-                for sec, found in pool.map(look, todo):
-                    cands[sec.index] = found
+            # The first section alone, so that it is ready (and can be shown) as soon as possible; then the rest, two at a time
+            # (decoding and matching run beside each other).
+            sec, found = look(todo[0])
+            cands[sec.frame] = found
+            done[0] += 1
+            with ThreadPoolExecutor(max_workers=2, initializer=lower_thread_priority) as pool:
+                for sec, found in pool.map(look, todo[1:]):
+                    cands[sec.frame] = found
                     with lock:
                         done[0] += 1
             clear = [c[0][2] for c in cands.values() if c and c[0][0] >= strong]
@@ -840,17 +866,19 @@ def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progr
             later = [sec for sec in todo if sec.czi_origin is None]
             total[0] = len(todo) + len(later)
             for n, sec in enumerate(later, 1):
-                c = [k for k in cands[sec.index] if x_known is None or abs(k[2] - x_known) < 60]
+                c = [k for k in cands[sec.frame] if x_known is None or abs(k[2] - x_known) < 60]
                 if not c:
-                    (small if sizes[sec.index] < 0.35 * typical else missed).append(str(sec.index + 1))
+                    (small if sizes[sec.frame] < 0.35 * typical else missed).append(str(sec.index + 1))
                     continue
                 report(f"Positioning section {sec.index + 1} of {len(stack.sections)}...")
                 X0, Y0, score = czi_refine(stack, path, sec, load_frame(sec), c[0][1], c[0][2], c[0][3])
                 done[0] += 1
                 if score >= accept:
                     sec.czi_origin = (X0, Y0)
+                    if on_located:
+                        on_located(sec)
                 else:
-                    (small if sizes[sec.index] < 0.35 * typical else missed).append(str(sec.index + 1))
+                    (small if sizes[sec.frame] < 0.35 * typical else missed).append(str(sec.index + 1))
             notes = []
             if missed:
                 notes.append(f"section{'s' if len(missed) > 1 else ''} {', '.join(missed[:8])}{', ...' if len(missed) > 8 else ''} "
