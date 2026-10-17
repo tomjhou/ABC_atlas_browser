@@ -4,6 +4,9 @@ REM Looks for Python as "py", then "python", then "python3", and uses the first 
 REM Missing libraries are installed automatically on first run.
 setlocal
 cd /d "%~dp0"
+title TIFF to NeuroInfo JP2 converter
+echo ==== TIFF to NeuroInfo JP2 converter ====
+echo.
 
 set "PYTHON_CMD="
 for %%P in (py python python3) do (

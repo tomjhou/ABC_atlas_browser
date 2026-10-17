@@ -3,6 +3,9 @@ REM Starts the CCF browser (double-click this file in Windows Explorer).
 REM Looks for Python as "py", then "python", then "python3", and uses the first that works.
 setlocal
 cd /d "%~dp0"
+title CCF browser
+echo ==== CCF browser ====
+echo.
 
 set "PYTHON_CMD="
 for %%P in (py python python3) do (
@@ -24,6 +27,6 @@ if not defined PYTHON_CMD (
 "%PYTHON_CMD%" CCF_browser.py %*
 if errorlevel 1 (
   echo.
-  echo the CCF browser stopped with an error ^(see above^). If a library is missing, run python-install.bat.
+  echo The CCF browser stopped with an error ^(see above^). If a library is missing, run python-install.bat.
   pause
 )

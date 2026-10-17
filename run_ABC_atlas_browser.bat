@@ -3,6 +3,9 @@ REM Starts the ABC atlas browser (double-click this file in Windows Explorer).
 REM Looks for Python as "py", then "python", then "python3", and uses the first that works.
 setlocal
 cd /d "%~dp0"
+title ABC atlas browser
+echo ==== ABC atlas browser ====
+echo.
 
 set "PYTHON_CMD="
 for %%P in (py python python3) do (
