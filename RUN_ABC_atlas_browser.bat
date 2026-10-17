@@ -1,24 +1,18 @@
 @echo off
 REM Starts the ABC atlas browser (double-click this file in Windows Explorer).
-REM Looks for Python as "py", then "python", then "python3", and uses the first that works.
+REM Finds Python (installing Python 3.13 first if there is none): see ensure_python.bat.
 setlocal
 cd /d "%~dp0"
 title ABC atlas browser
 echo ==== ABC atlas browser ====
 echo.
 
-set "PYTHON_CMD="
-for %%P in (py python python3) do (
-  if not defined PYTHON_CMD (
-    %%P --version >nul 2>&1
-    if not errorlevel 1 set "PYTHON_CMD=%%P"
-  )
-)
+call "%~dp0ensure_python.bat"
 
 if not defined PYTHON_CMD (
-  echo Could not find Python: tried "py", "python" and "python3".
-  echo Install Python from https://www.python.org/downloads/ ^(tick "Add python.exe to PATH"^),
-  echo then run python-install.bat to install the libraries this program uses.
+  echo Python could not be found or installed automatically.
+  echo Please install it from https://www.python.org/downloads/ ^(tick "Add python.exe to PATH"^)
+  echo and run this file again.
   echo.
   pause
   exit /b 1

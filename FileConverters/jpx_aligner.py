@@ -165,6 +165,36 @@ def load_frame_preview(jpx_path, frame_box, index):
     return img, w / pw, h / ph
 
 
+class Tooltip:
+    """A small note that appears when the pointer rests on a widget."""
+
+    def __init__(self, widget, text, delay=500):
+        self.widget, self.text, self.delay, self.tip, self.job = widget, text, delay, None, None
+        widget.bind("<Enter>", self.schedule, add="+")
+        widget.bind("<Leave>", self.hide, add="+")
+        widget.bind("<ButtonPress>", self.hide, add="+")
+
+    def schedule(self, event=None):
+        self.hide()
+        self.job = self.widget.after(self.delay, self.show)
+
+    def show(self):
+        self.job = None
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        tk.Label(self.tip, text=self.text, justify=tk.LEFT, background="#ffffe0", relief=tk.SOLID, borderwidth=1,
+                 wraplength=260, padx=4, pady=2).pack()
+        self.tip.wm_geometry(f"+{self.widget.winfo_rootx() - 100}+{self.widget.winfo_rooty() + self.widget.winfo_height() + 4}")
+
+    def hide(self, event=None):
+        if self.job:
+            self.widget.after_cancel(self.job)
+            self.job = None
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+
 def human_gb(n):
     return f"{n / 1e9:.1f} GB" if n >= 1e8 else f"{n / 1e6:.0f} MB"
 
@@ -203,7 +233,7 @@ class Aligner:
         self.prov_sel = set()       # vertices inside the rubber band while it is being dragged
         self.outline_undo = []      # steps of the Drawing panel's Undo: (section index, its outline before the change)
         self.last_ref = None        # the comparison section and opacity of the last redraw, for the overlay
-        self.last_alpha = 0.5
+        self.last_alpha = 0.75
         self.var_draw_info = tk.StringVar(self.root, "")
         self.var_draw_sel = tk.StringVar(self.root, "")   # second, indented line: how many vertices are selected
         self.hover = None           # ('vertex', i) or ('edge', i) under the pointer, for the current outline
@@ -218,7 +248,7 @@ class Aligner:
 
         self.var_ref = tk.StringVar(self.root, "previous")
         self.var_mode = tk.StringVar(self.root, "blend")
-        self.var_opacity = tk.DoubleVar(self.root, 0.5)
+        self.var_opacity = tk.DoubleVar(self.root, 0.75)
         self.var_rot = tk.StringVar(self.root, "0")
         self.var_dx = tk.StringVar(self.root, "0")
         self.var_dy = tk.StringVar(self.root, "0")
@@ -335,7 +365,13 @@ class Aligner:
             e = ttk.Entry(f, textvariable=var, width=10)
             e.grid(row=r, column=1, columnspan=2, sticky="w", padx=4)
             e.bind("<Return>", lambda ev: self.apply_entries())
-        ttk.Button(f, text="Apply", command=self.apply_entries).grid(row=2, column=3, rowspan=3, sticky="ns")
+        ab = ttk.Frame(f)   # Apply and Undo share the height the Apply button had alone
+        ab.grid(row=2, column=3, rowspan=3, sticky="ns")
+        ttk.Button(ab, text="Apply", command=self.apply_entries).pack(fill=tk.BOTH, expand=True)
+        undo = ttk.Button(ab, text="Undo", command=self.do_undo)
+        undo.pack(fill=tk.BOTH, expand=True)
+        Tooltip(undo, "Undoes the last alignment edit (rotation, shift, flip). Shortcut: Ctrl+Z.\n"
+                      "Outline edits have their own Undo, in the Drawing panel.")
         bf = ttk.Frame(f)
         bf.grid(row=5, column=0, columnspan=4, pady=(6, 0))
         for text, deg in (("-1°", -1), ("-0.1°", -0.1), ("+0.1°", 0.1), ("+1°", 1)):   # (+ is clockwise)
@@ -344,7 +380,9 @@ class Aligner:
         bf2.grid(row=6, column=0, columnspan=4, pady=(4, 0))
         ttk.Button(bf2, text="Flip left-right (F)", command=self.flip).pack(side=tk.LEFT, padx=2)
         ttk.Button(bf2, text="Reset", command=self.reset_section).pack(side=tk.LEFT, padx=2)
-        self.label_detail = ttk.Label(f, text="", foreground="gray30", justify=tk.LEFT)
+        # (wrapped, so that a long note cannot widen the panel at the expense of the picture)
+        self.label_detail = ttk.Label(f, text="", foreground="gray30", justify=tk.LEFT,
+                                      wraplength=round(250 * self.root.winfo_fpixels("1i") / 96))
         self.label_detail.grid(row=7, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
         f = ttk.LabelFrame(right, text="Compare with", padding=6)
@@ -479,26 +517,36 @@ class Aligner:
                 "(their current images in the JPX are kept as they are):\n\n" + "\n".join(missing),
                 parent=self.root)
         if stack.source_pixel_um and abs(stack.source_pixel_um / stack.pixel_um - 1) > 0.01:
-            if messagebox.askyesno(
+            answer = messagebox.askyesnocancel(
                     "Pixel size doesn't match the source images",
-                    f"This reconstruction is labelled with a pixel size of {stack.pixel_um:g} um (in reconstruction.xml and the "
-                    f"JPX's metadata), but its source images have {stack.source_pixel_um:g} um (from CaseFile.H5). The outlines "
-                    "show that NeuroInfo laid the images out one source pixel to one stack pixel, so the label looks wrong "
-                    "(typically because the size was typed in by hand when the stack was built).\n\n"
+                    f"This reconstruction is labelled with a pixel size of {stack.pixel_um:g} um, "
+                    f"but its source images have {stack.source_pixel_um:g} um (from CaseFile.H5).\n\n"
                     f"Correct the pixel size to {stack.source_pixel_um:g} um?\n\n"
-                    "If you choose Yes, all lengths here (shifts, outlines) are shown in the corrected units, and the next "
+                    "If Yes, the next "
                     "export writes the corrected pixel size into the JPX's metadata. reconstruction.xml is not changed.",
-                    icon="warning", parent=self.root):
+                    icon="warning", parent=self.root)
+            if answer is None:   # Cancel: don't open the stack at all
+                return
+            if answer:
                 stack.apply_pixel_size(stack.source_pixel_um)
-        unreadable = sorted({os.path.basename(s.source_path) for s in stack.sections if s.source_path and not s.renderable})
+        def other_format(s):
+            return bool(s.source_path) and not s.renderable and not s.source_path.lower().endswith(".czi")
+        unreadable = sorted({os.path.basename(s.source_path) for s in stack.sections if other_format(s)})
         if unreadable:
             messagebox.showinfo(
                 "Source images this tool can't read",
-                f"{sum(1 for s in stack.sections if s.source_path and not s.renderable)} of the {len(stack.sections)} sections "
-                "come from source images that are not JPEG 2000 files (for example Zeiss .czi):\n\n"
+                f"{sum(1 for s in stack.sections if other_format(s))} of the {len(stack.sections)} sections "
+                "come from source images that are not JPEG 2000 or Zeiss .czi files:\n\n"
                 + "\n".join(unreadable[:6]) + ("\n..." if len(unreadable) > 6 else "")
                 + "\n\nFor those sections the picture is the JPX's own frame, their alignment can't be edited here, and "
                 "their outlines can. Exporting copies their frames unchanged.", parent=self.root)
+        czi_online = sorted({s.source_path for s in stack.sections
+                             if s.source_path.lower().endswith(".czi") and ns.is_online_only(s.source_path)})
+        if czi_online and not messagebox.askyesno(
+                "Download from OneDrive?",
+                f"{len(czi_online)} slide scan(s) ({human_gb(sum(os.path.getsize(p) for p in czi_online))}) are online-only in "
+                "OneDrive and must be downloaded to show and re-render their sections. Continue?", parent=self.root):
+            return
         need = [s for s in stack.sections if s.renderable and not preview_is_cached(s.source_path)]
         online = [s for s in need if ns.is_online_only(s.source_path)]
         if online:
@@ -538,20 +586,31 @@ class Aligner:
 
         def work():
             frame_boxes = None
+            if any(s.source_path.lower().endswith(".czi") and s.czi_origin is None for s in todo):
+                self.msgs.put(("status", "Preparing the Zeiss .czi reader (installed first if it is missing)..."))
+                problems = ns.calibrate_stack_czi(stack, progress=lambda i, n, text: self.msgs.put(("progress", (i, n, text))))
+                self.msgs.put(("progress", (0, len(todo), "")))
+                self.msgs.put(("czi_ready", (stack, {k: v for k, v in problems.items() if v})))
+            czi_scenes = {}
             for n, s in enumerate(todo, 1):
                 if self.stack is not stack:
                     return
                 is_frame = not s.renderable
                 try:
-                    if is_frame:
+                    if not is_frame and s.source_path.lower().endswith(".czi"):
+                        key = (s.source_path, ns.czi_scene_of(s, stack))
+                        self.msgs.put(("status", f"Loading section {s.index + 1} of {len(stack.sections)}..."))
+                        if key not in czi_scenes:
+                            czi_scenes[key] = ns.czi_preview(s, stack, PREVIEW_MAX_PX)
+                        pv = czi_scenes[key]
+                    elif is_frame:
                         if frame_boxes is None:
                             frame_boxes = [b for b in ns.read_boxes(stack.jpx_path) if b.kind == b"jp2c"]
-                        self.msgs.put(("status", f"Loading the frame of {s.name} (section {s.index + 1}; {n} of {len(todo)})..."))
+                        self.msgs.put(("status", f"Loading section {s.index + 1} of {len(stack.sections)}..."))
                         pv = load_frame_preview(stack.jpx_path, frame_boxes[s.index], s.index)
                     else:
                         cached = preview_is_cached(s.source_path)
-                        self.msgs.put(("status", f"{'Loading' if cached else 'Building'} preview of {s.name} "
-                                                 f"({n} of {len(todo)})..."))
+                        self.msgs.put(("status", f"{'Loading' if cached else 'Building (first time only)'} section {s.index + 1} of {len(stack.sections)}..."))
                         pv = load_preview(s.source_path)
                 except Exception as e:
                     self.msgs.put(("status", f"Couldn't read {s.name}: {e}"))
@@ -567,12 +626,27 @@ class Aligner:
                 kind, payload = self.msgs.get_nowait()
                 if kind == "status":
                     self.var_status.set(payload)
+                    for item in self.canvas.find_withtag("loadtext"):   # (the message in the middle of the picture follows it)
+                        self.canvas.itemconfig(item, text=payload)
                 elif kind == "loaded":
                     stack, text = payload
                     if stack is self.stack:   # (a stack opened since has its own loading under way)
                         self.loading_previews = False
                         self.update_cursor()
                         self.var_status.set(text)
+                elif kind == "czi_ready":
+                    stack, problems = payload
+                    if stack is self.stack:
+                        self.refresh_list()
+                        self.update_controls()
+                        if problems:
+                            few = sum(1 for s in stack.sections if s.source_path.lower().endswith(".czi") and not s.renderable)
+                            messagebox.showwarning(
+                                "Some sections couldn't be located on the slide scan",
+                                f"{few} of {len(stack.sections)} sections {'shows' if few == 1 else 'show'} the JPX's own "
+                                f"{'frame, so its alignment' if few == 1 else 'frames, so their alignment'} can't be edited "
+                                f"({'its outline' if few == 1 else 'their outlines'} can):\n\n"
+                                + "\n".join(f"{k}: {v}" for k, v in problems.items()), parent=self.root)
                 elif kind == "preview":
                     stack, idx, pv, n, is_frame = payload
                     if stack is self.stack:
@@ -587,6 +661,8 @@ class Aligner:
                     i, n, text = payload
                     self.progress.config(maximum=n, value=i)
                     self.var_status.set(text)
+                    for item in self.canvas.find_withtag("loadtext"):
+                        self.canvas.itemconfig(item, text=text)
                 elif kind == "export_done":
                     self.export_finished(*payload)
         except queue.Empty:
@@ -661,8 +737,9 @@ class Aligner:
                  f"Net: rotation {-s.rotation_deg:+.2f}° (clockwise), {'mirrored' if s.mirrored else 'not mirrored'}"
                  + ("" if s.renderable else
                     "\nSource image not found: can't edit." if not s.source_path else
-                    "\nSource image is not a JPEG 2000 file: the picture is the JPX's own frame; "
-                    "alignment can't be edited, the outline can."))
+                    ("\nCouldn't be located on the slide scan" if s.source_path.lower().endswith(".czi")
+                     else "\nSource image is not a JPEG 2000 file")
+                    + ": the picture is the JPX's own frame; alignment can't be edited, the outline can."))
 
     # ---------------------------------------------------------------- editing
 
@@ -951,6 +1028,7 @@ class Aligner:
         else:
             R, t = sec.effective()
             M = np.vstack([ns.canvas_to_source_matrix(R, t, self.stack.pixel_um), [0, 0, 1]])  # -> source px
+            M[:2, 2] += ns.section_source_offset(sec, self.stack)   # (a .czi's preview is of its scene, not of the slide)
         P = np.array([[1 / kx, 0, 0.5 / kx - 0.5], [0, 1 / ky, 0.5 / ky - 0.5], [0, 0, 1]])  # -> preview px
         T = (P @ M @ A)[:2]
         flags = cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP
@@ -1075,7 +1153,12 @@ class Aligner:
         c.create_line(px, py - 8, px, py + 8, fill=cur_color, tags="overlay")
         self.draw_vertex_marks()
         if cur.index not in self.previews and self.loading_previews:
-            c.create_text(vw / 2, 20, text="loading preview...", fill="white", tags="overlay")
+            box = c.create_text(vw / 2, vh / 2, text="Loading preview...", fill="white", font=("Segoe UI", max(10, min(28, int((vw - 80) / 11))), "bold"), tags="overlay")
+            x0, y0, x1, y1 = c.bbox(box)
+            c.create_rectangle(x0 - 30, y0 - 18, x1 + 30, y1 + 18, fill="#202020", outline="#808080", tags="overlay")
+            c.tag_raise(box)
+            c.create_text(vw / 2, y1 + 50, text=self.var_status.get(), fill="white", font=("Segoe UI", 14), width=max(vw - 40, 200),
+                          justify="center", tags=("overlay", "loadtext"))
 
     # ---------------------------------------------------------------- outline editing
 

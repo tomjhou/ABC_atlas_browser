@@ -1,6 +1,6 @@
 @echo off
 REM Starts the TIFF to NeuroInfo JP2 converter (double-click this file in Windows Explorer).
-REM Looks for Python as "py", then "python", then "python3", and uses the first that works.
+REM Finds Python (installing Python 3.13 first if there is none): see ensure_python.bat.
 REM Missing libraries are installed automatically on first run.
 setlocal
 cd /d "%~dp0"
@@ -8,17 +8,12 @@ title TIFF to NeuroInfo JP2 converter
 echo ==== TIFF to NeuroInfo JP2 converter ====
 echo.
 
-set "PYTHON_CMD="
-for %%P in (py python python3) do (
-  if not defined PYTHON_CMD (
-    %%P --version >nul 2>&1
-    if not errorlevel 1 set "PYTHON_CMD=%%P"
-  )
-)
+call "%~dp0..\ensure_python.bat"
 
 if not defined PYTHON_CMD (
-  echo Could not find Python: tried "py", "python" and "python3".
-  echo Install Python from https://www.python.org/downloads/ ^(tick "Add python.exe to PATH"^).
+  echo Python could not be found or installed automatically.
+  echo Please install it from https://www.python.org/downloads/ ^(tick "Add python.exe to PATH"^)
+  echo and run this file again.
   echo.
   pause
   exit /b 1

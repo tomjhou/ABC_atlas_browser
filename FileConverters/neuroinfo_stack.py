@@ -48,14 +48,19 @@ import re
 import struct
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
 
 REQUIRED_PACKAGES = {"numpy": "numpy", "h5py": "h5py", "imagecodecs": "imagecodecs",
                      "cv2": "opencv-python"}
 
 
-def ensure_packages(required=None):
+CZI_PACKAGES = {"czifile": "czifile"}   # the Zeiss .czi reader, installed only when a stack needs it
+
+
+def ensure_packages(required=None, exit_on_failure=True):
     """Install any missing packages ({import name: pip name}) into this
     interpreter's environment."""
     required = required or REQUIRED_PACKAGES
@@ -71,7 +76,10 @@ def ensure_packages(required=None):
         site.addsitedir(user_site)
     still = [pip for mod, pip in required.items() if importlib.util.find_spec(mod) is None]
     if still:
-        sys.exit(f"Couldn't install {', '.join(still)}; install them with pip and try again.")
+        message = f"Couldn't install {', '.join(still)}; install them with pip and try again."
+        if exit_on_failure:
+            sys.exit(message)
+        raise ImportError(message)
 
 
 ensure_packages()
@@ -227,6 +235,7 @@ class Section:
     source_abs_hint: str = ""                        # path recorded in the file
     pivot_src: np.ndarray = None   # the edit pivot in source um (fixed when first opened, so editing the outline does not move it)
     saved_points: np.ndarray = None  # the outline as the opened file has it (to tell whether it was edited)
+    czi_origin: tuple = None   # for a Zeiss .czi source: where its source pixel (0, 0) is in the slide's pixel grid (see calibrate_czi)
 
     def __post_init__(self):
         self.case_points = np.asarray(self.case_points, float).reshape(-1, 2)
@@ -243,8 +252,10 @@ class Section:
     @property
     def renderable(self):
         """The source image was found and is one this tool can read, so the section can be re-rendered (and its alignment
-        edited). Otherwise the section only has its frame in the JPX, which is shown as it is; its outline can still be edited."""
-        return bool(self.source_path) and self.source_path.lower().endswith(JP2_EXTENSIONS)
+        edited). A .czi source counts once its position on the slide is known (czi_origin, found by calibrate_czi). Otherwise the
+        section only has its frame in the JPX, which is shown as it is; its outline can still be edited."""
+        path = self.source_path.lower()
+        return bool(path) and (path.endswith(JP2_EXTENSIONS) or (path.endswith(".czi") and self.czi_origin is not None))
 
     @property
     def center(self):
@@ -499,7 +510,7 @@ def _load_aligner(jpx_path, doc):
             i, d["name"], resolve_source(folder, d["name"], d.get("source_relative", ""), d.get("source_absolute", "")),
             np.array(d["case_points"], float).reshape(-1, 2), np.array(d["base_R"], float), np.array(d["base_t"], float),
             edit=copy.copy(e), saved_edit=copy.copy(e), source_abs_hint=d.get("source_absolute", ""),
-            pivot_src=d.get("pivot_src")))
+            pivot_src=d.get("pivot_src"), czi_origin=tuple(d["czi_origin"]) if d.get("czi_origin") else None))
     frames = [b for b in read_boxes(jpx_path) if b.kind == b"jp2c"]
     if len(stack.sections) != len(frames):
         raise ValueError("Alignment data doesn't match the number of images in this JPX")
@@ -544,6 +555,8 @@ def stack_json(stack, out_path):
             "pivot_src": np.round(s.pivot_src, 6).tolist(),
             "edit": asdict(s.edit),
         })
+        if s.czi_origin is not None:
+            secs[-1]["czi_origin"] = [round(float(v), 4) for v in s.czi_origin]
     # Version 2 only when needed (an outline was edited or removed, so the pivot is no longer the outline's centroid);
     # otherwise the file stays readable by the first version of this tool.
     needs_v2 = any(not len(s.case_points) or not np.allclose(s.pivot_src, s.case_points.mean(0), atol=1e-4)
@@ -575,16 +588,290 @@ def canvas_to_source_matrix(R, t, pixel_um):
     return np.column_stack([lin, off])
 
 
+##################################################
+#
+#    Zeiss .czi sources
+#
+# A slide scan holds several scenes (one per section, in a grid), each with its position (bbox) in one big pixel grid
+# and a pyramid of resolutions. NeuroInfo keeps each section's outline in um relative to a slide origin it does not record,
+# in a y-up frame: this tool's source pixel (col, row) of such a section is the slide pixel (col + X0, row + Y0), with
+# one (X0, Y0) for the whole .czi file (czi_origin). Both are found by matching a frame of the JPX against the scans
+# (calibrate_czi), after which sections are rendered from the scan like any other source image.
+#
+##################################################
+
+_czi_lock = threading.RLock()
+_czi_files = {}
+
+
+def czi_file(path):
+    """The (cached) open czifile.CziFile for `path`; installs the reader library first if needed."""
+    with _czi_lock:
+        key = os.path.normcase(os.path.abspath(path))
+        if key not in _czi_files:
+            ensure_packages(CZI_PACKAGES, exit_on_failure=False)
+            import czifile
+            _czi_files[key] = czifile.CziFile(path)
+        return _czi_files[key]
+
+
+def czi_scenes(path):
+    """Position of each scene in the slide's pixel grid: [(x0, y0, width, height), ...]."""
+    with _czi_lock:
+        cz = czi_file(path)
+        return [tuple(int(v) for v in cz.scenes[i].bbox) for i in range(len(cz.scenes))]
+
+
+def czi_levels(path, scene=0):
+    with _czi_lock:
+        return len(czi_file(path).scenes[scene].levels)
+
+
+def czi_read(path, scene, level=0):
+    """A scene at pyramid `level` (each level halves the resolution), H x W x C."""
+    with _czi_lock:
+        arr = czi_file(path).scenes[scene].levels[level].asarray()
+    if arr.ndim == 2:
+        arr = arr[None]
+    return np.moveaxis(arr, 0, -1)
+
+
+def czi_scene_of(section, stack):
+    """Index of the scene holding the section's outline (the one with most of the outline's points inside)."""
+    boxes = czi_scenes(section.source_path)
+    P = section.saved_points if len(section.saved_points) else section.pivot_src.reshape(1, 2)
+    X = P[:, 0] / stack.pixel_um + section.czi_origin[0]
+    Y = -P[:, 1] / stack.pixel_um + section.czi_origin[1]
+    inside = [int(np.sum((X >= x0) & (X < x0 + w) & (Y >= y0) & (Y < y0 + h))) for x0, y0, w, h in boxes]
+    return int(np.argmax(inside))
+
+
+def section_source_offset(section, stack):
+    """(dx, dy): the section's source pixel (col, row) is at (col + dx, row + dy) in the array that is read for it (the scene
+    of a .czi; zero for ordinary images)."""
+    if section.czi_origin is None or not section.source_path.lower().endswith(".czi"):
+        return 0.0, 0.0
+    x0, y0, _, _ = czi_scenes(section.source_path)[czi_scene_of(section, stack)]
+    return float(section.czi_origin[0] - x0), float(section.czi_origin[1] - y0)
+
+
+def czi_preview(section, stack, max_px):
+    """(image H x W x C, k) for a section's scene at the coarsest pyramid level that is still at least max_px on its long
+    side (k source pixels per image pixel), as (img, kx, ky) like the aligner's other previews."""
+    path = section.source_path
+    scene = czi_scene_of(section, stack)
+    _, _, w, h = czi_scenes(path)[scene]
+    level = 0
+    while level + 1 < czi_levels(path, scene) and max(w, h) / 2 ** level > max_px:
+        level += 1
+    img = czi_read(path, scene, level)
+    return img, w / img.shape[1], h / img.shape[0]
+
+
+def _czi_template(frame_mean, section, stack, S, box):
+    """The frame resampled into source pixels (S source px per template px) over box = (cmin, rmin, cmax, rmax)."""
+    cmin, rmin, cmax, rmax = box
+    R, t = section.effective()
+    M = np.vstack([canvas_to_source_matrix(R, t, stack.pixel_um), [0, 0, 1]])   # canvas px -> source px
+    small = frame_mean if S == 1 else cv2.resize(frame_mean, (frame_mean.shape[1] // S, frame_mean.shape[0] // S),
+                                                 interpolation=cv2.INTER_AREA)
+    B = np.array([[S, 0, cmin], [0, S, rmin], [0, 0, 1]], float)                 # template px -> source px
+    D = np.array([[1 / S, 0, 0.5 / S - 0.5], [0, 1 / S, 0.5 / S - 0.5], [0, 0, 1]]) if S > 1 else np.eye(3)
+    A = (D @ np.linalg.inv(M) @ B)[:2]                                          # template px -> (shrunk) frame px
+    tw, th = int(np.ceil((cmax - cmin) / S)), int(np.ceil((rmax - rmin) / S))
+    return cv2.warpAffine(small, A, (tw, th), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                          borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+
+def _best_match(image, template):
+    """(score, (x, y) with sub-pixel refinement) of the best normalized-correlation position of template in image."""
+    res = cv2.matchTemplate(image, template, cv2.TM_CCOEFF_NORMED)
+    _, score, _, (x, y) = cv2.minMaxLoc(res)
+    fx, fy = float(x), float(y)
+    if 0 < x < res.shape[1] - 1:
+        a, b, c = res[y, x - 1], res[y, x], res[y, x + 1]
+        if a - 2 * b + c < 0:
+            fx += 0.5 * (a - c) / (a - 2 * b + c)
+    if 0 < y < res.shape[0] - 1:
+        a, b, c = res[y - 1, x], res[y, x], res[y + 1, x]
+        if a - 2 * b + c < 0:
+            fy += 0.5 * (a - c) / (a - 2 * b + c)
+    return float(score), (fx, fy)
+
+
+def _czi_outline_box(section, stack):
+    """The section's outline in source pixels, padded: (cmin, rmin, cmax, rmax)."""
+    P = section.saved_points
+    cols, rows = P[:, 0] / stack.pixel_um, -P[:, 1] / stack.pixel_um
+    pad = 0.08 * max(np.ptp(cols), np.ptp(rows))
+    return cols.min() - pad, rows.min() - pad, cols.max() + pad, rows.max() + pad
+
+
+def _crop_zero(arr, x0, y0, x1, y1):
+    """arr[y0:y1, x0:x1] where the part outside arr (a section can reach past its scene) reads as zeros."""
+    out = np.zeros((y1 - y0, x1 - x0) + arr.shape[2:], arr.dtype)
+    cx0, cy0, cx1, cy1 = max(x0, 0), max(y0, 0), min(x1, arr.shape[1]), min(y1, arr.shape[0])
+    if cx1 > cx0 and cy1 > cy0:
+        out[cy0 - y0:cy1 - y0, cx0 - x0:cx1 - x0] = arr[cy0:cy1, cx0:cx1]
+    return out
+
+
+def czi_candidates(stack, czi_path, section, frame, coarse=None):
+    """Coarse matches of the section's frame (H x W x C) against every scene of the scan: [(score, scene, X0, Y0), ...], best
+    first, each with the origin it implies (to within a few pixels). `coarse` is a dict that keeps the scenes' coarse images
+    from one call to the next (they are the same for every section of the scan)."""
+    boxes = czi_scenes(czi_path)
+    level = min(3, min(czi_levels(czi_path, i) for i in range(len(boxes))) - 1)
+    S = 2 ** level
+    box = _czi_outline_box(section, stack)
+    tmpl = _czi_template(frame.astype(np.float32).mean(2), section, stack, S, box)
+    found = []
+    for i, (x0, y0, w, h) in enumerate(boxes):
+        key = (czi_path, i, level)
+        if coarse is not None and key in coarse:
+            arr = coarse[key]
+        else:
+            arr = czi_read(czi_path, i, level).astype(np.float32).mean(2)
+            if coarse is not None:
+                coarse[key] = arr
+        ph, pw = tmpl.shape[0] // 2, tmpl.shape[1] // 2      # (the template's padding may reach past the scene)
+        img = _crop_zero(arr, -pw, -ph, arr.shape[1] + pw, arr.shape[0] + ph)
+        score, (fx, fy) = _best_match(img, tmpl)
+        found.append((score, i, x0 + S * (fx - pw) - box[0], y0 + S * (fy - ph) - box[1]))
+    return sorted(found, reverse=True)
+
+
+def czi_refine(stack, czi_path, section, frame, scene, X0, Y0, steps=((2, 16, None), (0, 8, 1500))):
+    """(X0, Y0, score) improved to a fraction of a pixel, from a coarse estimate, by matching at finer pyramid levels."""
+    x0, y0 = czi_scenes(czi_path)[scene][:2]
+    fmean = frame.astype(np.float32).mean(2)
+    box = _czi_outline_box(section, stack)
+    score = 0.0
+    for level, window, central in steps:
+        S = 2 ** level
+        b = box
+        if central:
+            cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+            b = (cx - central / 2, cy - central / 2, cx + central / 2, cy + central / 2)
+        tmpl = _czi_template(fmean, section, stack, S, b)
+        th, tw = tmpl.shape
+        ex, ey = (X0 + b[0] - x0) / S, (Y0 + b[1] - y0) / S      # expected position of the template in the scene array
+        ax0, ay0 = int(round(ex)) - window, int(round(ey)) - window
+        arr = czi_read(czi_path, scene, level)
+        img = _crop_zero(arr, ax0, ay0, ax0 + tw + 2 * window, ay0 + th + 2 * window).astype(np.float32).mean(2)
+        del arr
+        score, (fx, fy) = _best_match(img, tmpl)
+        X0, Y0 = x0 + S * (ax0 + fx) - b[0], y0 + S * (ay0 + fy) - b[1]
+    return float(X0), float(Y0), float(score)
+
+
+def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progress=None):
+    """Locate the sections of every .czi source of the stack that have no czi_origin yet, so that they can be rendered.
+
+    NeuroInfo's slide coordinates relate to the scan by an offset (X0, Y0) that it does not record, found here by matching each
+    section's frame in the JPX against the scan. X0 is the same for the whole scan; Y0 turns out to differ a little between
+    sections, so each section gets its own. Ambiguous matches (a faint section can resemble the wrong scene) are resolved by
+    taking the X0 the clear matches agree on. Returns {file name: error text or ""}. progress(done, total, text) is called as
+    the sections are located."""
+    frames = [b for b in read_boxes(stack.jpx_path) if b.kind == b"jp2c"]
+
+    def load_frame(sec):
+        with open(stack.jpx_path, "rb") as f:
+            img = imagecodecs.jpeg2k_decode(read_payload(f, frames[sec.index]))
+        return img[..., None] if img.ndim == 2 else img
+
+    problems = {}
+    for path in sorted({s.source_path for s in stack.sections if s.source_path.lower().endswith(".czi")}):
+        name = os.path.basename(path)
+        todo = [s for s in stack.sections if s.source_path == path and s.czi_origin is None and len(s.saved_points)]
+        if not todo:
+            problems[name] = ""
+            continue
+        try:
+            coarse = {}
+            cands, done = {}, [0]
+            sizes = {sec.index: max(np.ptp(sec.saved_points[:, 0]), np.ptp(sec.saved_points[:, 1])) for sec in todo}
+            typical = float(np.median(list(sizes.values())))
+            total = [len(todo)]
+            lock = threading.Lock()
+
+            active = set()   # the sections being looked at now (two at a time): the lowest is the one named
+
+            def report(text=None):
+                if progress:
+                    if text is None:
+                        text = (f"Locating section {min(active) + 1} of {len(stack.sections)} on the slide scan..."
+                                if active else "Locating sections on the slide scan...")
+                    progress(done[0], total[0], text)
+
+            def look(sec):
+                """A quick look at the section; if it is clearly at one place, position it precisely right away (the frame
+                is in memory now, and decoding it again would cost as much as everything else)."""
+                active.add(sec.index)
+                report()
+                frame = load_frame(sec)
+                found = czi_candidates(stack, path, sec, frame, coarse)
+                if found and found[0][0] >= strong:
+                    _, scene, X0, Y0 = found[0]
+                    X0, Y0, score = czi_refine(stack, path, sec, frame, scene, X0, Y0)
+                    if score >= accept:
+                        sec.czi_origin = (X0, Y0)
+                active.discard(sec.index)
+                report()
+                return sec, found
+
+            with ThreadPoolExecutor(max_workers=2) as pool:   # (decoding and matching run beside each other)
+                for sec, found in pool.map(look, todo):
+                    cands[sec.index] = found
+                    with lock:
+                        done[0] += 1
+            clear = [c[0][2] for c in cands.values() if c and c[0][0] >= strong]
+            x_known = float(np.median(clear)) if clear else None
+            missed, small = [], []
+            later = [sec for sec in todo if sec.czi_origin is None]
+            total[0] = len(todo) + len(later)
+            for n, sec in enumerate(later, 1):
+                c = [k for k in cands[sec.index] if x_known is None or abs(k[2] - x_known) < 60]
+                if not c:
+                    (small if sizes[sec.index] < 0.35 * typical else missed).append(str(sec.index + 1))
+                    continue
+                report(f"Positioning section {sec.index + 1} of {len(stack.sections)}...")
+                X0, Y0, score = czi_refine(stack, path, sec, load_frame(sec), c[0][1], c[0][2], c[0][3])
+                done[0] += 1
+                if score >= accept:
+                    sec.czi_origin = (X0, Y0)
+                else:
+                    (small if sizes[sec.index] < 0.35 * typical else missed).append(str(sec.index + 1))
+            notes = []
+            if missed:
+                notes.append(f"section{'s' if len(missed) > 1 else ''} {', '.join(missed[:8])}{', ...' if len(missed) > 8 else ''} "
+                             "couldn't be located on the scan")
+            if small:   # (tiny pieces of tissue are often stray fragments, which are not worth the trouble)
+                notes.append(f"section{'s' if len(small) > 1 else ''} {', '.join(small[:8])} "
+                             f"{'are' if len(small) > 1 else 'is'} very small (a stray fragment?) and couldn't be located on the scan")
+            problems[name] = "; ".join(notes)
+        except Exception as e:
+            problems[name] = f"the scan couldn't be read ({type(e).__name__}: {e})"
+    return problems
+
+
 def render_section(section, stack, source=None, interpolation=cv2.INTER_LINEAR, use_edit=True):
     """Full-resolution section image on the stack canvas (H x W x C)."""
+    offset = (0.0, 0.0)
     if source is None:
         if not section.source_path:
             raise FileNotFoundError(f"source image for {section.name} not found")
-        source = imagecodecs.imread(section.source_path)
+        if section.source_path.lower().endswith(".czi"):
+            scene = czi_scene_of(section, stack)
+            source = czi_read(section.source_path, scene, 0)
+            offset = section_source_offset(section, stack)
+        else:
+            source = imagecodecs.imread(section.source_path)
     if source.ndim == 2:
         source = source[..., None]
     R, t = section.effective() if use_edit else (section.R, section.t)
     M = canvas_to_source_matrix(R, t, stack.pixel_um)
+    M[:, 2] += offset
     out = np.zeros((stack.canvas_h, stack.canvas_w, source.shape[2]), source.dtype)
     for c in range(source.shape[2]):
         out[..., c] = cv2.warpAffine(source[..., c], M, (stack.canvas_w, stack.canvas_h),
