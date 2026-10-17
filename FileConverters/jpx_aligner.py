@@ -311,6 +311,11 @@ class Aligner:
         ttk.Label(left, text="* changed since opened\n~ edited  |  F flipped", foreground="gray30",
                   justify=tk.LEFT).pack(side=tk.BOTTOM, anchor="w", pady=(4, 0))
         ttk.Label(left, text="Sections").pack(anchor="w")
+        order = ttk.Frame(left)   # under the list (packed before it, so the list takes what is left)
+        order.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+        for text, command in (("Move up", lambda: self.move_section(-1)), ("Move down", lambda: self.move_section(1)),
+                              ("Delete", self.delete_section)):
+            ttk.Button(order, text=text, command=command).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
         self.listbox = tk.Listbox(left, width=30, height=12, exportselection=False, activestyle="none",
                                   font=("Segoe UI", 10))
         self.listbox.pack(fill=tk.BOTH, expand=True)
@@ -607,7 +612,7 @@ class Aligner:
                         if frame_boxes is None:
                             frame_boxes = [b for b in ns.read_boxes(stack.jpx_path) if b.kind == b"jp2c"]
                         self.msgs.put(("status", f"Loading section {s.index + 1} of {len(stack.sections)}..."))
-                        pv = load_frame_preview(stack.jpx_path, frame_boxes[s.index], s.index)
+                        pv = load_frame_preview(stack.jpx_path, frame_boxes[s.frame], s.frame)
                     else:
                         cached = preview_is_cached(s.source_path)
                         self.msgs.put(("status", f"{'Loading' if cached else 'Building (first time only)'} section {s.index + 1} of {len(stack.sections)}..."))
@@ -615,7 +620,7 @@ class Aligner:
                 except Exception as e:
                     self.msgs.put(("status", f"Couldn't read {s.name}: {e}"))
                     continue
-                self.msgs.put(("preview", (stack, s.index, pv, n, is_frame)))
+                self.msgs.put(("preview", (stack, s.frame, pv, n, is_frame)))
             self.msgs.put(("loaded", (stack, f"Ready. {len(todo)} sections loaded.")))
 
         threading.Thread(target=work, daemon=True).start()
@@ -756,9 +761,9 @@ class Aligner:
     def push_undo(self, s):
         """Remember the edit of `s` (and, with "also move the following sections" on, of the sections after it, which an edit
         of `s` will move too) as one undo step."""
-        step = [(s.index, copy.copy(s.edit))]
+        step = [(s.frame, copy.copy(s.edit))]
         if self.var_follow.get():
-            step += [(f.index, copy.copy(f.edit)) for f in self.followers(s)]
+            step += [(f.frame, copy.copy(f.edit)) for f in self.followers(s)]
         self.undo.append(step)
         if len(self.undo) > 500:
             self.undo.pop(0)
@@ -850,7 +855,7 @@ class Aligner:
             return
         for s in self.stack.sections:
             if not s.edit.is_identity():
-                self.undo.append([(s.index, copy.copy(s.edit))])
+                self.undo.append([(s.frame, copy.copy(s.edit))])
                 s.edit = ns.Edit()
         self.refresh_list()
         self.update_controls()
@@ -860,13 +865,69 @@ class Aligner:
         if not self.stack or self.busy or not self.undo:
             return
         step = self.undo.pop()
-        for i, e in step:
-            self.stack.sections[i].edit = e
-            self.refresh_list_item(i)
-        i = step[0][0]
-        if i != self.cur:
-            self.select(i)
-        self.changed(self.stack.sections[i])
+        done = []
+        for frame, e in step:
+            s = self.by_frame(frame)
+            if s is not None:
+                s.edit = e
+                self.refresh_list_item(s.index)
+                done.append(s)
+        if not done:
+            return
+        if done[0].index != self.cur:
+            self.select(done[0].index)
+        self.changed(done[0])
+
+    def move_section(self, delta):
+        """Move the current section up (-1) or down (+1) in the stack."""
+        if not self.stack or self.busy:
+            return
+        i, j = self.cur, self.cur + delta
+        secs = self.stack.sections
+        if not 0 <= j < len(secs):
+            return
+        secs[i], secs[j] = secs[j], secs[i]
+        self.renumber()
+        self.select(j)
+        self.refresh_list()
+        self.var_status.set(f"Moved section {i + 1} to position {j + 1}. Export to save the new order.")
+
+    def delete_section(self):
+        """Remove the current section from the stack (after asking); the exported JPX will not contain it."""
+        if not self.stack or self.busy:
+            return
+        secs = self.stack.sections
+        if len(secs) <= 1:
+            messagebox.showinfo("Delete", "A stack needs at least one section.", parent=self.root)
+            return
+        s = secs[self.cur]
+        if not messagebox.askyesno(
+                "Delete section", f"Delete section {s.index + 1} from the stack?\n\n"
+                "It is left out when you export. The source image and the original JPX are not touched, but the deletion "
+                "can't be undone here (reopen the file to get it back).", icon="warning", parent=self.root):
+            return
+        i = self.cur
+        del secs[i]
+        self.stack.deleted += 1
+        self.previews.pop(s.frame, None)
+        self.frame_previews.discard(s.frame)
+        self.undo = [step for step in ([(f, e) for f, e in step if f != s.frame] for step in self.undo) if step]
+        self.outline_undo = [u for u in self.outline_undo if u[0] != s.frame]
+        self.renumber()
+        self.cur = min(i, len(secs) - 1)
+        self.sel_outline, self.sel_vertices, self.odrag, self.hover = False, set(), None, None
+        self.refresh_list()
+        self.update_controls()
+        self.redraw()
+        self.var_status.set(f"Deleted section {i + 1}. Export to save the stack without it.")
+
+    def renumber(self):
+        for i, sec in enumerate(self.stack.sections):
+            sec.index = i
+
+    def by_frame(self, frame):
+        """The section with that frame of the opened JPX (None if it was deleted)."""
+        return next((s for s in self.stack.sections if s.frame == frame), None)
 
     # ---------------------------------------------------------------- mouse / keys
 
@@ -1017,13 +1078,13 @@ class Aligner:
 
     def warp_section(self, sec, vw, vh):
         """(image vh x vw x C float32 in raw units, coverage mask) of a section in the view."""
-        pv = self.previews.get(sec.index)
+        pv = self.previews.get(sec.frame)
         if pv is None:
             return None, None
         img, kx, ky = pv
         s, ox, oy = self.view
         A = np.array([[1 / s, 0, -ox / s], [0, 1 / s, -oy / s], [0, 0, 1]])        # view -> canvas px
-        if sec.index in self.frame_previews:   # the JPX's own frame: already on the canvas, so canvas px = frame px
+        if sec.frame in self.frame_previews:   # the JPX's own frame: already on the canvas, so canvas px = frame px
             M = np.eye(3)
         else:
             R, t = sec.effective()
@@ -1152,7 +1213,7 @@ class Aligner:
         c.create_line(px - 8, py, px + 8, py, fill=cur_color, tags="overlay")
         c.create_line(px, py - 8, px, py + 8, fill=cur_color, tags="overlay")
         self.draw_vertex_marks()
-        if cur.index not in self.previews and self.loading_previews:
+        if cur.frame not in self.previews and self.loading_previews:
             box = c.create_text(vw / 2, vh / 2, text="Loading preview...", fill="white", font=("Segoe UI", max(10, min(28, int((vw - 80) / 11))), "bold"), tags="overlay")
             x0, y0, x1, y1 = c.bbox(box)
             c.create_rectangle(x0 - 30, y0 - 18, x1 + 30, y1 + 18, fill="#202020", outline="#808080", tags="overlay")
@@ -1209,15 +1270,19 @@ class Aligner:
         return ("edge", best[1], best[2]) if best else None
 
     def push_outline_undo(self, sec):
-        self.outline_undo.append((sec.index, sec.case_points.copy()))
+        self.outline_undo.append((sec.frame, sec.case_points.copy()))
         if len(self.outline_undo) > 500:
             self.outline_undo.pop(0)
 
     def undo_outline(self):
         if not self.outline_undo or not self.stack or self.busy:
             return
-        i, points = self.outline_undo.pop()
-        self.stack.sections[i].case_points = points
+        frame, points = self.outline_undo.pop()
+        sec = self.by_frame(frame)
+        if sec is None:
+            return
+        i = sec.index
+        sec.case_points = points
         self.sel_outline, self.sel_vertices, self.odrag = False, set(), None
         if i != self.cur:
             self.select(i)

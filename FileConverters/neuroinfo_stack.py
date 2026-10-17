@@ -236,8 +236,11 @@ class Section:
     pivot_src: np.ndarray = None   # the edit pivot in source um (fixed when first opened, so editing the outline does not move it)
     saved_points: np.ndarray = None  # the outline as the opened file has it (to tell whether it was edited)
     czi_origin: tuple = None   # for a Zeiss .czi source: where its source pixel (0, 0) is in the slide's pixel grid (see calibrate_czi)
+    frame: int = -1            # which frame of the opened JPX is this section's (index is its position now, which the user can change)
 
     def __post_init__(self):
+        if self.frame < 0:
+            self.frame = self.index
         self.case_points = np.asarray(self.case_points, float).reshape(-1, 2)
         if self.pivot_src is None:
             self.pivot_src = self.case_points.mean(0) if len(self.case_points) else np.zeros(2)
@@ -319,6 +322,7 @@ class Stack:
     from_aligner: bool = False
     source_pixel_um: float = 0.0     # the source images' pixel size, when it differs from pixel_um (the stack's label)
     pixel_corrected: bool = False    # pixel_um was changed here: the next export writes it into the JPX's own metadata
+    deleted: int = 0                 # how many sections were deleted since opening
 
     def apply_pixel_size(self, new_um):
         """Relabel the stack with pixel size `new_um` (the source images' true pixel size). Every length in um follows: the
@@ -346,8 +350,13 @@ class Stack:
         return any(s.dirty for s in self.sections)
 
     @property
+    def reordered(self):
+        """Sections were deleted or moved since opening."""
+        return self.deleted > 0 or any(s.frame != s.index for s in self.sections)
+
+    @property
     def changed(self):
-        return self.pixel_corrected or any(s.changed for s in self.sections)
+        return self.pixel_corrected or self.reordered or any(s.changed for s in self.sections)
 
     def out_of_canvas(self):
         """Sections whose outline extends past the canvas, with the overhang in um."""
@@ -777,7 +786,7 @@ def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progr
 
     def load_frame(sec):
         with open(stack.jpx_path, "rb") as f:
-            img = imagecodecs.jpeg2k_decode(read_payload(f, frames[sec.index]))
+            img = imagecodecs.jpeg2k_decode(read_payload(f, frames[sec.frame]))
         return img[..., None] if img.ndim == 2 else img
 
     problems = {}
@@ -898,16 +907,20 @@ def patch_xmp_pixel_size(payload, pixel_um):
 def write_jpx_like(template_path, codestreams, out_path, extra_payloads=(), pixel_um=None):
     """Copy template_path's boxes verbatim, replacing its jp2c codestreams in
     order with `codestreams` (bytes, or callables returning bytes), dropping
-    any old aligner box and appending `extra_payloads` as uuid boxes."""
+    any old aligner box and appending `extra_payloads` as uuid boxes. With fewer
+    codestreams than the template has frames, the template's last frames (each
+    with its own jpch/jplh header boxes) are left out."""
     boxes = read_boxes(template_path)
     frames = [b for b in boxes if b.kind == b"jp2c"]
-    if len(frames) != len(codestreams):
+    if len(codestreams) > len(frames) or not codestreams:
         raise ValueError(f"template has {len(frames)} frames, got {len(codestreams)} codestreams")
     tmp = out_path + ".partial"
     i = 0
     try:
         with open(template_path, "rb") as src, open(tmp, "wb") as dst:
             for b in boxes:
+                if i >= len(codestreams) and b.kind in (b"jp2c", b"jpch", b"jplh"):
+                    continue   # (the frames that were left out, and their header boxes)
                 if b.kind == b"jp2c":
                     cs = codestreams[i]
                     dst.write(box_bytes(b"jp2c", cs() if callable(cs) else cs))
@@ -951,7 +964,7 @@ def export_stack(stack, out_path, quality_db=DEFAULT_QUALITY_DB, rerender_all=Fa
             if progress is not None:
                 progress(s.index, len(stack.sections), s.name)
             if s not in todo:
-                codestreams.append(read_payload(fj, frames[s.index]))
+                codestreams.append(read_payload(fj, frames[s.frame]))
                 log(f"  {s.name}: unchanged, copied")
                 continue
             t0 = time.time()
@@ -1058,13 +1071,13 @@ def cmd_roundtrip(args):
     with open(st.jpx_path, "rb") as fj:
         for s in st.sections:
             if s not in secs:
-                codestreams.append(read_payload(fj, frames[s.index]))
+                codestreams.append(read_payload(fj, frames[s.frame]))
                 continue
             t0 = time.time()
             img = render_section(s, st, interpolation=interp)
             line = f"  {s.index}: {s.name:20s} rendered in {time.time() - t0:4.1f} s"
             if args.compare:
-                theirs = imagecodecs.jpeg2k_decode(read_payload(fj, frames[s.index]))
+                theirs = imagecodecs.jpeg2k_decode(read_payload(fj, frames[s.frame]))
                 corr, mad, dx, dy = compare_frames(img, theirs)
                 del theirs
                 line += (f" | vs original: corr {corr:.4f}, mean |diff| {100 * mad:4.1f}% of mean, "
