@@ -1683,7 +1683,7 @@ class CCFBrowser:
         buttons.pack(fill='x', pady=(10, 0))
         ttk.Button(buttons, text="Close", command=self.close_paint).pack(side='right')
         ttk.Button(buttons, text="Apply", command=self.apply_paint).pack(side='right', padx=(0, 6))
-        ttk.Button(buttons, text="Save volume…", command=self.save_volume).pack(side='left')
+        ttk.Button(buttons, text="Save volume as…", command=self.save_volume).pack(side='left')
         info = self.info.window
         info.update_idletasks()
         below = info.winfo_y() + info.winfo_height() + 8
@@ -1998,7 +1998,7 @@ class CCFBrowser:
             if (self.loaded_atlas_path and Path(ann) == Path(self.loaded_atlas_path)
                     and self.edit_version != self.saved_version):
                 notes.append("NOTE: the atlas on screen has painted changes that haven't been saved; the meshes are "
-                             "made from the file on disk. Use Save volume… in the Paint panel first to include them.\n")
+                             "made from the file on disk. Use Save volume as… in the Paint panel first to include them.\n")
             self.settings.update(mesh_annotation=ann, mesh_reference=ref, mesh_copy_existing=copy_existing.get())
             show("Reading the volumes…")
 
@@ -3162,7 +3162,7 @@ class CCFBrowser:
     def close(self):
         if self.edit_version != self.saved_version and not messagebox.askyesno(
                 "Unsaved changes", f"The volume has {self.edit_count:,} edited voxels that have not been saved "
-                "(Paint panel > Save volume).{0}{0}Close without saving?".format(chr(10)), icon='warning', default='no',
+                "(Paint panel > Save volume as).{0}{0}Close without saving?".format(chr(10)), icon='warning', default='no',
                 parent=self.root):
             return
         self.settings['bregma_mm'] = list(self.bregma)

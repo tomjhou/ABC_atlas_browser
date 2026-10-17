@@ -32,6 +32,7 @@ automatically if missing).
 
 import copy
 import hashlib
+import json
 import math
 import os
 import queue
@@ -54,6 +55,8 @@ from PIL import Image, ImageTk  # noqa: E402
 PREVIEW_MAX_PX = 2500   # longest side of the cached preview of each section
 CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
                          "JhouLab", "jpx_aligner_cache")
+SETTINGS_FILE = os.path.join(os.path.dirname(CACHE_DIR), "jpx_aligner_settings.json")
+RECENT_MAX = 10
 NUDGE_UM, NUDGE_BIG_UM = 5.0, 50.0
 ROT_STEP, ROT_BIG_STEP = 0.1, 1.0
 
@@ -101,6 +104,36 @@ def load_preview(src):
     np.savez(tmp, img=img, kx=w / pw, ky=h / ph)
     os.replace(tmp, path)
     return img, w / pw, h / ph
+
+
+def load_recent():
+    """The recently opened stacks (newest first) from the settings file; [] if there is none or it cannot be read."""
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            return [p for p in json.load(f).get("recent", []) if isinstance(p, str)]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def add_recent(path):
+    """Put `path` first in the recent list (once, whatever the letter case), keeping RECENT_MAX; failures to save are ignored."""
+    key = os.path.normcase(os.path.abspath(path))
+    recent = [os.path.abspath(path)] + [p for p in load_recent() if os.path.normcase(os.path.abspath(p)) != key]
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"recent": recent[:RECENT_MAX]}, f, indent=1)
+    except OSError:
+        pass
+
+
+def clear_recent():
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"recent": []}, f)
+    except OSError:
+        pass
 
 
 def human_gb(n):
@@ -168,6 +201,9 @@ class Aligner:
         menu = tk.Menu(root)
         fm = tk.Menu(menu, tearoff=0)
         fm.add_command(label="Open...", command=self.open_dialog, accelerator="Ctrl+O")
+        self.recent_menu = tk.Menu(fm, tearoff=0)
+        fm.add_cascade(label="Open recent", menu=self.recent_menu)
+        fm.config(postcommand=self.fill_recent_menu)   # (refreshed each time the File menu opens)
         fm.add_command(label="Export JPX...", command=self.export_dialog, accelerator="Ctrl+S")
         fm.add_separator()
         fm.add_command(label="Exit", command=self.quit)
@@ -328,6 +364,29 @@ class Aligner:
                                        "Discard them?", parent=self.root)
         return True
 
+    def fill_recent_menu(self):
+        """The recently opened stacks as menu entries (newest first), then a way to clear the list."""
+        menu = self.recent_menu
+        menu.delete(0, tk.END)
+        recent = load_recent()
+        for n, path in enumerate(recent):
+            folder = os.path.basename(os.path.dirname(path.rstrip("/\\")))
+            label = f"{n + 1}  {os.path.basename(path)}" + (f"   ({folder})" if folder else "")
+            menu.add_command(label=label, command=lambda p=path: self.open_recent(p))
+        if not recent:
+            menu.add_command(label="(no recent files)", state="disabled")
+        else:
+            menu.add_separator()
+            menu.add_command(label="Clear list", command=clear_recent)
+
+    def open_recent(self, path):
+        if self.busy or not self.confirm_discard():
+            return
+        if not os.path.exists(path):
+            messagebox.showerror("Can't open", f"This file or folder no longer exists:\n{path}", parent=self.root)
+            return
+        self.open_path(path)
+
     def open_dialog(self):
         if self.busy or not self.confirm_discard():
             return
@@ -376,6 +435,7 @@ class Aligner:
         self.levels_set = False
         self.build_channel_controls()
         self.root.title(f"JPX aligner - {os.path.basename(path)}")
+        add_recent(path)
         self.refresh_list()
         self.update_controls()
         self.redraw(fit_if_needed=True)
