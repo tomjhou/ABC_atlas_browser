@@ -413,14 +413,26 @@ def resolve_source(jpx_folder, name, relative="", absolute=""):
     candidates += [os.path.join(jpx_folder, name), os.path.join(jpx_folder, "..", name)]
     if absolute:
         candidates.append(absolute)
-        # NeuroInfo case files may record another computer's drive letter
-        m = re.match(r"^[A-Za-z]:[\\/](.*)$", absolute)
-        if m:
-            for drive in "DCEFGHIJ":
-                candidates.append(f"{drive}:/{m.group(1)}")
     for c in candidates:
         if c and os.path.isfile(c):
             return os.path.normpath(c)
+    # Not there under that name: a file whose name is the same with some extra characters before the extension (a label added
+    # by hand, e.g. "...0033.czi" -> "...0033-LHb.czi") is taken for it, searched for where the exact name was looked for.
+    stem, ext = os.path.splitext(name)
+    folders = []
+    for c in candidates:
+        d = os.path.dirname(c)
+        if d and d not in folders and os.path.isdir(d):
+            folders.append(d)
+    for d in folders:
+        found = []
+        for n in os.listdir(d):
+            n_stem, n_ext = os.path.splitext(n)
+            if n_ext.lower() == ext.lower() and len(n_stem) > len(stem) and n_stem.lower().startswith(stem.lower())                     and not n_stem[len(stem)].isdigit() and os.path.isfile(os.path.join(d, n)):   # (not "0033" for "003")
+                found.append(n)
+        found.sort(key=len)
+        if found and (len(found) == 1 or len(found[0]) < len(found[1])):   # the one with the least added; a tie is left unresolved
+            return os.path.normpath(os.path.join(d, found[0]))
     return ""
 
 
@@ -457,28 +469,77 @@ def find_aligner_json(jpx_path):
     return None
 
 
+def _xml_guids(xml_path):
+    """The contour GUIDs in a NeuroInfo reconstruction XML (upper case)."""
+    with open(xml_path, encoding="latin-1") as f:
+        return {g.upper() for g in re.findall(r'name="GUID"><s>([0-9A-Fa-f]+)</s>', f.read())}
+
+
+def _h5_matches(h5_path, guids):
+    """Whether the case file holds all of these contour GUIDs (None if it cannot be read)."""
+    try:
+        with h5py.File(h5_path, "r") as f:
+            return guids <= {k.upper() for k in f["BrainMaker/Contours"].keys()}
+    except Exception:
+        return None
+
+
 def _find_neuroinfo_files(jpx_path, locate=None):
-    """(xml path, h5 path) of the NeuroInfo files that go with the JPX. They are looked for beside it by their usual names
-    (<jpx name>.xml or reconstruction.xml, and CaseFile.H5); a file that is not there is asked for through
-    locate(kind, expected_name, folder, candidates) -> path or None (kind is "xml" or "h5"; candidates are the files of that
-    type in the folder), one file at a time. Without `locate` (or if it returns None) the error names the missing file."""
+    """(xml path, h5 path) of the NeuroInfo files that go with the JPX.
+
+    The XML is <jpx name>.xml beside the JPX. Nothing assumes a name for the case file: the reconstruction's own GUIDs say which
+    .h5 files fit it, and when exactly one does it is used without asking. The user is asked (and the likeliest offered first)
+    when several fit, when none fits, and when there is none at all (to locate it); the same goes for the XML when no
+    <jpx name>.xml is there. Asking is done through
+    locate(kind, expected_name, folder, candidates, reason, default, notes) -> path or None, where kind is "xml" or "h5",
+    candidates are the files of that type in the folder, reason is "missing" or "ambiguous", default is the one to offer first
+    and notes maps a candidate to a remark about it. Without `locate` (or when it returns None for a missing file) the error
+    names the file; without `locate`, an ambiguous choice falls back on the default."""
     folder = os.path.dirname(os.path.abspath(jpx_path))
     files = {n.lower(): n for n in os.listdir(folder)}
-    stem = os.path.splitext(os.path.basename(jpx_path))[0].lower()
-    found = {}
-    for kind, names, shown in (("xml", (stem + ".xml", "reconstruction.xml"), f"{os.path.splitext(os.path.basename(jpx_path))[0]}.xml or reconstruction.xml"),
-                               ("h5", ("casefile.h5",), "CaseFile.H5")):
-        name = next((files[n] for n in names if n in files), None)
-        if name:
-            found[kind] = os.path.join(folder, name)
-            continue
-        candidates = sorted(n for n in files.values() if n.lower().endswith("." + kind))
-        chosen = locate(kind, shown, folder, candidates) if locate else None
+    jpx_stem = os.path.splitext(os.path.basename(jpx_path))[0]
+
+    def listing(ext):
+        return sorted(n for n in files.values() if n.lower().endswith(ext))
+
+    # --- the XML
+    xml_name = files.get(jpx_stem.lower() + ".xml")
+    if xml_name:
+        xml_path = os.path.join(folder, xml_name)
+    else:
+        candidates = listing(".xml")
+        default = files.get("reconstruction.xml") or (candidates[0] if candidates else None)
+        chosen = locate("xml", f"{jpx_stem}.xml", folder, candidates, "ambiguous" if candidates else "missing", default, {}) \
+            if locate else None
+        if not chosen and not locate and default:
+            chosen = os.path.join(folder, default)
         if not chosen:
-            raise FileNotFoundError(
-                f"This JPX has no alignment data of its own, and {shown} (needed to recover it) wasn't found in\n{folder}")
-        found[kind] = chosen
-    return found["xml"], found["h5"]
+            raise FileNotFoundError(f"This JPX has no alignment data of its own, and {jpx_stem}.xml (needed to recover it) "
+                                    f"wasn't found in\n{folder}")
+        xml_path = chosen
+
+    # --- the case file
+    candidates = listing(".h5")
+    guids = _xml_guids(xml_path)
+    notes = {}
+    for n in candidates:
+        fits = _h5_matches(os.path.join(folder, n), guids)
+        notes[n] = "fits this reconstruction" if fits else ("doesn't fit this reconstruction" if fits is False else "can't be read")
+    default = next((n for n in candidates if notes[n] == "fits this reconstruction"), None) \
+        or files.get("casefile.h5") or (candidates[0] if candidates else None)
+    fitting = [n for n in candidates if notes[n] == "fits this reconstruction"]
+    if len(fitting) == 1:
+        h5_path = os.path.join(folder, fitting[0])
+    else:
+        chosen = locate("h5", "the case file (.h5)", folder, candidates, "ambiguous" if candidates else "missing", default, notes) \
+            if locate else None
+        if not chosen and not locate and default:
+            chosen = os.path.join(folder, default)
+        if not chosen:
+            raise FileNotFoundError("This JPX has no alignment data of its own, and its NeuroInfo case file (.h5) "
+                                    f"{'was not chosen' if candidates else 'wasn' + chr(39) + 't found'} in\n{folder}")
+        h5_path = chosen
+    return xml_path, h5_path
 
 
 def _load_neuroinfo(jpx_path, locate=None):
@@ -514,7 +575,8 @@ def _load_neuroinfo(jpx_path, locate=None):
             P = np.column_stack([pts["X"], pts["Y"]]).astype(float)
             Q = stack_outlines.get(guid.upper())
             if Q is None or len(Q) != len(P):
-                raise ValueError(f"{name}: outline in {xml_name} missing or doesn't match CaseFile.H5")
+                raise ValueError(f"{name}: outline in {xml_name} missing or doesn't match {os.path.basename(h5_path)} "
+                                 "(is that the case file of this reconstruction?)")
             R, t, err = fit_rigid(P, Q)
             if err > 1.0:
                 # Some source images (e.g. Zeiss .czi slides) have a different pixel size from the stack's (0.65 um against
@@ -683,6 +745,20 @@ def czi_read(path, scene, level=0):
     return np.moveaxis(arr, 0, -1)
 
 
+def czi_read_region(path, scene, x, y, w, h):
+    """The part (x, y, w, h) of a scene at full resolution, in slide pixels, as H x W x C (zeros where the scene does not
+    reach). Only the tiles under it are read, which is far quicker than the whole scene."""
+    with _czi_lock:
+        level = czi_file(path).scenes[scene].levels[0]
+        try:
+            arr = level(roi=(int(x), int(y), int(w), int(h))).asarray()
+        except ValueError:   # (no tile under the region at all: nothing there)
+            arr = np.zeros((level.shape[0], int(h), int(w)), level.dtype)
+    if arr.ndim == 2:
+        arr = arr[None]
+    return np.moveaxis(arr, 0, -1)
+
+
 def czi_scene_of(section, stack):
     """Index of the scene holding the section's outline (the one with most of the outline's points inside)."""
     boxes = czi_scenes(section.source_path)
@@ -783,10 +859,11 @@ def _crop_zero(arr, x0, y0, x1, y1):
     return out
 
 
-def czi_candidates(stack, czi_path, section, frame, coarse=None):
+def czi_candidates(stack, czi_path, section, frame, coarse=None, hint=None):
     """Coarse matches of the section's frame (H x W x C) against every scene of the scan: [(score, scene, X0, Y0), ...], best
     first, each with the origin it implies (to within a few pixels). `coarse` is a dict that keeps the scenes' coarse images
-    from one call to the next (they are the same for every section of the scan)."""
+    from one call to the next (they are the same for every section of the scan). With hint = (X0, Y0, band_x, band_y), the
+    origin is only looked for within that band around the expected one (far fewer places to try)."""
     boxes = czi_scenes(czi_path)
     level = min(3, min(czi_levels(czi_path, i) for i in range(len(boxes))) - 1)
     S = 2 ** level
@@ -802,9 +879,19 @@ def czi_candidates(stack, czi_path, section, frame, coarse=None):
             if coarse is not None:
                 coarse[key] = arr
         ph, pw = tmpl.shape[0] // 2, tmpl.shape[1] // 2      # (the template's padding may reach past the scene)
-        img = _crop_zero(arr, -pw, -ph, arr.shape[1] + pw, arr.shape[0] + ph)
+        if hint is None:
+            img = _crop_zero(arr, -pw, -ph, arr.shape[1] + pw, arr.shape[0] + ph)
+            left, top = -pw, -ph
+        else:
+            hx, hy, bx, by = hint
+            ex, ey = (hx + box[0] - x0) / S, (hy + box[1] - y0) / S      # where the template should lie in this scene
+            wx, wy = int(np.ceil(bx / S)), int(np.ceil(by / S))
+            if ex > arr.shape[1] + wx or ex + tmpl.shape[1] < -wx or ey > arr.shape[0] + wy or ey + tmpl.shape[0] < -wy:
+                continue   # (the expected place is not in this scene)
+            left, top = int(round(ex)) - wx, int(round(ey)) - wy
+            img = _crop_zero(arr, left, top, left + tmpl.shape[1] + 2 * wx, top + tmpl.shape[0] + 2 * wy)
         score, (fx, fy) = _best_match(img, tmpl)
-        found.append((score, i, x0 + S * (fx - pw) - box[0], y0 + S * (fy - ph) - box[1]))
+        found.append((score, i, x0 + S * (fx + left) - box[0], y0 + S * (fy + top) - box[1]))
     return sorted(found, reverse=True)
 
 
@@ -824,9 +911,12 @@ def czi_refine(stack, czi_path, section, frame, scene, X0, Y0, steps=((2, 16, No
         th, tw = tmpl.shape
         ex, ey = (X0 + b[0] - x0) / S, (Y0 + b[1] - y0) / S      # expected position of the template in the scene array
         ax0, ay0 = int(round(ex)) - window, int(round(ey)) - window
-        arr = czi_read(czi_path, scene, level)
-        img = _crop_zero(arr, ax0, ay0, ax0 + tw + 2 * window, ay0 + th + 2 * window).astype(np.float32).mean(2)
-        del arr
+        if level == 0:   # (only the tiles under the window are read)
+            img = czi_read_region(czi_path, scene, x0 + ax0, y0 + ay0, tw + 2 * window, th + 2 * window).astype(np.float32).mean(2)
+        else:
+            arr = czi_read(czi_path, scene, level)
+            img = _crop_zero(arr, ax0, ay0, ax0 + tw + 2 * window, ay0 + th + 2 * window).astype(np.float32).mean(2)
+            del arr
         score, (fx, fy) = _best_match(img, tmpl)
         X0, Y0 = x0 + S * (ax0 + fx) - b[0], y0 + S * (ay0 + fy) - b[1]
     return float(X0), float(Y0), float(score)
@@ -871,18 +961,44 @@ def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progr
                                 if active else "Locating sections on the slide scan...")
                     progress(done[0], total[0], text)
 
+            located_so_far = []   # (outline y in pixels, X0, Y0) of the sections placed so far
+
+            def expected_origin(sec):
+                """(X0, Y0) to expect for the section, from those placed already, or None. X0 is the same for the whole scan;
+                Y0 follows the outline's y in the case file at about two pixels per pixel (it runs the opposite way to the rows,
+                so the two add), with some scatter around that line."""
+                with lock:
+                    done_ = list(located_so_far)
+                if not done_ or not len(sec.saved_points):
+                    return None
+                ys = np.array([d[0] for d in done_]); xs = np.array([d[1] for d in done_]); y0s = np.array([d[2] for d in done_])
+                y = float(sec.saved_points[:, 1].mean()) / stack.pixel_um
+                slope = 2.0
+                if len(done_) >= 4 and np.ptp(ys) > 3000:   # (enough, and spread enough, to fit the slope too)
+                    slope, _ = np.polyfit(ys, y0s, 1)
+                    slope = float(np.clip(slope, 1.8, 2.3))
+                return float(np.median(xs)), float(np.mean(y0s - slope * ys) + slope * y)
+
             def look(sec):
                 """A quick look at the section; if it is clearly at one place, position it precisely right away (the frame
-                is in memory now, and decoding it again would cost as much as everything else)."""
+                is in memory now, and decoding it again would cost as much as everything else). Once some sections are placed,
+                the others are looked for only near where they are expected."""
                 active.add(sec.index)
                 report()
                 frame = load_frame(sec)
-                found = czi_candidates(stack, path, sec, frame, coarse)
+                expected = expected_origin(sec)
+                found = []
+                if expected is not None:   # (a band as wide as the scatter seen; anything not matching well falls back to a full search)
+                    found = czi_candidates(stack, path, sec, frame, coarse, hint=(expected[0], expected[1], 100, 1100))
+                if not found or found[0][0] < strong:
+                    found = czi_candidates(stack, path, sec, frame, coarse)
                 if found and found[0][0] >= strong:
                     _, scene, X0, Y0 = found[0]
                     X0, Y0, score = czi_refine(stack, path, sec, frame, scene, X0, Y0)
                     if score >= accept:
                         sec.czi_origin = (X0, Y0)
+                        with lock:
+                            located_so_far.append((float(sec.saved_points[:, 1].mean()) / stack.pixel_um, X0, Y0))
                         if on_located:
                             on_located(sec)
                 active.discard(sec.index)
