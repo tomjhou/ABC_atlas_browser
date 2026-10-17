@@ -700,12 +700,28 @@ class Aligner:
         if path:
             self.open_path(path)
 
+    def locate_file(self, kind, expected, folder, candidates):
+        """A NeuroInfo file that is not beside the JPX: say which, and let the user find it (None: they decline)."""
+        what = "The NeuroInfo case file" if kind == "h5" else "The NeuroInfo reconstruction file"
+        others = ""
+        if candidates:
+            others = f"\n\nThere {'is' if len(candidates) == 1 else 'are'} {len(candidates)} other .{kind} file{'' if len(candidates) == 1 else 's'} " \
+                     f"in that folder ({', '.join(candidates[:4])}{', ...' if len(candidates) > 4 else ''}); you can choose one."
+        if not messagebox.askokcancel(
+                "File not found", f"{what} ({expected}) wasn't found next to the JPX, in\n{folder}.{others}\n\n"
+                "Locate it now?", parent=self.root):
+            return None
+        types = [("HDF5 files", "*.h5 *.H5")] if kind == "h5" else [("XML files", "*.xml")]
+        path = filedialog.askopenfilename(parent=self.root, title=f"Locate {expected}", initialdir=folder,
+                                          filetypes=types + [("All files", "*.*")])
+        return path or None
+
     def open_path(self, path):
         self.opening = True
         self.update_cursor()
         self.root.update()
         try:
-            stack = ns.open_stack(path)
+            stack = ns.open_stack(path, locate=self.locate_file)
         except Exception as e:
             self.opening = False
             self.update_cursor()

@@ -457,17 +457,35 @@ def find_aligner_json(jpx_path):
     return None
 
 
-def _load_neuroinfo(jpx_path):
+def _find_neuroinfo_files(jpx_path, locate=None):
+    """(xml path, h5 path) of the NeuroInfo files that go with the JPX. They are looked for beside it by their usual names
+    (<jpx name>.xml or reconstruction.xml, and CaseFile.H5); a file that is not there is asked for through
+    locate(kind, expected_name, folder, candidates) -> path or None (kind is "xml" or "h5"; candidates are the files of that
+    type in the folder), one file at a time. Without `locate` (or if it returns None) the error names the missing file."""
     folder = os.path.dirname(os.path.abspath(jpx_path))
     files = {n.lower(): n for n in os.listdir(folder)}
     stem = os.path.splitext(os.path.basename(jpx_path))[0].lower()
-    xml_name = files.get(stem + ".xml") or files.get("reconstruction.xml")
-    h5_name = files.get("casefile.h5")
-    if not xml_name or not h5_name:
-        raise FileNotFoundError(
-            "This JPX has no alignment data of its own, and the NeuroInfo files needed to recover it "
-            f"(reconstruction.xml and CaseFile.H5) aren't next to it in\n{folder}")
-    xml = open(os.path.join(folder, xml_name), encoding="latin-1").read()
+    found = {}
+    for kind, names, shown in (("xml", (stem + ".xml", "reconstruction.xml"), f"{os.path.splitext(os.path.basename(jpx_path))[0]}.xml or reconstruction.xml"),
+                               ("h5", ("casefile.h5",), "CaseFile.H5")):
+        name = next((files[n] for n in names if n in files), None)
+        if name:
+            found[kind] = os.path.join(folder, name)
+            continue
+        candidates = sorted(n for n in files.values() if n.lower().endswith("." + kind))
+        chosen = locate(kind, shown, folder, candidates) if locate else None
+        if not chosen:
+            raise FileNotFoundError(
+                f"This JPX has no alignment data of its own, and {shown} (needed to recover it) wasn't found in\n{folder}")
+        found[kind] = chosen
+    return found["xml"], found["h5"]
+
+
+def _load_neuroinfo(jpx_path, locate=None):
+    folder = os.path.dirname(os.path.abspath(jpx_path))
+    xml_path, h5_path = _find_neuroinfo_files(jpx_path, locate)
+    xml_name = os.path.basename(xml_path)
+    xml = open(xml_path, encoding="latin-1").read()
     m = re.search(r'<scale x="([0-9.]+)"', xml)
     pixel_um = float(m.group(1)) if m else 0.575
     stack_outlines = {}
@@ -481,7 +499,7 @@ def _load_neuroinfo(jpx_path):
         w, h, nc = codestream_size(f, frames[0])
     stack = Stack(jpx_path, w, h, nc, pixel_um, origin=os.path.abspath(jpx_path))
 
-    with h5py.File(os.path.join(folder, h5_name), "r") as f:
+    with h5py.File(h5_path, "r") as f:
         bm = f["BrainMaker"]
         chain = {_s(r["Previous"]): _s(r["Name"]) for r in bm["OrderedSections/Contours"][()]}
         order, cur = [], ""
@@ -537,16 +555,17 @@ def _load_aligner(jpx_path, doc):
     return stack
 
 
-def open_stack(path):
+def open_stack(path, locate=None):
     """Open a JPX written by this tool, or a NeuroInfo reconstruction (a .jpx
-    with reconstruction.xml and CaseFile.H5 beside it, or that folder)."""
+    with reconstruction.xml and CaseFile.H5 beside it, or that folder). `locate` is asked for NeuroInfo files that are not
+    beside the JPX (see _find_neuroinfo_files)."""
     if os.path.isdir(path):
         names = {n.lower(): n for n in os.listdir(path)}
         if "reconstruction.jpx" not in names:
             raise FileNotFoundError(f"No reconstruction.jpx in {path}")
         path = os.path.join(path, names["reconstruction.jpx"])
     doc = find_aligner_json(path)
-    stack = _load_aligner(path, doc) if doc else _load_neuroinfo(path)
+    stack = _load_aligner(path, doc) if doc else _load_neuroinfo(path, locate)
     # The XMP repeats channel names once per image; the first `channels` apply
     info = read_xmp_channels(path)[:stack.channels]
     stack.channel_info = info + [ChannelInfo(f"channel {i}", (255, 255, 255))
