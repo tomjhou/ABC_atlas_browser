@@ -510,7 +510,8 @@ def save_viewer_settings(settings):
     Best-effort: a write failure (read-only install location, etc.) is
     swallowed rather than surfaced — failing to persist a preference isn't
     worth interrupting the session over."""
-    to_write = {'persist_settings': bool(settings.get('persist_settings', False))}
+    to_write = {'persist_settings': bool(settings.get('persist_settings', False)),
+                'z_mode': COORD_SETTINGS['z_mode'], 'bregma_ap_mm': COORD_SETTINGS['bregma_ap_mm']}   # (always kept: see COORD_SETTINGS)
     if to_write['persist_settings']:
         to_write['hover_enabled'] = bool(settings.get('hover_enabled', True))
         to_write['gene456_shape'] = settings.get('gene456_shape', GENE456_SHAPE_DEFAULT)
@@ -521,6 +522,252 @@ def save_viewer_settings(settings):
             json.dump(to_write, f, indent=2)
     except Exception as e:
         print(f"Warning: could not save viewer settings ({e})")
+
+# --- Which z coordinate sections are labelled with, everywhere in the app (section panels, hover readouts, the section grid). Set from
+# the launcher's Settings button; always kept in viewer_settings.json, whether or not the viewer's own settings persist.
+#   'section': the atlas's own section coordinate (the z column of the cell metadata, mm; sections are 0.2 mm apart)
+#   'ccf_ap':  the section's position along the Allen CCF's anterior-posterior axis (mm from the front; x_ccf, the median of its cells)
+#   'paxinos': that, relative to bregma and counted positive to the front as Paxinos does: bregma_ap_mm - x_ccf. Approximate: there is no
+#              exact CCF-to-Paxinos mapping, only registrations such as Chon et al. 2019, and the bregma position used is a setting.
+Z_MODE_OPTIONS = (
+    ('section', "Section z: the atlas's own section coordinate (mm)"),
+    ('ccf_ap', "CCF AP: position along the Allen CCF's front-to-back axis (mm)"),
+    ('paxinos', "Paxinos AP: relative to bregma, positive toward the front (mm; approximate)"),
+)
+DEFAULT_BREGMA_CCF_AP_MM = 5.40
+COORD_SETTINGS = {'z_mode': 'section', 'bregma_ap_mm': DEFAULT_BREGMA_CCF_AP_MM}
+
+
+def load_coordinate_settings():
+    """Read the z-coordinate setting from SETTINGS_FILE into COORD_SETTINGS (anything unreadable leaves the defaults)."""
+    try:
+        with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+            on_disk = json.load(f)
+        if not isinstance(on_disk, dict):
+            return
+        if on_disk.get('z_mode') in dict(Z_MODE_OPTIONS):
+            COORD_SETTINGS['z_mode'] = on_disk['z_mode']
+        bregma = float(on_disk.get('bregma_ap_mm'))
+        if 0.0 < bregma < 13.5:
+            COORD_SETTINGS['bregma_ap_mm'] = bregma
+    except Exception:
+        pass
+
+
+def save_coordinate_settings():
+    """Write the z-coordinate setting into SETTINGS_FILE, keeping whatever else is in it. Best effort."""
+    on_disk = {}
+    try:
+        with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            on_disk = loaded
+    except Exception:
+        pass
+    on_disk['z_mode'] = COORD_SETTINGS['z_mode']
+    on_disk['bregma_ap_mm'] = COORD_SETTINGS['bregma_ap_mm']
+    try:
+        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(on_disk, f, indent=2)
+    except Exception as e:
+        print(f"Warning: could not save the coordinate setting ({e})")
+
+
+load_coordinate_settings()
+
+# The per-section values behind those labels: {'z': {section label: mm}, 'ccf_ap': {section label: mm}}, each the median over the
+# section's cells, read straight from the atlas's cell metadata (and CCF) tables, once, in a background thread, and kept in a small
+# file next to the other caches (keyed on the source files) so later launches only read that.
+SECTION_COORDS_CACHE_VERSION = 1
+section_coords_state = {'table': None, 'thread': None, 'error': None, 'with_ccf': False}
+section_coords_lock = threading.Lock()
+
+
+def _read_section_coordinates(abc_cache, with_ccf):
+    meta_path = abc_cache.get_metadata_path(directory='MERFISH-C57BL6J-638850', file_name='cell_metadata_with_cluster_annotation')
+    ccf_path = abc_cache.get_metadata_path(directory=CCF_DIRECTORY, file_name=CCF_COORDS_FILE_NAME) if with_ccf else None
+    key = '|'.join(f"{p}|{os.stat(p).st_mtime_ns}|{os.stat(p).st_size}" for p in (meta_path, ccf_path) if p is not None)
+    cache_path = CACHE_DIR / f"section_coords_v{SECTION_COORDS_CACHE_VERSION}_{hashlib.md5(key.encode('utf-8')).hexdigest()[:16]}.json"
+    try:
+        with open(cache_path, 'r', encoding='utf-8') as f:
+            table = json.load(f)
+        if isinstance(table, dict) and 'z' in table:
+            return table
+    except Exception:
+        pass
+    header = pd.read_csv(meta_path, nrows=0).columns.tolist()
+    wanted = [header[0], SECTION_COL] + (['z'] if 'z' in header else [])
+    meta = pd.read_csv(meta_path, index_col=0, converters={0: str}, usecols=wanted)
+    table = {'z': {}, 'ccf_ap': {}}
+    if 'z' in meta.columns:
+        z = pd.to_numeric(meta['z'], errors='coerce').groupby(meta[SECTION_COL]).median().dropna()
+        table['z'] = {str(label): float(value) for label, value in z.items()}
+    if ccf_path is not None:
+        ccf_header = pd.read_csv(ccf_path, nrows=0).columns.tolist()
+        ccf = pd.read_csv(ccf_path, index_col=0, dtype={ccf_header[0]: str}, usecols=[ccf_header[0], 'x'])
+        sections = meta[SECTION_COL].reindex(ccf.index)
+        ap = pd.to_numeric(ccf['x'], errors='coerce').groupby(sections).median().dropna()
+        table['ccf_ap'] = {str(label): float(value) for label, value in ap.items()}
+    try:
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            json.dump(table, f)
+    except Exception as e:
+        print(f"Could not save the section coordinate table ({e}).")
+    return table
+
+
+def start_section_coordinate_load(abc_cache):
+    """Start reading the per-section coordinate table in the background, if that hasn't been done (or the setting now needs the CCF
+    part that an earlier read left out). Never raises."""
+    needs_ccf = COORD_SETTINGS['z_mode'] != 'section'
+    try:
+        with_ccf = needs_ccf and not ccf_files_missing(abc_cache)
+    except Exception:
+        with_ccf = False
+    with section_coords_lock:
+        state = section_coords_state
+        if state['thread'] is not None and (state['with_ccf'] or not with_ccf):
+            return
+        state.update(table=None, error=None, with_ccf=with_ccf)
+
+        def work():
+            try:
+                table = _read_section_coordinates(abc_cache, with_ccf)
+                section_coords_state['table'] = table
+            except Exception as e:
+                section_coords_state['error'] = e
+                print(f"Could not read the section coordinates ({e}).")
+
+        state['thread'] = threading.Thread(target=work, daemon=True)
+        state['thread'].start()
+
+
+def section_coordinates_ready():
+    """True once the table has been read (or reading it failed, so nothing more will come)."""
+    return section_coords_state['table'] is not None or section_coords_state['error'] is not None
+
+
+def section_z_text(section_label, abc_cache=None, wait=False, short=False):
+    """The section's z in the coordinate chosen in Settings, as text ('' if it isn't known, or not yet read: `wait` makes this
+    wait for the table, which is quick after the first time). `short` leaves out the unit, for tight places."""
+    if abc_cache is not None:
+        start_section_coordinate_load(abc_cache)
+    thread = section_coords_state['thread']
+    if wait and thread is not None and thread.is_alive():
+        thread.join()
+    table = section_coords_state['table']
+    if not table:
+        return ''
+    mode = COORD_SETTINGS['z_mode']
+    label = str(section_label)
+    if mode == 'section':
+        value = table['z'].get(label)
+    else:
+        value = table['ccf_ap'].get(label)
+        if value is not None and mode == 'paxinos':
+            value = COORD_SETTINGS['bregma_ap_mm'] - value
+    if value is None:
+        return ''
+    unit = '' if short else ' mm'
+    if mode == 'section':
+        return f"z {value:.2f}{unit}" if short else f"z = {value:.2f} mm"
+    if mode == 'ccf_ap':
+        return f"CCF AP {value:.2f}{unit}" if short else f"CCF AP = {value:.2f} mm"
+    return f"AP {value:+.2f}{unit}" if short else f"Paxinos AP = {value:+.2f} mm (approx.)"
+
+
+SECTION_Z_LABEL_FONTSIZE = 8    # points: the z label at the top-right of each thumbnail in the section grid (was 6)
+
+
+def add_section_z_labels(fig, ax, layout, abc_cache):
+    """Small z labels at the top-right of every thumbnail of the section grid (the image holds the section number as its title): live
+    text over the cached picture, so changing the setting needs no new picture. Filled in once the section table has been read."""
+    start_section_coordinate_load(abc_cache)
+    texts = {}
+    for section, box in layout.items():
+        _x0, x1, _y0, y1 = box['pixel_bbox']
+        texts[section] = ax.text(x1, y1, '', ha='right', va='bottom', fontsize=SECTION_Z_LABEL_FONTSIZE, color='#444444', clip_on=True)
+    timer = fig.canvas.new_timer(interval=400)
+
+    def fill():
+        try:
+            if section_coordinates_ready():
+                for section, text in texts.items():
+                    text.set_text(section_z_text(section, short=True))
+                timer.stop()
+                fig.canvas.draw_idle()
+        except Exception:
+            timer.stop()
+
+    timer.add_callback(fill)
+    timer.start()
+
+
+def show_coordinate_settings_dialog(abc_cache):
+    """The launcher's Settings window: which z coordinate sections are labelled with. Applies and saves on OK."""
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    dlg = tk.Toplevel(root)
+    dlg.title("Settings")
+    dlg.attributes('-topmost', True)
+    dlg.resizable(False, False)
+    mode_var = tk.StringVar(dlg, COORD_SETTINGS['z_mode'])
+    bregma_var = tk.StringVar(dlg, f"{COORD_SETTINGS['bregma_ap_mm']:g}")
+    frame = ttk.Frame(dlg, padding=14)
+    frame.pack()
+    ttk.Label(frame, text="Z coordinate shown for each section\n(section labels, hover readouts and the section grid):",
+              justify=tk.LEFT).pack(anchor="w", pady=(0, 6))
+    for value, text in Z_MODE_OPTIONS:
+        ttk.Radiobutton(frame, text=text, value=value, variable=mode_var).pack(anchor="w", pady=1)
+    row = ttk.Frame(frame)
+    row.pack(anchor="w", pady=(10, 0))
+    ttk.Label(row, text="Bregma, as a CCF front-to-back position (mm):").pack(side=tk.LEFT)
+    ttk.Entry(row, textvariable=bregma_var, width=7).pack(side=tk.LEFT, padx=6)
+    ttk.Label(frame, foreground="gray35", justify=tk.LEFT, wraplength=460, text=(
+        "Used only for the Paxinos option, as bregma_AP - CCF_AP. There is no exact mapping between the Allen CCF and Paxinos "
+        "coordinates, so this is an approximation. The default, 5.40 mm, is a commonly used approximate value; set it to the bregma "
+        "position of the registration you rely on (for example Chon et al. 2019). The CCF options need the CCF coordinate files "
+        "(a one-time download).")).pack(
+        anchor="w", pady=(6, 0))
+    result = {'ok': False}
+
+    def ok():
+        try:
+            bregma = float(bregma_var.get())
+            if not 0.0 < bregma < 13.5:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Settings", "Enter bregma's position as a number of mm between 0 and 13.5.", parent=dlg)
+            return
+        result['ok'], result['bregma'] = True, bregma
+        dlg.destroy()
+
+    buttons = ttk.Frame(frame)
+    buttons.pack(fill=tk.X, pady=(12, 0))
+    ttk.Button(buttons, text="OK", command=ok).pack(side=tk.RIGHT)
+    ttk.Button(buttons, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT, padx=6)
+    dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+    dlg.bind("<Escape>", lambda e: dlg.destroy())
+    dlg.update_idletasks()
+    dlg.grab_set()
+    root.wait_window(dlg)
+    try:
+        if result['ok']:
+            mode = mode_var.get()
+            if mode != 'section' and ccf_files_missing(abc_cache) and not ensure_ccf_downloaded(abc_cache):
+                print("The CCF coordinates weren't downloaded, so sections stay labelled with the section z.")
+                mode = 'section'
+            COORD_SETTINGS['z_mode'] = mode
+            COORD_SETTINGS['bregma_ap_mm'] = result['bregma']
+            save_coordinate_settings()
+            start_section_coordinate_load(abc_cache)
+    finally:
+        root.destroy()
+
 
 # Where the ABC atlas download lives. By default it's next to this repository,
 # in the parent folder. If it isn't there, the user picks a location once (see
@@ -5280,6 +5527,47 @@ def render_section_level_array(section_series, section_label, spatial, level, ca
     return rgba
 
 
+def render_group_highlight_array(section_series, section_label, spatial, level, number, cached_layout, img_w, img_h, dpi=150):
+    """Render `section_label` with the cells of one taxonomy group marked: those whose `level` (class, subclass, supertype or cluster)
+    ID, the number a label such as '05 IT-ET Glut' starts with, is `number` are drawn in gold, every other cell dim grey, on black.
+    Placed like render_gene_expression_array's picture (the axes exactly at cached_layout's pixel_bbox and data limits), so it can be
+    swapped in for the others. Not cached on disk. Returns (RGBA uint8 array, number of cells in the group, the group's label, '' if
+    this section has none of it). Raises ValueError if the level or spatial coordinates aren't available."""
+    if spatial is None or 'x' not in spatial.columns or 'y' not in spatial.columns:
+        raise ValueError("spatial x/y coordinates not available")
+    if level not in spatial.columns:
+        raise ValueError(f"'{level}' labels not available in the cell metadata")
+    section_spatial = spatial[(section_series == section_label).to_numpy()]
+    xs = pd.to_numeric(section_spatial['x'], errors='coerce').to_numpy()
+    ys = pd.to_numeric(section_spatial['y'], errors='coerce').to_numpy()
+    ids = extract_leading_numeric_id(section_spatial[level]).to_numpy()
+    names = section_spatial[level].astype(str).to_numpy()
+    valid = ~(np.isnan(xs) | np.isnan(ys))
+    xs, ys, ids, names = xs[valid], ys[valid], ids[valid], names[valid]
+    if len(xs) == 0:
+        raise ValueError(f"no spatial coordinates for section {section_label}")
+    in_group = ids == float(number)
+    label = str(names[in_group][0]).strip() if in_group.any() else ''
+
+    fig = Figure(figsize=(img_w / dpi, img_h / dpi), dpi=dpi)
+    FigureCanvasAgg(fig)
+    fig.patch.set_facecolor('black')
+    px_x0, px_x1, px_y0, px_y1 = cached_layout['pixel_bbox']
+    ax = fig.add_axes([px_x0 / img_w, px_y0 / img_h, (px_x1 - px_x0) / img_w, (px_y1 - px_y0) / img_h])
+    ax.set_facecolor('black')
+    ax.scatter(xs[~in_group], ys[~in_group], c=[[0.28, 0.28, 0.28]], s=3, linewidths=0)
+    if in_group.any():
+        ax.scatter(xs[in_group], ys[in_group], c=[[1.0, 0.84, 0.0]], s=10, linewidths=0)
+    ax.set_xlim(cached_layout['data_xlim'])
+    ax.set_ylim(cached_layout['data_ylim'])
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    fig.canvas.draw()
+    return np.asarray(fig.canvas.buffer_rgba()).copy(), int(in_group.sum()), label
+
+
 def prompt_load_rois_file(initial_dir=None):
     """Native 'Open File' dialog for picking a previously saved roi_coords.csv.
     Returns the chosen path (str) or None if cancelled/unavailable. Uses
@@ -6714,6 +7002,7 @@ def prompt_startup_panel(out_folder):
     startup phase, rather than falling through into a pipeline with no
     selection made)."""
     RADIO_OPTIONS = ('Neurons', 'NonNeurons', 'All')
+    start_section_coordinate_load(abc_cache)   # (the table of sections' z values, read in the background for the windows to come)
 
     fig = plt.figure(figsize=compute_figsize_for_screen_height(1.55, height_frac=0.5, default=(10, 6)))
     normalize_tk_scaling(fig)
@@ -6925,6 +7214,17 @@ def prompt_startup_panel(out_folder):
     cancel_button = Button(cancel_ax, 'Exit', hovercolor='0.85')
     cancel_button.label.set_fontsize(UI_BUTTON_FONTSIZE)
 
+    settings_ax = fig.add_axes([0.80, 0.915, 0.15, 0.06])    # top-right corner, level with the title
+    settings_button = Button(settings_ax, 'Settings…', hovercolor='0.85')
+    settings_button.label.set_fontsize(UI_BUTTON_FONTSIZE * 0.9)
+
+    def on_settings(event):
+        hide_recent_dropdown()
+        show_coordinate_settings_dialog(abc_cache)   # returns when its window is closed; the panel is still here
+        fig.canvas.draw_idle()
+
+    settings_button.on_clicked(on_settings)
+
     def on_new_run(event):
         hide_recent_dropdown()
         folder = committed_out_folder()
@@ -7088,6 +7388,7 @@ def prompt_section_selection_gui(adata, abc_cache, section_series, out_folder=No
     # image's resolution per se, is what makes interaction feel laggy on a
     # large cached bitmap.
     ax.imshow(img, extent=(0, img_w, 0, img_h), origin='upper', interpolation='nearest')
+    add_section_z_labels(fig, ax, layout, abc_cache)
     # 'auto' (rather than imshow's default 'equal') fills the axes box
     # exactly regardless of any small mismatch between the box's aspect
     # ratio and the image's — 'equal' instead expands the *data* range to
@@ -9076,7 +9377,8 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
         # is what tells the initial view radio apart as Gene vs. Imputed
         # Gene — the render itself doesn't otherwise carry that.
         initial_mode = 'imputed_gene' if precomputed_gene_open.get('dataset') == 'imputed' else 'gene'
-        current_view = {'mode': initial_mode, 'gene': precomputed_gene_open['resolved_gene']}
+        current_view = {'mode': initial_mode, 'gene': precomputed_gene_open['resolved_gene'],
+                        'genes': [precomputed_gene_open['resolved_gene']]}
     else:
         current_view = {'mode': 'standard'}
     if session_color_scale is not None:
@@ -9144,7 +9446,7 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
     # view — loading it once serves both) on the first hover-hold, not
     # eagerly, since most ROI-picking sessions never need it.
     hover_cells = {
-        'ready': False, 'xs': None, 'ys': None,
+        'ready': False, 'xs': None, 'ys': None, 'rows': None,
         'class': None, 'subclass': None, 'supertype': None, 'cluster': None,
     }
 
@@ -9205,10 +9507,64 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
         valid = ~(np.isnan(xs) | np.isnan(ys))
         hover_cells['xs'] = xs[valid]
         hover_cells['ys'] = ys[valid]
+        hover_cells['rows'] = np.where(section_mask)[0][valid]  # (each cell's row in adata: for reading its expression)
         for col in ('class', 'subclass', 'supertype', 'cluster'):
             hover_cells[col] = section_df[col].to_numpy()[valid] if col in section_df.columns else None
         hover_cells['ready'] = True
         return True
+
+    def section_z_suffix():
+        """', z = ...' for the coordinate readout: this section's z in the coordinate chosen in the launcher's Settings."""
+        z_text = section_z_text(section_label, abc_cache)
+        return f', {z_text}' if z_text else ''
+
+    def hover_expression_text(idx):
+        """The hovered cell's expression of the gene(s) the Gene / Imputed Gene view is showing, as text for the status bar (None in
+        the Groups view, or if it can't be read). In the units of the Linear / Log radio buttons, as in render_gene_expression_array:
+        MERFISH genes are raw counts (Linear) or log1p of them (Log); imputed genes are stored as log2 values (Log) and shown as
+        2**x - 1 (Linear)."""
+        mode = current_view.get('mode')
+        if mode not in ('gene', 'imputed_gene') or hover_cells.get('rows') is None:
+            return None
+        use_imputed = mode == 'imputed_gene'
+        log_scale = color_scale_state['mode'] == 'log'
+        row = int(hover_cells['rows'][idx])
+        parts = []
+        for gene in current_view.get('genes') or []:
+            try:
+                if use_imputed:
+                    source = imputed_state['adata'] if imputed_state is not None else None
+                    gene_col = find_gene_index(source, gene) if source is not None else None
+                    if gene_col is None:
+                        continue
+                    position = source.obs_names.get_indexer([adata.obs_names[row]])[0]
+                    if position < 0:
+                        parts.append(f'{gene} = n/a')
+                        continue
+                    value = float(_get_full_gene_column(source, gene_col)[position])
+                    if not log_scale:
+                        value = 2.0 ** value - 1.0
+                else:
+                    gene_col = find_gene_index(adata, gene)
+                    if gene_col is None:
+                        continue
+                    cell = adata[row, gene_col].X
+                    if hasattr(cell, 'toarray'):
+                        cell = cell.toarray()
+                    value = float(np.asarray(cell).ravel()[0])
+                    if log_scale:
+                        value = float(np.log1p(value))
+            except Exception as e:
+                print(f"Could not read the expression of {gene} for the hovered cell: {e}")
+                continue
+            parts.append(f'{gene} = {value:.3g}' if not np.isnan(value) else f'{gene} = n/a')
+        if not parts:
+            return None
+        if use_imputed:
+            unit = 'log2' if log_scale else 'linear'
+        else:
+            unit = 'log1p' if log_scale else 'raw'
+        return ', '.join(parts) + f' ({unit})'
 
     # cached_layout's pixel_bbox/data_xlim/data_ylim give the (near-uniform)
     # pixel-per-micron scale needed to draw the ring — sized to the actual
@@ -9536,7 +9892,9 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
             for label in ('class', 'subclass', 'supertype') if hover_cells[label] is not None
         ]
         info_line = ', '.join(info_parts) if info_parts else '(no class/subclass/supertype metadata)'
-        status_text.set_text(f'x = {data_x:.3f}, y = {data_y:.3f}\n{info_line}')
+        expression = hover_expression_text(idx)
+        coords = f'x = {data_x:.3f}, y = {data_y:.3f}{section_z_suffix()}' + (f', {expression}' if expression else '')
+        status_text.set_text(f'{coords}\n{info_line}')
         blit_hover_overlays()
         # A second, separate hold — the group markers are a bigger visual
         # change than the ring/text, so they only appear once the cursor
@@ -9564,7 +9922,7 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
         # move rather than only while a button is held.
         if event.inaxes is ax and event.xdata is not None and event.ydata is not None:
             data_x, data_y = to_data(event.xdata, event.ydata)
-            status_text.set_text(f'x = {data_x:.3f}, y = {data_y:.3f}')
+            status_text.set_text(f'x = {data_x:.3f}, y = {data_y:.3f}{section_z_suffix()}')
         else:
             status_text.set_text('x = —, y = —')
 
@@ -10012,6 +10370,7 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
         img_artist.set_data(new_img)
         current_view['mode'] = 'imputed_gene' if use_imputed else 'gene'
         current_view['gene'] = combined_query
+        current_view['genes'] = list(resolved_names)   # (one name each: what the hover readout looks up)
         update_mode_dependent_controls()
         imputed_suffix = ' [imputed]' if use_imputed else ''
         if is_multi:
@@ -10187,6 +10546,92 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
         clear_multi_gene_legend()
         fig.canvas.draw_idle()
         raise_figure_window(fig)  # same reasoning as on_show_gene's — a real render here can take a moment too
+
+    # --- "Find group" view: type one number (a class, subclass, supertype or cluster ID, at the level the Group dropdown has) in the
+    # text box that is the gene box in the Gene views, and the cells of that group are drawn in gold, the rest dim grey. The one
+    # box serves both: find_state remembers what each view had typed in it, and box_shows() swaps them (and the label).
+    FIND_LABEL = 'Find group'
+    find_state = {'box': 'gene', 'gene_text': '', 'number_text': '', 'cache': {}}
+
+    def box_shows(which):
+        """Make the text box hold the gene names ('gene') or the group number ('number'), with its own label."""
+        if find_state['box'] == which:
+            return
+        if which == 'number':
+            find_state['gene_text'] = gene_textbox.text
+            set_textbox_text_silent(gene_textbox, find_state['number_text'])
+            gene_textbox.label.set_text('Number: ')
+        else:
+            find_state['number_text'] = gene_textbox.text
+            set_textbox_text_silent(gene_textbox, find_state['gene_text'])
+            gene_textbox.label.set_text('Gene(s): ')
+        find_state['box'] = which
+        dropdown_ax.set_visible(False)
+        suggestion_state['matches'] = []
+        clear_gene_name_marks(gene_textbox)
+
+    def apply_find():
+        """Show the group whose number is typed (see above), or, with nothing valid typed yet, the Groups picture at the Group
+        dropdown's level. Returns False if a picture couldn't be made."""
+        level = group_by_state['field']
+        base = f"Section {sanitize_section_token(section_label)}"
+        text = gene_textbox.text.strip()
+        found = re.fullmatch(r'(\d+)', text)
+        if found is None:
+            if not show_class_level(level):
+                return False
+            fig.canvas.manager.set_window_title(
+                f"{base} — type a {level} number in the box and press Enter; drag handles to edit ROIs, then Done")
+            if text:
+                print(f"'{text}' isn't a number: type a {level} number, e.g. 12.")
+            fig.canvas.draw_idle()
+            return True
+        number = int(found.group(1))
+        cached = find_state['cache'].get((level, number))
+        if cached is None:
+            status_updates_suppressed['active'] = True
+            set_render_controls_busy(True)
+            try:
+                spatial_df = ensure_picker_spatial('Loading cell metadata...')
+                cached = render_group_highlight_array(
+                    section_series, section_label, spatial_df, level, number, cached_layout, img_w, img_h)
+                find_state['cache'][(level, number)] = cached
+            except Exception as e:
+                print(f"Could not mark {level} {number} in section {section_label}: {e}")
+                return False
+            finally:
+                status_updates_suppressed['active'] = False
+                set_render_controls_busy(False)
+                status_text.set_text('x = —, y = —')
+        rgba, count, name = cached
+        img_artist.set_data(rgba)
+        img_artist.set_visible(True)
+        if count:
+            what = f"{level} {name}: {count:,} cells in gold"
+        else:
+            what = f"no cell of {level} {number} in this section"
+        fig.canvas.manager.set_window_title(f"{base} — {what}; drag handles to edit ROIs, then Done")
+        print(f"Section {section_label}: {what}.")
+        fig.canvas.draw_idle()
+        return True
+
+    def on_find_view(event):
+        was_find = current_view['mode'] == 'find'
+        box_shows('number')
+        if not apply_find():
+            if not was_find:
+                box_shows('gene')       # couldn't switch: the view (and its box) stay as they were
+            return
+        current_view['mode'] = 'find'
+        update_mode_dependent_controls()
+        colorbar_ax.set_visible(False)
+        scale_radio_ax.set_visible(False)
+        clear_multi_gene_legend()
+        fig.canvas.draw_idle()
+        raise_figure_window(fig)
+
+    apply_find = with_wait_cursor(apply_find)
+    on_find_view = with_wait_cursor(on_find_view)
 
     fig.subplots_adjust(top=AXES_TOP, bottom=AXES_BOTTOM, left=AXES_LEFT, right=AXES_RIGHT)
     # Shorter than before (0.06) so the freed vertical space can hold the
@@ -10488,7 +10933,7 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
     # Group/Done/Cancel buttons — same layout math as the section-grid
     # picker's rows (just with more widgets sharing this one).
     label_width = 0.07
-    VIEW_RADIO_OPTIONS = ('Groups', 'Gene', 'Imputed Gene')
+    VIEW_RADIO_OPTIONS = ('Groups', 'Gene', 'Imputed Gene', FIND_LABEL)
     # Computed from the labels' actual rendered width (see
     # radio_layout_as_axes_fractions) rather than a bare 0.20 constant — kept
     # as the floor for the common case where it's already enough room, grown
@@ -10571,7 +11016,7 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
         background unchanged; set_active(False) makes TextBox ignore input.
         Closes the autocomplete list when disabling."""
         enabled = (not render_busy_state['active']
-                   and (current_view['mode'] in ('gene', 'imputed_gene')
+                   and (current_view['mode'] in ('gene', 'imputed_gene', 'find')
                         or gene_entry_state['pending_mode'] is not None))
         color = ENABLED_CONTROL_COLOR if enabled else DISABLED_CONTROL_COLOR
         gene_textbox.set_active(enabled)
@@ -10651,7 +11096,7 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
         # Any edit clears the red "not found" names; they only come back if
         # the edited text still doesn't resolve when next shown.
         clear_gene_name_marks(gene_textbox)
-        if suppress_autocomplete['value']:
+        if suppress_autocomplete['value'] or find_state['box'] == 'number':
             return
         _prefix, current_token = split_gene_query(text)
         if not current_token:
@@ -10706,6 +11151,8 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
         # before rendering.
         if current_view['mode'] in ('gene', 'imputed_gene'):
             on_show_gene(None)
+        elif current_view['mode'] == 'find' and find_state['box'] == 'number':
+            apply_find()
         elif gene_entry_state['pending_mode'] is not None:
             set_view_radio_selection(VIEW_INDEX_BY_MODE[gene_entry_state['pending_mode']])
 
@@ -10775,7 +11222,7 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
     # grid picker's. view_radio_dot_x/view_radio_label_x were computed above
     # (with radio_width) via radio_layout_as_axes_fractions.
     view_radio_dot_size = button_fontsize ** 2
-    VIEW_MODE_BY_LABEL = {'Groups': 'standard', 'Gene': 'gene', 'Imputed Gene': 'imputed_gene'}
+    VIEW_MODE_BY_LABEL = {'Groups': 'standard', 'Gene': 'gene', 'Imputed Gene': 'imputed_gene', FIND_LABEL: 'find'}
     VIEW_INDEX_BY_MODE = {mode: i for i, mode in enumerate(VIEW_MODE_BY_LABEL[label] for label in VIEW_RADIO_OPTIONS)}
     initial_view_idx = VIEW_INDEX_BY_MODE.get(current_view['mode'], 0)
     view_radio_initial_facecolor = ['none'] * len(VIEW_RADIO_OPTIONS)
@@ -10809,8 +11256,12 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
         label = VIEW_RADIO_OPTIONS[idx]
         gene_entry_state['pending_mode'] = None
         if label == 'Groups':
+            box_shows('gene')
             on_standard_view(None)
+        elif label == FIND_LABEL:
+            on_find_view(None)
         else:
+            box_shows('gene')       # (the gene names must be in the box for the render below to read them)
             use_imputed = label == 'Imputed Gene'
             # Loading the imputed dataset is slow and needs an explicit
             # up-front warning (see ensure_imputed_gene_dataset_loaded) —
@@ -10827,6 +11278,8 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
                     # gene box usable (it's otherwise disabled in Groups) so
                     # they can be fixed, then Enter retries this switch.
                     gene_entry_state['pending_mode'] = 'imputed_gene' if use_imputed else 'gene'
+        if current_view['mode'] == 'find' and gene_entry_state['pending_mode'] is None:
+            box_shows('number')     # (a switch away from Find group that didn't happen: its box is as it was)
         update_mode_dependent_controls()
         blit_hover_overlays()
         # Reflects what actually happened, not just what was clicked —
@@ -10917,6 +11370,8 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
         # time Groups is shown (on_standard_view).
         if current_view['mode'] == 'standard':
             show_class_level(chosen)
+        elif current_view['mode'] == 'find':
+            apply_find()
 
     fig.canvas.mpl_connect('button_press_event', on_group_list_click)
 
@@ -11149,8 +11604,8 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
     # session_view_settings docstring entry). Runs however the window was
     # closed, since show_figure_blocking only returns once it's gone.
     if session_view_settings is not None:
-        session_view_settings['mode'] = current_view['mode']
-        session_view_settings['gene'] = gene_textbox.text.strip()
+        session_view_settings['mode'] = 'standard' if current_view['mode'] == 'find' else current_view['mode']
+        session_view_settings['gene'] = (gene_textbox.text if find_state['box'] == 'gene' else find_state['gene_text']).strip()
 
     return pending
 
@@ -13233,7 +13688,15 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             # default, so left uninverted a section renders top/bottom
             # flipped.
             sec_ax.invert_yaxis()
-            sec_ax.set_title(sanitize_section_token(sec), fontsize=max(6, SIDEBAR_FONTSIZE * 0.55))
+            # The section's z, in the coordinate chosen in the launcher's Settings, in the title and again, in white, inside the
+            # panel's top-left corner: the title can be cut off by the panel above it, the label can't be.
+            z_text = section_z_text(sec, abc_cache, wait=True)
+            sec_name = sanitize_section_token(sec)
+            sec_ax.set_title(f"{sec_name}  ({z_text})" if z_text else sec_name, fontsize=max(6, SIDEBAR_FONTSIZE * 0.55))
+            # Above the stand-in pictures used while zooming (zorder 1e6 and up), like the scale bar.
+            section_label_artist = sec_ax.text(
+                0.02, 0.98, f"{sec_name}\n{z_text}" if z_text else sec_name, transform=sec_ax.transAxes, ha='left', va='top',
+                color='white', fontsize=max(5, SIDEBAR_FONTSIZE * 0.45), linespacing=1.1, zorder=1e6 + 9)
             # Hollow ring, not a filled dot — now that the background dots
             # themselves carry meaningful color (see update_section_
             # background_colors), a filled highlight would obscure it. Same
@@ -13286,7 +13749,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
                 section_scalebar = {'ax': sec_ax, 'line': scalebar_line, 'text': scalebar_text}
             section_panels[sec] = {
                 'ax': sec_ax, 'highlight': highlight, 'group_highlight': None,
-                'dim_veil': dim_veil,
+                'dim_veil': dim_veil, 'label': section_label_artist,
                 'background_artist': background_artist,
                 # Filled in by apply_panel_colors_with_gray_behind on the
                 # first real color assignment — None until then, which
@@ -14818,6 +15281,9 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             # a published annotation.
             if cell_leiden is not None:
                 info_parts.append(f"leiden: {cell_leiden[idx]}")
+            hover_z = section_z_text(sec, abc_cache)
+            if hover_z:
+                info_parts.append(hover_z)
             hover_status_text.set_text(
                 HOVER_FIELD_SEP.join(info_parts) if info_parts else 'No metadata available for this cell.'
             )
@@ -14844,6 +15310,9 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
                     if value is None or (isinstance(value, float) and np.isnan(value)):
                         continue
                     info_parts.append(f"{level}: {value}")
+            hover_z = section_z_text(sec, abc_cache)
+            if hover_z:
+                info_parts.append(hover_z)
             text = HOVER_FIELD_SEP.join(info_parts) if info_parts else 'No metadata available for this cell.'
             hover_status_text.set_text(f"{text}{HOVER_FIELD_SEP}(not in UMAP)")
         blit_hover_overlays()
@@ -18142,6 +18611,10 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             for live_spine, new_spine in zip(live_ax.spines.values(), new_ax.spines.values()):
                 new_spine.set_linewidth(live_spine.get_linewidth())
             new_ax.set_title(live_ax.get_title(), fontsize=live_ax.title.get_fontsize())
+            label_artist = panel.get('label')
+            if label_artist is not None:
+                new_ax.text(0.02, 0.98, label_artist.get_text(), transform=new_ax.transAxes, ha='left', va='top',
+                            color='white', fontsize=label_artist.get_fontsize(), linespacing=1.1, zorder=label_artist.get_zorder())
 
             bg = panel['background_artist']
             offsets, facecolors, sizes = visible_points_only(
