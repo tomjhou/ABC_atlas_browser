@@ -1690,6 +1690,11 @@ class SectionLoader:
         self.order = []                    # [(slide index, polygon index)]
         self.thumbs = {}                   # (slide index, polygon index) -> PhotoImage
         self.drag = None
+        top0 = ttk.Frame(f, padding=(12, 8, 12, 0))
+        top0.pack(fill=tk.X)
+        self.var_fit_thumbs = tk.BooleanVar(f, True)
+        ttk.Checkbutton(top0, text="Scale sections to fit thumbnails", variable=self.var_fit_thumbs,
+                        command=self.on_fit_thumbs).pack(side=tk.LEFT)
         top = ttk.Frame(f, padding=(12, 8))
         top.pack(fill=tk.X)
         self.var_order_text = tk.StringVar(f, "")
@@ -1743,10 +1748,19 @@ class SectionLoader:
             self.build_thumbs()
             self.draw_order()
 
+    def on_fit_thumbs(self):
+        """"Scale sections to fit thumbnails" changed: the thumbnails are made again."""
+        self.thumbs = {}
+        self.build_thumbs()
+        self.draw_order()
+
     def build_thumbs(self):
+        """The thumbnail of each section: a crop of its slide's picture around its outline. Each is scaled up or down to fill its
+        thumbnail (the default), or, unchecked, all are drawn to one scale (the one at which the biggest section just fits), so that
+        sizes can be compared; the scale is in um, so that slides of different pixel sizes agree."""
+        fit = self.var_fit_thumbs.get()
+        items = []                                   # (key, crop box a, b, outline in overview pixels, um per overview pixel)
         for si, pi in self.order:
-            if (si, pi) in self.thumbs:
-                continue
             s = self.project.slides[si]
             if s.path not in self.ov:
                 continue
@@ -1756,15 +1770,24 @@ class SectionLoader:
             pad = 0.08 * (hi - lo).max() + 4
             a = np.maximum(np.floor(lo - pad), 0).astype(int)
             b = np.minimum(np.ceil(hi + pad), [img.shape[1], img.shape[0]]).astype(int)
-            crop = img[a[1]:b[1], a[0]:b[0]]
-            if crop.size == 0:
+            if b[0] <= a[0] or b[1] <= a[1]:
                 continue
-            f = min(THUMB_W / crop.shape[1], THUMB_H / crop.shape[0])
+            items.append(((si, pi), a, b, poly, k * (self.slide_px(s) or 0.65)))
+        fits = {key: min(THUMB_W / (b[0] - a[0]), THUMB_H / (b[1] - a[1])) for key, a, b, _, _ in items}
+        # one scale for all, in thumbnail pixels per um: the smallest of those that make each section fit
+        common = min((fits[key] / u for key, _, _, _, u in items), default=1.0)
+        for key, a, b, poly, u in items:
+            if key in self.thumbs:
+                continue
+            s = self.project.slides[key[0]]
+            img = self.ov[s.path][0]
+            f = fits[key] if fit else common * u
+            crop = img[a[1]:b[1], a[0]:b[0]]
             color = self.ovc.get(s.path)
             crop3 = color[a[1]:b[1], a[0]:b[0]] if self.var_color.get() and color is not None else np.repeat(crop[:, :, None], 3, axis=2)
             rgb = cv2.resize(crop3, (max(int(crop.shape[1] * f), 1), max(int(crop.shape[0] * f), 1)), interpolation=cv2.INTER_AREA)
             cv2.polylines(rgb, [((poly - a) * f).astype(np.int32)], True, (255, 212, 0), 1, cv2.LINE_AA)
-            self.thumbs[(si, pi)] = ImageTk.PhotoImage(Image.fromarray(rgb))
+            self.thumbs[key] = ImageTk.PhotoImage(Image.fromarray(rgb))
 
     def cell_geometry(self):
         w = max(self.ocanvas.winfo_width(), 300)
@@ -1784,8 +1807,7 @@ class SectionLoader:
         cols, cw, chh = self.cell_geometry()
         rows = (len(self.order) + cols - 1) // cols
         c.config(scrollregion=(0, 0, 10, CELL_PAD + rows * chh))
-        self.var_order_text.set(f"{len(self.order)} section(s). Drag a picture to where it belongs in the series; "
-                                "the number is its place in the order.")
+        self.var_order_text.set(f"{len(self.order)} section(s). Drag a picture to where it belongs; the number is its place.")
         for i, key in enumerate(self.order):
             if self.drag and self.drag["moved"] and i == self.drag["index"]:
                 continue
