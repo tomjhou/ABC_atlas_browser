@@ -43,7 +43,8 @@ def choose():
     card("2", "Align images",
          "Line up the sections and export the stack. Opens the sections from step 1, or a JPX you already have.", "align", False)
     ttk.Separator(outer).pack(fill=tk.X, pady=(14, 8))
-    ttk.Button(outer, text="Exit", width=24, command=root.destroy).pack(side=tk.BOTTOM, ipady=6, pady=(0, 4))   # (centered)
+    ttk.Style(root).configure("Exit.TButton", font=("Segoe UI", 13))
+    ttk.Button(outer, text="Exit", width=24, style="Exit.TButton", command=root.destroy).pack(side=tk.BOTTOM, ipady=6, pady=(0, 4))   # (centered)
     root.mainloop()
     return choice[0] if choice else None
 

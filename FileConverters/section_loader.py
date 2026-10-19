@@ -439,19 +439,23 @@ class SectionLoader:
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         nav = ttk.Frame(left, padding=(8, 6))
         nav.pack(fill=tk.X)
+        # (a grid, so that when the window is narrow the image menu gives way, not the checkboxes beside it)
+        nav.columnconfigure(1, weight=1)
         self.btn_prev = ttk.Button(nav, text="◀", width=3, command=lambda: self.goto_slide(self.cur - 1))
-        self.btn_prev.pack(side=tk.LEFT)
+        self.btn_prev.grid(row=0, column=0)
         self.var_slide = tk.StringVar(f, "")
         # the heading is a menu of the images, to jump to any of them (its text keeps the bold type of the heading it replaces)
         self.combo = ttk.Combobox(nav, textvariable=self.var_slide, state="readonly", font=("Segoe UI", 11, "bold"), width=60)
-        self.combo.pack(side=tk.LEFT, padx=10)
+        self.combo.grid(row=0, column=1, padx=8, sticky="w")
         self.combo.bind("<<ComboboxSelected>>", self.on_pick_image)
         self.root.option_add("*TCombobox*Listbox.font", ("Segoe UI", 10))
         self.btn_fwd = ttk.Button(nav, text="▶", width=3, command=lambda: self.goto_slide(self.cur + 1))
-        self.btn_fwd.pack(side=tk.LEFT)
-        ttk.Button(nav, text="Fit", width=5, command=self.fit_view).pack(side=tk.RIGHT)
+        self.btn_fwd.grid(row=0, column=2)
+        self.var_scenes = tk.BooleanVar(f, False)
+        ttk.Checkbutton(nav, text="Show scene outlines", variable=self.var_scenes, command=self.redraw).grid(row=0, column=3, padx=(14, 0))
         self.var_color = tk.BooleanVar(f, False)
-        ttk.Checkbutton(nav, text="Show sections in color", variable=self.var_color, command=self.on_color).pack(side=tk.RIGHT, padx=14)
+        ttk.Checkbutton(nav, text="Show sections in color", variable=self.var_color, command=self.on_color).grid(row=0, column=4, padx=14)
+        ttk.Button(nav, text="Fit", width=5, command=self.fit_view).grid(row=0, column=5)
         self.canvas = tk.Canvas(left, bg="#202020", highlightthickness=0, cursor="arrow")
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.canvas.bind("<Configure>", lambda e: self.redraw())
@@ -544,7 +548,7 @@ class SectionLoader:
     def refresh_image_menu(self):
         n = len(self.project.slides)
         names = [f"Image {i + 1} of {n}:  {os.path.basename(s.path)}" for i, s in enumerate(self.project.slides)]
-        self.combo.config(values=names, width=min(max((len(t) for t in names), default=20) + 2, 80))
+        self.combo.config(values=names, width=min(max((len(t) for t in names), default=20) + 1, 80))
 
     # -- entering and leaving the stage
 
@@ -968,6 +972,15 @@ class SectionLoader:
         self.photo = ImageTk.PhotoImage(Image.fromarray(out))
         c.create_image(0, 0, image=self.photo, anchor="nw")
         c.create_text(8, ch - 6, anchor="sw", fill="#a0a0a0", font=("Segoe UI", 9), text="Wheel: zoom    Right button: pan")
+        if self.var_scenes.get() and not sp.is_jp2(self.slide().path):
+            # the scenes of the scan, as dashed rectangles (a black line under the white one keeps them visible on bright tissue)
+            x0, y0, k = self.ov[self.slide().path][1]
+            for n, (bx, by, bw, bh) in enumerate(sp.scene_boxes(self.slide().path), 1):
+                a = self.to_canvas([((bx - x0) / k, (by - y0) / k)])[0]
+                b = self.to_canvas([((bx + bw - x0) / k, (by + bh - y0) / k)])[0]
+                c.create_rectangle(a[0], a[1], b[0], b[1], outline="black", width=3)
+                c.create_rectangle(a[0], a[1], b[0], b[1], outline="white", width=1, dash=(5, 4))
+                c.create_text(a[0] + 6, a[1] + 4, anchor="nw", text=f"scene {n}", fill="white", font=("Segoe UI", 9, "italic"))
         if self.mode != "threshold":
             boxes = sp.scene_boxes(self.slide().path)
             for i, p in enumerate(self.polys.get(self.cur, [])):
