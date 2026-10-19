@@ -39,6 +39,7 @@ missing, like tifs_to_jp2.py).
 """
 
 import argparse
+import contextlib
 import copy
 import datetime
 import importlib.util
@@ -339,6 +340,7 @@ class Stack:
     pixel_corrected: bool = False    # pixel_um was changed here: the next export writes it into the JPX's own metadata
     deleted: int = 0                 # how many sections were deleted since opening
     case_file: str = ""              # the NeuroInfo case file (.h5) the alignment was recovered from, when it was
+    unsaved: bool = False            # made in memory from slide scans (no JPX behind it yet): everything is still to be exported
 
     def apply_pixel_size(self, new_um):
         """Relabel the stack with pixel size `new_um` (the source images' true pixel size). Every length in um follows: the
@@ -359,6 +361,9 @@ class Stack:
 
     @property
     def folder(self):
+        if not self.jpx_path:      # (made in memory from slide scans: beside the first of them)
+            first = next((s.source_path for s in self.sections if s.source_path), "")
+            return os.path.dirname(os.path.abspath(first)) if first else os.getcwd()
         return os.path.dirname(os.path.abspath(self.jpx_path))
 
     @property
@@ -372,7 +377,7 @@ class Stack:
 
     @property
     def changed(self):
-        return self.pixel_corrected or self.reordered or any(s.changed for s in self.sections)
+        return self.unsaved or self.pixel_corrected or self.reordered or any(s.changed for s in self.sections)
 
     def out_of_canvas(self):
         """Sections whose outline extends past the canvas, with the overhang in um."""
@@ -827,26 +832,43 @@ def section_source_offset(section, stack):
     return float(section.czi_origin[0] - x0), float(section.czi_origin[1] - y0)
 
 
-def czi_slide_thumbnail(path, max_px=300):
+def czi_slide_thumbnail(path, max_px=300, colors=None):
     """A small picture of the whole slide scan (the scenes put side by side where they lie): (8-bit image, (x0, y0, k)) where
-    slide pixel (X, Y) is at ((X - x0) / k, (Y - y0) / k) in the image."""
+    slide pixel (X, Y) is at ((X - x0) / k, (Y - y0) / k) in the image. With `colors` (an (r, g, b) for each channel) the picture
+    of the channels in those colors follows as a third item: (gray, (x0, y0, k), 8-bit RGB image)."""
     boxes = czi_scenes(path)
     gx0, gy0 = min(b[0] for b in boxes), min(b[1] for b in boxes)
     gx1, gy1 = max(b[0] + b[2] for b in boxes), max(b[1] + b[3] for b in boxes)
     k = max(gx1 - gx0, gy1 - gy0) / max_px
     out = np.zeros((int(np.ceil((gy1 - gy0) / k)), int(np.ceil((gx1 - gx0) / k))), np.float32)
+    chans = None
     for i, (x0, y0, w, h) in enumerate(boxes):
         level = int(min(max(np.floor(np.log2(max(k, 1))), 0), czi_levels(path, i) - 1))
-        img = czi_read(path, i, level).astype(np.float32).mean(2)
+        raw = czi_read(path, i, level).astype(np.float32)
+        img = raw.mean(2)
         tw, th = max(1, round(w / k)), max(1, round(h / k))
         img = cv2.resize(img, (tw, th), interpolation=cv2.INTER_AREA)
         px, py = round((x0 - gx0) / k), round((y0 - gy0) / k)
+        if colors:
+            if chans is None:
+                chans = np.zeros(out.shape + (raw.shape[2],), np.float32)
+            each = np.stack([cv2.resize(raw[:, :, c], (tw, th), interpolation=cv2.INTER_AREA) for c in range(raw.shape[2])], axis=2)
+            rc = chans[py:py + th, px:px + tw]
+            np.maximum(rc, each[:rc.shape[0], :rc.shape[1]], out=rc)
         region = out[py:py + th, px:px + tw]
         # (a scene's box has empty corners where its tile grid does not reach, and the box overlaps the neighbours' data: the
         # brighter of what is there and what the scene has, so that an empty corner does not wipe out the neighbour's picture)
         np.maximum(region, img[:region.shape[0], :region.shape[1]], out=region)
     hi = max(float(np.percentile(out[out > 0], 99.5)) if (out > 0).any() else 1.0, 1.0)
-    return (np.clip(out / hi, 0, 1) ** 0.6 * 255).astype(np.uint8), (gx0, gy0, k)
+    gray = (np.clip(out / hi, 0, 1) ** 0.6 * 255).astype(np.uint8)
+    if not colors:
+        return gray, (gx0, gy0, k)
+    rgb = np.zeros(out.shape + (3,), np.float32)
+    for c in range(chans.shape[2]):     # (each channel stretched on its own, then shown in its color)
+        v = chans[:, :, c]
+        hi_c = max(float(np.percentile(v[v > 0], 99.5)) if (v > 0).any() else 1.0, 1.0)
+        rgb += (np.clip(v / hi_c, 0, 1) ** 0.6)[:, :, None] * (np.array(colors[c % len(colors)], np.float32) / 255)
+    return gray, (gx0, gy0, k), (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
 
 
 def czi_preview(section, stack, max_px):
@@ -1613,20 +1635,90 @@ def write_jpx_like(template_path, codestreams, out_path, extra_payloads=(), pixe
         raise
 
 
+# The start of a JPX written by NeuroInfo (signature, file type, reader requirements): the same for every one.
+JPX_PREAMBLE = bytes.fromhex("0000000c6a5020200d0a870a0000001c667479706a707820000000006a7078206a7032206a707862000000457272657103ffc000003ff0000a0005800000002d40000000022000000012100000001308000000010400000008020000000c010000001f00800000140040000000")
+
+
+def make_xmp(n_frames, channel_info, pixel_um):
+    """The XMP packet NeuroInfo keeps in its JPX files: the channels' colors, and for every frame its pixel size and channels."""
+    def rgb(c):
+        return f'xmp:Red="{c[0]}" xmp:Green="{c[1]}" xmp:Blue="{c[2]}"'
+    px = f"{pixel_um:.6f}"
+    t = ['<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?> <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="XMP Core 6.0.0"> '
+         '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"> <rdf:Description rdf:about="" '
+         'xmlns:xmp="http://ns.adobe.com/xap/1.0/"> <xmp:Image_Headers> <rdf:Bag> <rdf:li xmp:Application="NeuroInfo" '
+         'xmp:Version="2026.1.1" xmp:UseChannelData="True" xmp:CameraName="" xmp:MicroscopeName="" xmp:LensName="" '
+         'xmp:CorrectionFactor="0.000000" xmp:CreateDate=""/> </rdf:Bag> </xmp:Image_Headers> <xmp:ColorMaps> <rdf:Bag>']
+    for i, ch in enumerate(channel_info):
+        t.append(f' <rdf:li> <rdf:Description xmp:Map="{i}" xmp:BitsUsed="16" xmp:MapType="0" xmp:BlackPoint="0" '
+                 'xmp:WhitePoint="65535" xmp:Gamma="1.000000" xmp:GrayScale="False" xmp:Gain="1.000000" '
+                 'xmp:WhiteBalance="1.000000" xmp:Offset="0"> <xmp:BlackColor xmp:Red="0" xmp:Green="0" xmp:Blue="0" xmp:Alpha="0"/> '
+                 f'<xmp:WhiteColor {rgb(ch.color)} xmp:Alpha="0"/> </rdf:Description> </rdf:li>')
+    t.append(' </rdf:Bag> </xmp:ColorMaps> <xmp:Images> <rdf:Bag>')
+    for f in range(n_frames):
+        t.append(f' <rdf:li> <rdf:Description xmp:Image="{f}" xmp:Rotation="0.000000" xmp:TranslationX="0.000000" '
+                 f'xmp:TranslationY="0.000000" xmp:PixelWidth="{px}" xmp:PixelHeight="{px}" xmp:SizeZ="240.000000" '
+                 'xmp:OrigPixelWidth="-1.000000" xmp:OrigPixelHeight="-1.000000" xmp:OrigSizeZ="-1.000000" xmp:OriginX="0.000000" '
+                 'xmp:OriginY="0.000000" xmp:OriginZ="0.000000" xmp:CombinationMethod="0"> <xmp:Channels> <rdf:Bag>')
+        for i, ch in enumerate(channel_info):
+            t.append(f' <rdf:li xmp:Channel="{i}" xmp:ColorMapID="{i}" xmp:Name="" xmp:Enabled="True"/>')
+        t.append(' </rdf:Bag> </xmp:Channels> <xmp:Groups> <rdf:Bag>')
+        for i, ch in enumerate(channel_info):
+            t.append(f' <rdf:li xmp:GroupName="{ch.name}" xmp:Red="{i}" xmp:Green="-1" xmp:Blue="-1" '
+                     'xmp:ExposureSeconds="-1.000000" xmp:Gain="-1.000000"/>')
+        t.append(' </rdf:Bag> </xmp:Groups> </rdf:Description> </rdf:li>')
+    t.append(' </rdf:Bag> </xmp:Images> </rdf:Description> </rdf:RDF> </x:xmpmeta> <?xpacket end="w"?>')
+    return "".join(t).encode("utf-8")
+
+
+def write_jpx_new(codestreams, out_path, canvas_w, canvas_h, channel_info, pixel_um, extra_payloads=()):
+    """A multi-frame JPX of the codestreams (bytes, or callables returning bytes), laid out like NeuroInfo's, written from
+    scratch (write_jpx_like needs an existing JPX to copy from)."""
+    n = len(codestreams)
+    if not n:
+        raise ValueError("no codestreams")
+    ihdr = box_bytes(b"ihdr", struct.pack(">IIHBBBB", canvas_h, canvas_w, len(channel_info), 15, 7, 1, 0))
+    colr = box_bytes(b"colr", struct.pack(">BBBI", 1, 0, 0, 16 if len(channel_info) >= 3 else 17))
+    tmp = out_path + ".partial"
+    try:
+        with open(tmp, "wb") as dst:
+            dst.write(JPX_PREAMBLE)
+            dst.write(box_bytes(b"jp2h", ihdr + colr))
+            for i, cs in enumerate(codestreams):
+                dst.write(box_bytes(b"jpch", b""))
+                dst.write(box_bytes(b"jplh", b""))
+                if i == 0:
+                    dst.write(box_bytes(b"uuid", XMP_UUID + make_xmp(n, channel_info, pixel_um)))
+                dst.write(box_bytes(b"jp2c", cs() if callable(cs) else cs))
+            for payload in extra_payloads:
+                dst.write(box_bytes(b"uuid", payload))
+        os.replace(tmp, out_path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def export_stack(stack, out_path, quality_db=DEFAULT_QUALITY_DB, rerender_all=False,
                  log=print, progress=None, stop_event=None):
     """Write `stack` with its edits to out_path. Sections whose edit matches
-    the opened file are copied unchanged unless rerender_all.
+    the opened file are copied unchanged unless rerender_all (a stack made in memory from slide scans has no file to copy from:
+    every section is rendered, and the JPX is written from scratch).
     progress(i, n, text) is called before each section."""
-    frames = [b for b in read_boxes(stack.jpx_path) if b.kind == b"jp2c"]
+    fresh = not stack.jpx_path
+    frames = [] if fresh else [b for b in read_boxes(stack.jpx_path) if b.kind == b"jp2c"]
     # (a section whose source image cannot be read, e.g. a .czi, is never re-rendered: its frame is copied as it is)
-    todo = [s for s in stack.sections if s.renderable and (rerender_all or s.dirty)]
+    todo = [s for s in stack.sections if s.renderable and (fresh or rerender_all or s.dirty)]
     missing = [s.name for s in todo if not s.source_path]
     if missing:
         raise FileNotFoundError("Source images not found: " + ", ".join(missing))
+    if fresh and len(todo) != len(stack.sections):
+        raise ValueError("Some sections can't be rendered from their source images.")
     codestreams = []
     n_render = 0
-    with open(stack.jpx_path, "rb") as fj:
+    with (contextlib.nullcontext() if fresh else open(stack.jpx_path, "rb")) as fj:
         for s in stack.sections:
             if stop_event is not None and stop_event.is_set():
                 raise UserCanceled
@@ -1644,9 +1736,12 @@ def export_stack(stack, out_path, quality_db=DEFAULT_QUALITY_DB, rerender_all=Fa
             n_render += 1
             log(f"  {s.name}: re-rendered ({len(cs) / 1e6:.1f} MB, {time.time() - t0:.0f} s)")
     doc = stack_json(stack, out_path)
-    write_jpx_like(stack.jpx_path, codestreams, out_path,
-                   extra_payloads=[ALIGNER_UUID + json.dumps(doc, separators=(",", ":")).encode("utf-8")],
-                   pixel_um=stack.pixel_um if stack.pixel_corrected else None)
+    extra = [ALIGNER_UUID + json.dumps(doc, separators=(",", ":")).encode("utf-8")]
+    if fresh:
+        write_jpx_new(codestreams, out_path, stack.canvas_w, stack.canvas_h, stack.channel_info, stack.pixel_um, extra_payloads=extra)
+    else:
+        write_jpx_like(stack.jpx_path, codestreams, out_path, extra_payloads=extra,
+                       pixel_um=stack.pixel_um if stack.pixel_corrected else None)
     log(f"Wrote {out_path} ({os.path.getsize(out_path) / 1e6:.0f} MB; {n_render} re-rendered, "
         f"{len(stack.sections) - n_render} copied)")
     return n_render

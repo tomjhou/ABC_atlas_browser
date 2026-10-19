@@ -41,6 +41,7 @@ import threading
 import time
 
 import neuroinfo_stack as ns
+import section_project as sp
 
 ns.ensure_packages({"PIL": "pillow"})
 
@@ -714,7 +715,8 @@ class Aligner:
             return
         path = filedialog.askopenfilename(
             parent=self.root, title="Open a reconstruction (NeuroInfo or exported by this tool)",
-            filetypes=[("JPX stacks", "*.jpx"), ("All files", "*.*")],
+            filetypes=[("JPX stacks and section projects", "*.jpx *" + sp.PROJECT_SUFFIX), ("JPX stacks", "*.jpx"),
+                       ("Section projects (from the step that finds the sections)", "*" + sp.PROJECT_SUFFIX), ("All files", "*.*")],
             initialdir=self.stack.folder if self.stack else None)
         if path:
             self.open_path(path)
@@ -776,7 +778,30 @@ class Aligner:
         self.root.wait_window(dlg)
         return result["path"]
 
+    def open_project(self, path):
+        """A section project (step 1 of the workflow): its sections become an in-memory stack, rendered from the slide scans."""
+        self.opening = True
+        self.update_cursor()
+        self.root.update()
+        try:
+            project = sp.Project.load(path)
+            missing = [s.path for s in project.slides if not os.path.isfile(s.path)]
+            if missing:
+                raise FileNotFoundError("These slide scans weren't found:\n\n" + "\n".join(missing[:6]))
+            stack = sp.build_stack(project)
+        except Exception as e:
+            self.opening = False
+            self.update_cursor()
+            messagebox.showerror("Can't open", str(e), parent=self.root)
+            return
+        self.opening = False
+        self.update_cursor()
+        self.open_seconds = 0.0
+        self.show_stack(stack, path)
+
     def open_path(self, path):
+        if path.lower().endswith(sp.PROJECT_SUFFIX):
+            return self.open_project(path)
         self.opening = True
         self.update_cursor()
         self.root.update()
@@ -840,6 +865,11 @@ class Aligner:
                     f"{len(online)} section image(s) ({human_gb(size)}) are online-only in OneDrive and "
                     "must be downloaded to build previews. Continue?", parent=self.root):
                 return
+        self.show_stack(stack, path)
+
+    def show_stack(self, stack, path=None):
+        """Make `stack` the one being edited. `path` is the file it came from: a JPX, or a section project (the stack is then in
+        memory only, and its first export writes a new JPX). With no path the stack is in memory with nothing behind it."""
         self.stack = stack
         self.previews = {}
         self.frame_previews = set()
@@ -855,8 +885,13 @@ class Aligner:
         self.levels = [[0.0, 65535.0] for _ in range(stack.channels)]
         self.levels_set = False
         self.build_channel_controls()
-        self.root.title(f"JPX aligner - {os.path.basename(path)}")
-        add_recent(path)
+        if stack.jpx_path:
+            self.root.title(f"JPX aligner - {os.path.basename(path or stack.jpx_path)}")
+        else:
+            self.root.title(f"JPX aligner - unsaved project from {len(stack.sections)} sections"
+                            + (f" ({os.path.basename(path)})" if path else ""))
+        if path:
+            add_recent(path)
         self.refresh_list()
         self.update_controls()
         self.redraw(fit_if_needed=True)
@@ -2050,7 +2085,7 @@ class Aligner:
         except ValueError:
             messagebox.showerror("Quality", "Quality must be a number of dB, e.g. 60.", parent=self.root)
             return
-        rerender_all = self.var_rerender.get()
+        rerender_all = self.var_rerender.get() or not st.jpx_path   # (a stack made from slide scans has no frames to copy)
         todo = [s for s in st.sections if s.renderable and (rerender_all or s.dirty)]   # (others: frames copied as they are)
         if not st.changed:   # (also when "re-render unchanged sections too" would still write every image)
             same = ("every image would be re-rendered, but with the same placement as before" if rerender_all
@@ -2078,7 +2113,8 @@ class Aligner:
             return
         out = filedialog.asksaveasfilename(
             parent=self.root, title="Export JPX", initialdir=st.folder,
-            initialfile=os.path.basename(st.jpx_path), defaultextension=".jpx",   # (the dialog asks before overwriting)
+            initialfile=os.path.basename(st.jpx_path) or ns.next_free_name(st.folder),
+            defaultextension=".jpx",   # (the dialog asks before overwriting)
             filetypes=[("JPX stacks", "*.jpx")])
         if not out:
             return

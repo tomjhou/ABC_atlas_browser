@@ -89,6 +89,17 @@ command-line version.
 `tools/jp2_boxdump.py <file.jp2>` prints a JPEG2000 file's header boxes and codestream settings, for
 comparing converted files with NeuroInfo's own.
 
+## SECTION WORKFLOW (from slide scans to an aligned stack)
+
+Double-click `RUN_jpx_aligner.bat` for the start window, with two steps in order:
+
+1. **Load / detect images** (`section_loader.py`): choose Zeiss `.czi` slide scans; for each slide, set a
+   brightness threshold (the preview tints what will be found) and accept it to outline each section
+   (holes such as ventricles stay in); merge, delete or hand-draw outlines; then drag the sections into their order.
+   The result is saved beside the first slide as `<name>.sections.json` and handed, in memory, to step 2.
+2. **Align images**: the aligner below. Open a `.jpx` or a saved `.sections.json` (File > Open). A project that
+   starts from slide scans has no JPX yet; its first export writes one.
+
 ## JPX ALIGNER (adjust NeuroInfo section stacks)
 
 NeuroInfo's serial section assembler can't revise an alignment once it's made. `jpx_aligner.py`
