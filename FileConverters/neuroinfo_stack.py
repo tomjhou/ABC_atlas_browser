@@ -717,6 +717,7 @@ try:
 except ImportError:
     j2k_partial = None
 
+CZI_WORKERS = max(1, min(os.cpu_count() or 1, 16))   # threads for decoding a scan's tiles (the reader's default is one: 6 s a scene)
 _czi_lock = threading.RLock()   # (installing the reader library, and making the locks below)
 _czi_files = {}
 _czi_locks = {}
@@ -793,7 +794,7 @@ def czi_levels(path, scene=0):
 def czi_read(path, scene, level=0):
     """A scene at pyramid `level` (each level halves the resolution), H x W x C."""
     with _czi_lock_for(path):
-        arr = czi_file(path).scenes[scene].levels[level].asarray()
+        arr = czi_file(path).scenes[scene].levels[level].asarray(maxworkers=CZI_WORKERS)
     if arr.ndim == 2:
         arr = arr[None]
     return np.moveaxis(arr, 0, -1)
@@ -805,7 +806,7 @@ def czi_read_region(path, scene, x, y, w, h):
     with _czi_lock_for(path):
         level = czi_file(path).scenes[scene].levels[0]
         try:
-            arr = level(roi=(int(x), int(y), int(w), int(h))).asarray()
+            arr = level(roi=(int(x), int(y), int(w), int(h))).asarray(maxworkers=CZI_WORKERS)
         except ValueError:   # (no tile under the region at all: nothing there)
             arr = np.zeros((level.shape[0], int(h), int(w)), level.dtype)
     if arr.ndim == 2:
@@ -1576,13 +1577,14 @@ def render_section(section, stack, source=None, interpolation=cv2.INTER_LINEAR, 
         P = section.stack_points if use_edit else (R @ section.case_points.T).T + t
         mask = np.zeros(out.shape[:2], np.uint8)
         cv2.fillPoly(mask, [np.column_stack([P[:, 0] / stack.pixel_um, -P[:, 1] / stack.pixel_um]).round().astype(np.int32)], 1)
-        out[mask == 0] = 0
+        for c in range(out.shape[2]):      # (a mask, not out[mask == 0] = 0, which is slow on a canvas this big)
+            out[..., c] = cv2.bitwise_and(out[..., c], out[..., c], mask=mask)
     return out
 
 
-def encode_frame(image, quality_db=DEFAULT_QUALITY_DB):
+def encode_frame(image, quality_db=DEFAULT_QUALITY_DB, threads=None):
     cs = imagecodecs.jpeg2k_encode(image, quality_db, codecformat="j2k", mct=False,
-                                   resolutions=7, numthreads=os.cpu_count() or 1)
+                                   resolutions=7, numthreads=threads or os.cpu_count() or 1)
     return add_com_markers(cs, ["MBF Bioscience"])
 
 
@@ -1701,6 +1703,22 @@ def write_jpx_new(codestreams, out_path, canvas_w, canvas_h, channel_info, pixel
         raise
 
 
+EXPORT_PARALLEL = 1   # sections rendered at once. Measured on 6 sections of a 17664 px canvas: 1 -> 12.8 s each, 2 -> 11.7 s,
+                      # 3 -> 20.8 s (the encoder already uses every processor, and memory bandwidth is the limit)
+
+
+def export_workers(stack, n_sections):
+    """How many sections to render at once: EXPORT_PARALLEL, fewer if memory is short (a section takes about three canvases of
+    the stack, plus the scene it is cut from)."""
+    need = stack.canvas_w * stack.canvas_h * stack.channels * 2 * 3 + 2e9
+    try:
+        import psutil
+        avail = psutil.virtual_memory().available
+    except Exception:
+        avail = 8e9
+    return int(max(1, min(EXPORT_PARALLEL, n_sections, avail * 0.6 // need)))
+
+
 def export_stack(stack, out_path, quality_db=DEFAULT_QUALITY_DB, rerender_all=False,
                  log=print, progress=None, stop_event=None):
     """Write `stack` with its edits to out_path. Sections whose edit matches
@@ -1718,23 +1736,42 @@ def export_stack(stack, out_path, quality_db=DEFAULT_QUALITY_DB, rerender_all=Fa
         raise ValueError("Some sections can't be rendered from their source images.")
     codestreams = []
     n_render = 0
-    with (contextlib.nullcontext() if fresh else open(stack.jpx_path, "rb")) as fj:
-        for s in stack.sections:
-            if stop_event is not None and stop_event.is_set():
-                raise UserCanceled
-            if progress is not None:
-                progress(s.index, len(stack.sections), s.name)
-            if s not in todo:
-                codestreams.append(read_payload(fj, frames[s.frame]))
-                log(f"  {s.name}: unchanged, copied")
-                continue
-            t0 = time.time()
-            img = render_section(s, stack)
-            cs = encode_frame(img, quality_db)
-            del img
-            codestreams.append(cs)
-            n_render += 1
-            log(f"  {s.name}: re-rendered ({len(cs) / 1e6:.1f} MB, {time.time() - t0:.0f} s)")
+    workers = export_workers(stack, len(todo))
+    threads = max(2, (os.cpu_count() or 4) // workers)   # (each encode gets its share of the processors)
+
+    def render(s):
+        """Render and encode one section (in a worker thread: several sections go at once, and the single-threaded parts of one
+        overlap with the encoding of another)."""
+        if stop_event is not None and stop_event.is_set():
+            raise UserCanceled
+        if progress is not None:
+            progress(s.index, len(stack.sections), s.name)
+        t0 = time.time()
+        img = render_section(s, stack)
+        cs = encode_frame(img, quality_db, threads)
+        del img
+        log(f"  {s.name}: re-rendered ({len(cs) / 1e6:.1f} MB, {time.time() - t0:.0f} s)")
+        return cs
+
+    with (contextlib.nullcontext() if fresh else open(stack.jpx_path, "rb")) as fj, \
+            ThreadPoolExecutor(max_workers=workers) as pool:
+        jobs = {id(s): pool.submit(render, s) for s in todo}
+        try:
+            for s in stack.sections:
+                if stop_event is not None and stop_event.is_set():
+                    raise UserCanceled
+                if s not in todo:
+                    if progress is not None:
+                        progress(s.index, len(stack.sections), s.name)
+                    codestreams.append(read_payload(fj, frames[s.frame]))
+                    log(f"  {s.name}: unchanged, copied")
+                    continue
+                codestreams.append(jobs[id(s)].result())
+                n_render += 1
+        except BaseException:
+            for j in jobs.values():
+                j.cancel()
+            raise
     doc = stack_json(stack, out_path)
     extra = [ALIGNER_UUID + json.dumps(doc, separators=(",", ":")).encode("utf-8")]
     if fresh:
