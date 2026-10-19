@@ -22,10 +22,10 @@ from PIL import Image, ImageTk
 
 import neuroinfo_stack as ns
 import section_project as sp
+from section_order import OrderGrid, THUMB_W, THUMB_H
 
 STAGES = ("Load slides", "Detect outlines", "Order sections", "Align")
 ACCENT = "#1f5fa8"
-THUMB_W, THUMB_H, CAPTION_H, CELL_PAD = 190, 150, 20, 10
 SELECT_COLOR, OUTLINE_COLOR, DRAW_COLOR = "#ff3030", "#ffd400", "#00e5ff"
 TINT = np.array([0, 190, 255], np.float32)
 GRID_LABEL = 22          # the height of the line of text under each picture of the grid of all the images
@@ -330,17 +330,23 @@ class SectionLoader:
         side = ttk.Frame(mid, padding=(12, 0))
         side.pack(side=tk.LEFT, fill=tk.Y)
         ttk.Button(side, text="Add images...", command=self.add_slides).pack(fill=tk.X)
-        ttk.Button(side, text="Remove", command=self.remove_slides).pack(fill=tk.X, pady=6)
-        ttk.Button(side, text="Move up", command=lambda: self.move_slide(-1)).pack(fill=tk.X)
-        ttk.Button(side, text="Move down", command=lambda: self.move_slide(1)).pack(fill=tk.X, pady=6)
-        ttk.Button(side, text="Set pixel size...", command=self.set_pixel_size).pack(fill=tk.X)
+        self.need_images = []              # the buttons that mean nothing until an image has been added (see refresh_slide_list)
+        for text, command, pad in (("Remove", self.remove_slides, 6), ("Move up", lambda: self.move_slide(-1), 0),
+                                   ("Move down", lambda: self.move_slide(1), 6), ("Set pixel size...", self.set_pixel_size, 0)):
+            button = ttk.Button(side, text=text, command=command)
+            button.pack(fill=tk.X, pady=pad)
+            self.need_images.append(button)
         ttk.Separator(side).pack(fill=tk.X, pady=10)
         ttk.Button(side, text="Open a saved project...", command=self.open_project).pack(fill=tk.X)
         ttk.Button(side, text="Open recent projects...", command=self.open_recent_project).pack(fill=tk.X, pady=(6, 0))
-        ttk.Button(side, text="Close project", command=self.close_project).pack(fill=tk.X, pady=(6, 0))
+        close_button = ttk.Button(side, text="Close project", command=self.close_project)
+        close_button.pack(fill=tk.X, pady=(6, 0))
+        self.need_images.append(close_button)
         return f
 
     def refresh_slide_list(self):
+        for button in getattr(self, "need_images", ()):          # (greyed while no image is in the list)
+            button.state(["!disabled"] if self.project.slides else ["disabled"])
         self.slide_tree.delete(*self.slide_tree.get_children())
         for i, s in enumerate(self.project.slides):
             info = self.infos.get(s.path)
@@ -1724,9 +1730,6 @@ class SectionLoader:
 
     def build_order(self):
         f = ttk.Frame(self.body)
-        self.order = []                    # [(slide index, polygon index)]
-        self.thumbs = {}                   # (slide index, polygon index) -> PhotoImage
-        self.drag = None
         top = ttk.Frame(f, padding=(12, 8))
         top.pack(fill=tk.X)
         self.var_order_text = tk.StringVar(f, "")
@@ -1740,20 +1743,33 @@ class SectionLoader:
         ttk.Checkbutton(top, text="Scale sections to fit thumbnails", variable=self.var_fit_thumbs,
                         command=self.on_fit_thumbs).pack(side=tk.RIGHT, padx=8)
         help_label.pack(side=tk.LEFT)      # (packed last: if the window is narrow it is the help text that is cut, not the buttons)
-        wrap = ttk.Frame(f)
-        wrap.pack(fill=tk.BOTH, expand=True)
-        self.ocanvas = tk.Canvas(wrap, bg="white", highlightthickness=0)
-        sb = ttk.Scrollbar(wrap, orient=tk.VERTICAL, command=self.ocanvas.yview)
-        self.ocanvas.config(yscrollcommand=sb.set)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.ocanvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.ocanvas.bind("<Configure>", lambda e: self.draw_order())
-        self.ocanvas.bind("<MouseWheel>", lambda e: self.ocanvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
-        self.ocanvas.bind("<ButtonPress-1>", self.o_press)
-        self.ocanvas.bind("<B1-Motion>", self.o_move)
-        self.ocanvas.bind("<ButtonRelease-1>", self.o_release)
-        self.ocanvas.bind("<Double-Button-1>", self.o_double)
+
+        def caption(key, i):
+            slide = self.project.slides[key[0]]
+            return f"{i + 1}   {os.path.splitext(os.path.basename(slide.path))[0][-9:]}", f"#{key[1] + 1}"   # (#: its outline's number in tab 2)
+
+        self.grid = OrderGrid(f, caption, on_double=self.order_double, enabled=lambda: self.stage == 2,
+                              after_draw=lambda: self.var_order_text.set(f"{len(self.grid.order)} section(s). Drag a picture to reorder."))
+        self.grid.frame.pack(fill=tk.BOTH, expand=True)
         return f
+
+    @property
+    def order(self):
+        """[(slide index, polygon index)] in the order of the sections (the shared thumbnail grid keeps it)."""
+        return self.grid.order
+
+    @order.setter
+    def order(self, value):
+        self.grid.order = value
+
+    @property
+    def thumbs(self):
+        """(slide index, polygon index) -> PhotoImage"""
+        return self.grid.thumbs
+
+    @thumbs.setter
+    def thumbs(self, value):
+        self.grid.thumbs = value
 
     def enter_order(self):
         proj = self.project
@@ -1826,100 +1842,14 @@ class SectionLoader:
             cv2.polylines(rgb, [((poly - a) * f).astype(np.int32)], True, (255, 212, 0), 1, cv2.LINE_AA)
             self.thumbs[key] = ImageTk.PhotoImage(Image.fromarray(rgb))
 
-    def cell_geometry(self):
-        w = max(self.ocanvas.winfo_width(), 300)
-        cw, chh = THUMB_W + CELL_PAD, THUMB_H + CAPTION_H + CELL_PAD
-        cols = max(1, (w - CELL_PAD) // cw)
-        return cols, cw, chh
+    def draw_order(self):
+        self.grid.draw()
 
-    def cell_origin(self, i):
-        cols, cw, chh = self.cell_geometry()
-        return CELL_PAD + (i % cols) * cw, CELL_PAD + (i // cols) * chh
-
-    def draw_order(self, gap=None):
-        c = self.ocanvas
-        c.delete("all")
-        if self.stage != 2:
-            return
-        cols, cw, chh = self.cell_geometry()
-        rows = (len(self.order) + cols - 1) // cols
-        c.config(scrollregion=(0, 0, 10, CELL_PAD + rows * chh))
-        self.var_order_text.set(f"{len(self.order)} section(s). Drag a picture to reorder.")
-        for i, key in enumerate(self.order):
-            if self.drag and self.drag["moved"] and i == self.drag["index"]:
-                continue
-            x, y = self.cell_origin(i)
-            c.create_rectangle(x, y, x + THUMB_W, y + THUMB_H, outline="#c0c0c0", fill="#101010")
-            ph = self.thumbs.get(key)
-            if ph:
-                c.create_image(x + THUMB_W / 2, y + THUMB_H / 2, image=ph)
-            slide = self.project.slides[key[0]]
-            c.create_text(x + 2, y + THUMB_H + 2, anchor="nw", fill="black", font=("Segoe UI", 9),
-                          text=f"{i + 1}   {os.path.splitext(os.path.basename(slide.path))[0][-9:]}")
-            c.create_text(x + THUMB_W - 2, y + THUMB_H + 2, anchor="ne", fill=ACCENT, font=("Segoe UI", 9, "bold"),
-                          text=f"#{key[1] + 1}")      # (the number of its outline in the previous tab)
-        if self.drag and self.drag["moved"]:
-            g = self.drag["slot"]
-            x, y = self.cell_origin(g)
-            if g == len(self.order) and g % cols == 0 and g:
-                x, y = self.cell_origin(g - 1)
-                x += cw
-            c.create_rectangle(x - 6, y, x - 3, y + THUMB_H, fill=ACCENT, outline="")
-            ph = self.thumbs.get(self.order[self.drag["index"]])
-            if ph:
-                c.create_image(self.drag["x"], self.drag["y"], image=ph)
-
-    def slot_at(self, x, y):
-        """Insertion position (0 .. len) for a point on the canvas."""
-        cols, cw, chh = self.cell_geometry()
-        y = self.ocanvas.canvasy(y)
-        col = int(min(max((x - CELL_PAD) // cw, 0), cols - 1))
-        row = int(max((y - CELL_PAD) // chh, 0))
-        i = row * cols + col
-        cx = CELL_PAD + col * cw + THUMB_W / 2
-        if x > cx:
-            i += 1
-        return min(i, len(self.order))
-
-    def o_press(self, e):
-        y = self.ocanvas.canvasy(e.y)
-        cols, cw, chh = self.cell_geometry()
-        col, row = (e.x - CELL_PAD) // cw, (y - CELL_PAD) // chh
-        i = int(row * cols + col)
-        if 0 <= col < cols and 0 <= i < len(self.order):
-            self.drag = {"index": i, "x0": e.x, "y0": y, "x": e.x, "y": y, "moved": False, "slot": i}
-
-    def o_move(self, e):
-        d = self.drag
-        if not d:
-            return
-        y = self.ocanvas.canvasy(e.y)
-        if not d["moved"] and abs(e.x - d["x0"]) + abs(y - d["y0"]) < 6:
-            return
-        d["moved"], d["x"], d["y"] = True, e.x, y
-        d["slot"] = self.slot_at(e.x, e.y)
-        self.draw_order()
-
-    def o_release(self, e):
-        d, self.drag = self.drag, None
-        if d and d["moved"]:
-            item = self.order.pop(d["index"])
-            slot = d["slot"] - (1 if d["slot"] > d["index"] else 0)
-            self.order.insert(slot, item)
-        self.draw_order()
-
-    def o_double(self, e):
+    def order_double(self, key, i):
         """Double-click on a thumbnail: back to the outlines tab, at that section's image with its outline selected."""
         if self.busy:
             return
-        y = self.ocanvas.canvasy(e.y)
-        cols, cw, chh = self.cell_geometry()
-        col, row = (e.x - CELL_PAD) // cw, (y - CELL_PAD) // chh
-        i = int(row * cols + col)
-        if not (0 <= col < cols and 0 <= i < len(self.order)):
-            return
-        self.drag = None
-        si, pi = self.order[i]
+        si, pi = key
         self.project.order = list(self.order)         # (the order made so far is kept for when the tab is entered again)
         self.cur = si
         self.show_stage(1)
@@ -1929,8 +1859,7 @@ class SectionLoader:
             self.redraw()
 
     def reverse_order(self):
-        self.order.reverse()
-        self.draw_order()
+        self.grid.reverse()
 
     def reset_order(self):
         self.order = self.project.default_order()

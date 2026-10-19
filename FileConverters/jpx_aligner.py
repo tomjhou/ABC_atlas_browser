@@ -44,6 +44,7 @@ from dataclasses import asdict
 
 import neuroinfo_stack as ns
 import section_project as sp
+from section_order import OrderGrid, THUMB_W, THUMB_H
 
 ns.ensure_packages({"PIL": "pillow"})
 
@@ -408,7 +409,8 @@ class Aligner:
         for text, command, tip in (
                 ("Move up", lambda: self.move_section(-1), "Move selected section earlier in the sequence order"),
                 ("Move down", lambda: self.move_section(1), "Move selected section later in the sequence order"),
-                ("Delete", self.delete_section, "Remove section from sequence")):
+                ("Delete", self.delete_section, "Remove section from sequence"),
+                ("Thumbnails...", self.order_dialog, "Put the sections in order by dragging their pictures about in a window")):
             button = ttk.Button(order, text=text, command=command)
             button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
             Tooltip(button, tip)
@@ -1679,6 +1681,119 @@ class Aligner:
         self.listbox.itemconfig(d["target"], background="")
         if d["target"] != d["from"] and self.stack and not self.busy:
             self.move_to(d["from"], d["target"])
+
+    def order_dialog(self):
+        """A window with a picture of every section, to put them in order by dragging (the grid of step 1's third tab). Apply makes the
+        new order; Cancel leaves things as they were. A double-click applies it too, and goes to that section."""
+        if not self.stack or self.busy or self.opening or len(self.stack.sections) < 2:
+            return
+        stack = self.stack
+        secs = list(stack.sections)
+        by_frame = {sec.frame: sec for sec in secs}
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Order the sections")
+        dlg.transient(self.root)
+        dlg.geometry(f"1000x700+{self.root.winfo_rootx() + 40}+{self.root.winfo_rooty() + 40}")
+        top = ttk.Frame(dlg, padding=(12, 8))
+        top.pack(fill=tk.X)
+        text = tk.StringVar(dlg)
+        state = {"closed": False}
+
+        def caption(frame, i):
+            sec = by_frame[frame]
+            scene = ns.czi_scene_if_known(sec, stack)
+            return f"{i + 1}  {os.path.splitext(sec.name)[0][-9:]}", f"scene {scene + 1}" if scene is not None else ""
+
+        grid = OrderGrid(dlg, caption, on_double=lambda frame, i: apply(frame),
+                         after_draw=lambda: text.set(f"{len(grid.order)} sections. Drag to reorder; double-click applies and goes to it."))
+        grid.order = [sec.frame for sec in secs]
+
+        def close():
+            state["closed"] = True
+            dlg.destroy()
+
+        def apply(go_to=None):
+            if stack is not self.stack:
+                return close()
+            new = [by_frame[f] for f in grid.order]
+            changed = [sec.frame for sec in new] != [sec.frame for sec in secs]
+            keep = by_frame[go_to] if go_to is not None else secs[self.cur]
+            close()
+            if changed:
+                stack.sections[:] = new
+                self.renumber()
+                self.cur = keep.index
+                self.refresh_list()
+                self.select(self.cur)
+                self.var_status.set("Reordered the sections. Export to save the new order.")
+            elif go_to is not None:
+                self.select(keep.index)
+
+        def thumb(frame):
+            """The section as the main view shows it (aligned, at the brightness set), fitted into its thumbnail with its outline."""
+            sec = by_frame[frame]
+            P = sec.stack_points
+            if not len(P):
+                return None
+            px = stack.pixel_um
+            X, Y = P[:, 0] / px, -P[:, 1] / px
+            lo, hi = np.array([X.min(), Y.min()]), np.array([X.max(), Y.max()])
+            pad = 0.08 * float((hi - lo).max()) + 4
+            sc = min(THUMB_W / (hi[0] - lo[0] + 2 * pad), THUMB_H / (hi[1] - lo[1] + 2 * pad))
+            ox, oy = THUMB_W / 2 - (lo[0] + hi[0]) / 2 * sc, THUMB_H / 2 - (lo[1] + hi[1]) / 2 * sc
+            saved, self.view = self.view, (sc, ox, oy)
+            try:
+                img, _ = self.warp_section(sec, THUMB_W, THUMB_H)
+            finally:
+                self.view = saved
+            if img is None:
+                return None
+            rgb = (np.clip(self.colorize(img), 0, 1) * 255).astype(np.uint8)
+            cv2.polylines(rgb, [np.column_stack([ox + X * sc, oy + Y * sc]).astype(np.int32)], True, (255, 212, 0), 1, cv2.LINE_AA)
+            return ImageTk.PhotoImage(Image.fromarray(rgb))
+
+        skip = set()      # (sections with nothing to show)
+
+        def fill():
+            """The thumbnails are made a few at a time as the sections' pictures are loaded (they may still be coming in)."""
+            if state["closed"]:
+                return
+            made = 0
+            for frame in grid.order:
+                if frame in grid.thumbs or frame in skip:
+                    continue
+                if frame not in self.previews:
+                    continue
+                try:
+                    ph = thumb(frame)
+                except Exception:
+                    ph = None
+                if ph is None:
+                    skip.add(frame)
+                else:
+                    grid.thumbs[frame] = ph
+                made += 1
+                if made >= 12:
+                    break
+            if made:
+                grid.draw()
+            if len(grid.thumbs) + len(skip) < len(by_frame):
+                dlg.after(30 if made else 300, fill)
+
+        ttk.Button(top, text="Reverse order", command=grid.reverse).pack(side=tk.RIGHT)
+        ttk.Button(top, text="Original order", command=lambda: (grid.order.sort(), grid.draw())).pack(side=tk.RIGHT, padx=8)
+        ttk.Label(top, textvariable=text, foreground="gray30").pack(side=tk.LEFT)
+        bottom = ttk.Frame(dlg, padding=10)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Button(bottom, text="Apply", command=apply).pack(side=tk.RIGHT)
+        ttk.Button(bottom, text="Cancel", command=close).pack(side=tk.RIGHT, padx=8)
+        grid.frame.pack(fill=tk.BOTH, expand=True)
+        dlg.protocol("WM_DELETE_WINDOW", close)
+        dlg.bind("<Escape>", lambda e: close())
+        dlg.update_idletasks()
+        dlg.grab_set()
+        grid.draw()
+        fill()
 
     def delete_section(self):
         """Remove the current section from the stack (after asking); the exported JPX will not contain it."""
