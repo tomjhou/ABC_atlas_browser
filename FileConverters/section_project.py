@@ -68,6 +68,15 @@ def remove_recent_project(path):
     _save_recent_projects([p for p in recent_projects() if os.path.normcase(os.path.abspath(p)) != key])
 
 
+def _relative(path, folder):
+    """`path` relative to `folder`, with forward slashes (the absolute path only if there is no relative one, another drive)."""
+    try:
+        rel = os.path.relpath(path, folder)
+    except ValueError:
+        rel = os.path.abspath(path)
+    return rel.replace("\\", "/")
+
+
 def is_project_path(path):
     """Whether a file name is a project file's (the current ending, or the one used at first)."""
     return path.lower().endswith((PROJECT_SUFFIX, OLD_PROJECT_SUFFIX))
@@ -364,6 +373,7 @@ class Slide:
     min_area: int = -1                # smallest region kept, in overview pixels (-1: not set yet: 0.25 mm2 when first shown)
     smooth: int = 8                   # how much the boundary is smoothed (pixels; outward by preference)
     pad: int = 2                      # how far each outline is grown outward (pixels)
+    own: dict = None                  # this image's own settings, kept while "same settings for all images" is on (to go back to)
     pixel_um: float = 0.0             # pixel size set by the user (0: the file's own)
     polygons: list = field(default_factory=list)   # outlines in the slide's pixel grid (n x 2, x then y), once accepted
     accepted: bool = False
@@ -377,6 +387,7 @@ class Project:
     z_spacing_um: float = 0.0                      # distance between adjacent sections (um); NeuroInfo asks for it too
     alignment: dict = None                         # the aligner's state (stack_json): its edits, outline changes, order, canvas
     alignment_key: str = ""                        # fingerprint() of the outlines and order that alignment was made from
+    shared: dict = None                            # the settings every image shares ("same settings for all images"), or None
 
     def polygons_key(self):
         """Something that changes when any slide's outlines do (the order is kept while this is the same)."""
@@ -395,17 +406,28 @@ class Project:
         path = path or self.path
         if not path:
             raise ValueError("no project file name")
+        folder = os.path.dirname(os.path.abspath(path))
+        alignment = self.alignment
+        if alignment:      # (paths in the project file are relative to its folder only: drives may be mapped differently elsewhere)
+            alignment = dict(alignment, origin="", sections=[{k: v for k, v in sec.items() if k != "source_absolute"}
+                                                             for sec in alignment["sections"]])
         doc = {"format": PROJECT_FORMAT, "version": PROJECT_VERSION,
-               "slides": [{"path": s.path.replace("\\", "/"), "threshold": s.threshold, "min_area": s.min_area,
-                           "smooth": s.smooth, "pad": s.pad, "pixel_um": s.pixel_um, "accepted": s.accepted, "polygons": [np.round(p, 2).tolist() for p in s.polygons]}
+               "slides": [{"path": _relative(s.path, folder), "threshold": s.threshold, "min_area": s.min_area,
+                           "smooth": s.smooth, "pad": s.pad, "own": s.own, "pixel_um": s.pixel_um, "accepted": s.accepted, "polygons": [np.round(p, 2).tolist() for p in s.polygons]}
                           for s in self.slides],
                "order": [list(o) for o in self.order], "z_spacing_um": self.z_spacing_um,
-               "alignment": self.alignment, "alignment_key": self.alignment_key}
+               "shared": self.shared, "alignment": alignment, "alignment_key": self.alignment_key}
         tmp = path + ".partial"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(doc, f, separators=(",", ":"))
         os.replace(tmp, path)
         self.path = path
+
+    def folder(self):
+        """The folder the project lives in: its file's, or (not saved yet) its first image's; "" if there is neither."""
+        if self.path:
+            return os.path.dirname(os.path.abspath(self.path))
+        return os.path.dirname(os.path.abspath(self.slides[0].path)) if self.slides else ""
 
     @staticmethod
     def load(path):
@@ -416,14 +438,18 @@ class Project:
         slides = []
         for d in doc["slides"]:
             p = d["path"]
-            if not os.path.isfile(p):      # (the slide may have moved with the project file: look beside it)
-                alt = os.path.join(os.path.dirname(os.path.abspath(path)), os.path.basename(p))
+            here = os.path.dirname(os.path.abspath(path))
+            if not os.path.isabs(p):       # (relative to the project file's folder, as projects are saved now)
+                p = os.path.normpath(os.path.join(here, p))
+            elif not os.path.isfile(p):    # (an older project's absolute path, from another machine or place: look beside the project file)
+                alt = os.path.join(here, os.path.basename(p))
                 p = alt if os.path.isfile(alt) else p
-            slides.append(Slide(p, threshold=d.get("threshold", -1), min_area=d.get("min_area", -1), smooth=d.get("smooth", 8), pad=d.get("pad", 2), pixel_um=d.get("pixel_um", 0.0),
+            slides.append(Slide(p, threshold=d.get("threshold", -1), min_area=d.get("min_area", -1), smooth=d.get("smooth", 8), pad=d.get("pad", 2), own=d.get("own"), pixel_um=d.get("pixel_um", 0.0),
                                 polygons=[np.array(q, float).reshape(-1, 2) for q in d["polygons"]],
                                 accepted=d.get("accepted", False)))
         proj = Project(slides, [tuple(o) for o in doc.get("order", [])], os.path.abspath(path), float(doc.get("z_spacing_um", 0.0)),
                        doc.get("alignment"), doc.get("alignment_key", ""))
+        proj.shared = doc.get("shared")
         return proj
 
     def new_path(self):
@@ -476,7 +502,7 @@ def match_alignment(project):
     olds = []
     for o in old["sections"]:
         P = np.array(o["case_points"], float).reshape(-1, 2)
-        base = os.path.basename((o.get("source_absolute") or o.get("name", "")).replace("\\", "/")).lower()
+        base = os.path.basename((o.get("source_relative") or o.get("source_absolute") or o.get("name", "")).replace("\\", "/")).lower()
         olds.append((base, np.column_stack([P[:, 0] / old_px, -P[:, 1] / old_px]) if len(P) else None))
     assign, taken = {}, set()
     groups = {}

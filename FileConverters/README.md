@@ -97,6 +97,9 @@ Double-click `RUN_WORKFLOW.bat` for the start window, with two steps in order:
    brightness threshold (the preview tints what will be found) and accept it to outline each section
    (holes such as ventricles stay in); merge, delete or hand-draw outlines; then drag the sections into their order.
    The result is saved beside the first slide as `<name>_project.json` and handed, in memory, to step 2.
+   A project's images must be in the same folder as its project file, and the file keeps only relative paths, so the
+   folder can be moved or opened on another computer (network drives may be mapped differently). Removing every image
+   starts a new project, saved in the folder of the next image added.
 2. **Align images**: the aligner below. Open a `.jpx` or a saved `_project.json` (File > Open). A project that
    starts from slide scans has no JPX yet; its first export writes one.
    The alignment edits (moves, rotations, flips, outline changes, order) are saved into the same project file as you

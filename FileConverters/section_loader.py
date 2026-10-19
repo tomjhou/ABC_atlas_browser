@@ -28,6 +28,7 @@ ACCENT = "#1f5fa8"
 THUMB_W, THUMB_H, CAPTION_H, CELL_PAD = 190, 150, 20, 10
 SELECT_COLOR, OUTLINE_COLOR, DRAW_COLOR = "#ff3030", "#ffd400", "#00e5ff"
 TINT = np.array([0, 190, 255], np.float32)
+GRID_LABEL = 22          # the height of the line of text under each picture of the grid of all the images
 
 
 def human_size(n):
@@ -120,9 +121,13 @@ class SectionLoader:
 
     def quit(self):
         if self.project.slides and not messagebox.askyesno("Quit", "Close without handing the sections to the alignment tool?\n"
-                                                           "(What you have done is saved in the project file when you go on.)",
+                                                           "Your work is saved in the project file.",
                                                            parent=self.root):
             return
+        try:
+            self.sync_project()          # (the outlines worked on, and the settings, are written to the project file before the window goes)
+        except Exception as e:
+            print(f"Couldn't save the project: {e}", flush=True)
         self.close()
 
     def background(self, work, done):
@@ -214,6 +219,8 @@ class SectionLoader:
                 self.redraw()
         elif self.stage == 2 and kind == "gray":
             self.finish_thumbs()
+        if kind == "gray" and self.stage == 1 and self.grid_mode:
+            self.schedule_grid()
 
     def poll(self):
         try:
@@ -221,6 +228,11 @@ class SectionLoader:
                 kind, payload = self.msgs.get_nowait()
                 if kind == "overview":
                     self.on_overview(*payload)
+                elif kind == "grid":
+                    version, i, rgb = payload
+                    if version == self.grid_version and self.grid_mode:
+                        self.grid_rgb[i] = rgb
+                        self.redraw()
                 elif kind == "done":
                     done, res = payload
                     self.busy -= 1
@@ -269,6 +281,7 @@ class SectionLoader:
                 messagebox.showinfo("Pixel size needed", "These files don't say what their pixel size is. Select them and use "
                                     "\"Set pixel size...\":\n\n" + "\n".join(unknown[:8]), parent=self.root)
                 return
+            self.save_slide_list()
             self.show_stage(1)
         elif self.stage == 1:
             self.leave_detect()
@@ -290,7 +303,7 @@ class SectionLoader:
 
     def build_load(self):
         f = ttk.Frame(self.body, padding=20)
-        ttk.Label(f, text="Slide scans (.czi) and section images (.jp2)", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        ttk.Label(f, text="Image files", font=("Segoe UI", 12, "bold")).pack(anchor="w")
         ttk.Label(f, text="Add every file whose sections you want to align: a slide scan holds several, a .jp2 holds one. "
                           "They are taken in the order listed.",
                   foreground="gray30").pack(anchor="w", pady=(0, 8))
@@ -305,6 +318,15 @@ class SectionLoader:
         self.slide_tree.config(yscrollcommand=sb.set)
         self.slide_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.pack(side=tk.LEFT, fill=tk.Y)
+        # the list's rows can also be dragged to a new place with the mouse (the buttons at the right do the same a step at a time)
+        self.drag_row, self.drag_active = None, False
+        self.drop_line = tk.Frame(self.slide_tree, bg=ACCENT, height=2)
+        self.slide_tree.bind("<ButtonPress-1>", self.row_press, add="+")
+        self.slide_tree.bind("<B1-Motion>", self.row_drag, add="+")
+        self.slide_tree.bind("<ButtonRelease-1>", self.row_drop, add="+")
+        self.row_menu = tk.Menu(self.root, tearoff=0)
+        self.row_menu.add_command(label="Copy path", command=self.copy_paths)
+        self.slide_tree.bind("<Button-3>", self.row_menu_open)
         side = ttk.Frame(mid, padding=(12, 0))
         side.pack(side=tk.LEFT, fill=tk.Y)
         ttk.Button(side, text="Add images...", command=self.add_slides).pack(fill=tk.X)
@@ -315,6 +337,7 @@ class SectionLoader:
         ttk.Separator(side).pack(fill=tk.X, pady=10)
         ttk.Button(side, text="Open a saved project...", command=self.open_project).pack(fill=tk.X)
         ttk.Button(side, text="Open recent projects...", command=self.open_recent_project).pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(side, text="Clear project", command=self.clear_project).pack(fill=tk.X, pady=(6, 0))
         return f
 
     def refresh_slide_list(self):
@@ -369,36 +392,162 @@ class SectionLoader:
             self.refresh_slide_list()
 
     def add_slides(self):
-        paths = filedialog.askopenfilenames(parent=self.root, title="Slide scans and section images", filetypes=[
+        """Add images. A project's images all lie in the folder its file is in (so that it can be moved or opened on another machine with
+        paths mapped differently): the dialog starts there, and files from elsewhere are refused. For a new project the first image
+        chosen sets the folder."""
+        folder = self.project.folder()
+        paths = filedialog.askopenfilenames(parent=self.root, title="Slide scans and section images", initialdir=folder or None, filetypes=[
             ("Slide scans and section images", "*.czi *.jp2 *.j2k *.j2c"), ("Zeiss .czi", "*.czi"), ("JPEG 2000", "*.jp2 *.j2k *.j2c"),
             ("All files", "*.*")])
-        known = {s.path for s in self.project.slides}
+        if not paths:
+            return
+        same = lambda a, b: os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+        folder = folder or os.path.dirname(os.path.abspath(paths[0]))
+        refused = [p for p in paths if not same(os.path.dirname(os.path.abspath(p)), folder)]
+        if refused:
+            messagebox.showinfo(
+                "Images from another folder",
+                f"A project's images must be in the folder of its project file, so that the project can be moved or opened on another "
+                f"computer (its paths are relative). That folder is:\n{folder}\n\nNot added:\n\n" + "\n".join(refused[:8])
+                + ("\n..." if len(refused) > 8 else "") + "\n\nTo use them, start a new project: remove all the images here, "
+                "then add the others.", parent=self.root)
+        known = {os.path.normcase(os.path.abspath(s.path)) for s in self.project.slides}
         for p in paths:
             p = os.path.normpath(p)
-            if p not in known:
-                self.project.slides.append(sp.Slide(p))
+            if p in refused or os.path.normcase(os.path.abspath(p)) in known:
+                continue
+            self.project.slides.append(sp.Slide(p))
         self.refresh_slide_list()
+        self.update_title()
         self.read_infos()
+
+    def save_slide_list(self):
+        """Write the project file (a new project's is named after the first image of the list as it is now). Done when going on from the
+        first tab, so that what is done there takes effect only then."""
+        if not self.project.slides:
+            return
+        try:
+            self.write_project(self.project)
+        except OSError as e:
+            self.var_status.set(f"Couldn't save the project: {e}")
+
+    def clear_project(self):
+        """Remove every image and start over: the project is new again, and gets its file (in the folder of the next image added) when
+        the first tab is left. The project file already saved, if any, is not touched."""
+        if not self.project.slides:
+            return
+        saved = f"\n\nThe project file {os.path.basename(self.project.path)} is kept as it is." if self.project.path else ""
+        if not messagebox.askyesno("Clear project", f"Remove all {len(self.project.slides)} image(s) from this project and start a new one?{saved}",
+                                   parent=self.root):
+            return
+        self.sync_project(save=False)
+        self.reset_project()
+        self.refresh_slide_list()
+        self.var_status.set("Cleared: add images to start a new project.")
+
+    def reset_project(self):
+        """Back to a new, empty project (when every image has been removed): the next image added starts a project file in its own folder."""
+        self.project = sp.Project()
+        self.infos, self.ov, self.ovc = {}, {}, {}
+        self.polys, self.undo, self.order, self.order_key = {}, {}, [], None
+        self.cur, self.waiting_for, self.pending_min_mm2 = 0, None, {}
+        self.update_title()
 
     def remove_slides(self):
         gone = {int(i) for i in self.slide_tree.selection()}
         if gone:
+            self.sync_project(save=False)            # (outlines worked on are written back before the list changes under them)
             self.project.slides = [s for i, s in enumerate(self.project.slides) if i not in gone]
             self.project.order = []
+            self.polys, self.undo = {}, {}           # (these are by position in the list: rebuilt from the slides' outlines)
+            self.cur = 0
+            if not self.project.slides:
+                self.reset_project()
             self.refresh_slide_list()
+
+    def row_menu_open(self, e):
+        """Right click on a file of the list: its menu (the row under the pointer is selected first, unless it already is)."""
+        row = self.slide_tree.identify_row(e.y)
+        if not row:
+            return
+        if row not in self.slide_tree.selection():
+            self.slide_tree.selection_set(row)
+        self.row_menu.tk_popup(e.x_root, e.y_root)
+
+    def copy_paths(self):
+        """The full path of each selected file, one to a line, onto the clipboard."""
+        rows = sorted(int(i) for i in self.slide_tree.selection())
+        text = "\n".join(os.path.normpath(self.project.slides[i].path) for i in rows if i < len(self.project.slides))
+        if text:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update()          # (so that the clipboard keeps it after this window closes)
+            self.var_status.set("Copied the path of 1 file to the clipboard." if len(rows) == 1 else f"Copied the paths of {len(rows)} files to the clipboard.")
 
     def move_slide(self, d):
         sel = [int(i) for i in self.slide_tree.selection()]
         if len(sel) != 1:
             return
-        i = sel[0]
-        j = i + d
-        if 0 <= j < len(self.project.slides):
-            sl = self.project.slides
-            sl[i], sl[j] = sl[j], sl[i]
-            self.project.order = []
-            self.refresh_slide_list()
-            self.slide_tree.selection_set(str(j))
+        self.move_slide_to(sel[0], sel[0] + d)
+
+    def move_slide_to(self, i, j):
+        """Move the image at position i of the list to position j."""
+        sl = self.project.slides
+        if i == j or not (0 <= i < len(sl) and 0 <= j < len(sl)):
+            return
+        self.sync_project(save=False)
+        sl.insert(j, sl.pop(i))
+        self.project.order = []
+        self.polys, self.undo = {}, {}
+        self.refresh_slide_list()
+        self.slide_tree.selection_set(str(j))
+
+    def row_press(self, e):
+        row = self.slide_tree.identify_row(e.y)
+        self.drag_row = int(row) if row and self.slide_tree.identify_region(e.x, e.y) == "cell" else None
+        self.drag_active = False
+        self.drag_start = (e.x, e.y)
+
+    def drop_index(self, y):
+        """Where in the list a row dropped at height y goes: 0 .. the number of rows (before the row under the pointer if y is in its
+        upper half, after it if in its lower half)."""
+        row = self.slide_tree.identify_row(y)
+        n = len(self.project.slides)
+        if not row:
+            return n if y > 0 else 0
+        k = int(row)
+        box = self.slide_tree.bbox(row)
+        if not box:
+            return k
+        return k + 1 if y > box[1] + box[3] / 2 else k
+
+    def row_drag(self, e):
+        if self.drag_row is None:
+            return
+        if not self.drag_active:
+            if abs(e.y - self.drag_start[1]) + abs(e.x - self.drag_start[0]) < 5:
+                return
+            self.drag_active = True
+            self.slide_tree.config(cursor="fleur")
+        t = self.drop_index(e.y)
+        n = len(self.project.slides)
+        box = self.slide_tree.bbox(self.slide_tree.get_children()[-1] if t >= n else str(t))
+        if box:
+            self.drop_line.place(x=0, y=(box[1] + box[3] if t >= n else box[1]) - 1, relwidth=1)
+        if e.y < 8:                                  # (near the edge of the list: it scrolls)
+            self.slide_tree.yview_scroll(-1, "units")
+        elif e.y > self.slide_tree.winfo_height() - 8:
+            self.slide_tree.yview_scroll(1, "units")
+
+    def row_drop(self, e):
+        self.drop_line.place_forget()
+        self.slide_tree.config(cursor="")
+        if self.drag_row is None or not self.drag_active:
+            self.drag_row = None
+            return
+        i, t = self.drag_row, self.drop_index(e.y)
+        self.drag_row, self.drag_active = None, False
+        self.move_slide_to(i, t - 1 if t > i else t)
 
     def open_recent_project(self):
         """A list of the recently used projects to choose from."""
@@ -476,6 +625,7 @@ class SectionLoader:
             return
         sp.add_recent_project(path)
         self.project = proj
+        self.var_shared.set(bool(proj.shared))
         self.update_title()
         self.infos, self.ov, self.ovc = {}, {}, {}
         self.order_key = proj.polygons_key() if proj.order else None
@@ -500,13 +650,21 @@ class SectionLoader:
         self.pan = None
         self.job = None
         self.panel_nav = []                # (previous, next) buttons of the panels at the right
+        self.grid_buttons = []             # the "Show all images" buttons of the panels
+        self.accept_all_buttons = []       # the "Accept detection for all images" buttons (only usable while all the images are shown)
+        self.grid_mode = False             # all the images shown on a grid
+        self.grid_rgb, self.grid_cells, self.grid_photos, self.grid_job = {}, [], [], None
+        self.grid_version = 0
+        self.grid_size = None
         # ---- the picture
         left = ttk.Frame(f)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         nav = ttk.Frame(left, padding=(8, 6))
         nav.pack(fill=tk.X)
-        # (a grid, so that when the window is narrow the image menu gives way, not the checkboxes beside it)
-        nav.columnconfigure(1, weight=1)
+        # (a grid: the arrows sit against the menu, the checkboxes are pushed to the right by a spacer column, and when the window is
+        # narrow the menu gives way (fit_combo), not the checkboxes beside it)
+        nav.columnconfigure(3, weight=1)
+        self.nav = nav
         self.btn_prev = ttk.Button(nav, text="◀", width=3, command=lambda: self.goto_slide(self.cur - 1))
         self.btn_prev.grid(row=0, column=0)
         self.var_slide = tk.StringVar(f, "")
@@ -518,10 +676,11 @@ class SectionLoader:
         self.btn_fwd = ttk.Button(nav, text="▶", width=3, command=lambda: self.goto_slide(self.cur + 1))
         self.btn_fwd.grid(row=0, column=2)
         self.var_scenes = tk.BooleanVar(f, False)
-        ttk.Checkbutton(nav, text="Show scene outlines", variable=self.var_scenes, command=self.redraw).grid(row=0, column=3, padx=(14, 0))
+        ttk.Checkbutton(nav, text="Show scene outlines", variable=self.var_scenes, command=self.redraw).grid(row=0, column=4, padx=(14, 0))
         self.var_color = tk.BooleanVar(f, False)
-        ttk.Checkbutton(nav, text="Show sections in color", variable=self.var_color, command=self.on_color).grid(row=0, column=4, padx=14)
-        ttk.Button(nav, text="Fit", width=5, command=self.fit_view).grid(row=0, column=5)
+        ttk.Checkbutton(nav, text="Show sections in color", variable=self.var_color, command=self.on_color).grid(row=0, column=5, padx=14)
+        ttk.Button(nav, text="Fit", width=5, command=self.fit_view).grid(row=0, column=6)
+        nav.bind("<Configure>", lambda e: self.fit_combo())
         self.canvas = tk.Canvas(left, bg="#202020", highlightthickness=0, cursor="arrow")
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.canvas.bind("<Configure>", lambda e: self.redraw())
@@ -533,6 +692,7 @@ class SectionLoader:
         self.canvas.bind("<Double-Button-1>", self.on_double)
         self.canvas.bind("<Motion>", self.on_motion)
         for key, fn in (("<Key-c>", lambda e: self.close_polygon()), ("<Key-C>", lambda e: self.close_polygon()),
+                        ("<Key-m>", lambda e: self.merge_key()), ("<Key-M>", lambda e: self.merge_key()),
                         ("<Delete>", lambda e: self.delete_selected()), ("<Escape>", lambda e: self.cancel_draw()),
                         ("<Control-z>", lambda e: self.undo_last())):
             self.root.bind(key, fn)
@@ -548,7 +708,8 @@ class SectionLoader:
         ttk.Label(p, text="Find the sections", font=("Segoe UI", 12, "bold")).pack(anchor="w")
         ttk.Label(p, text="Pixels brighter than the threshold are tinted blue. Move the slider until each section is tinted "
                           "as a whole and the debris is not.", wraplength=300, foreground="gray30").pack(anchor="w", pady=(2, 8))
-        ttk.Button(p, text="Apply current settings to all images", command=self.apply_to_all).pack(fill=tk.X, pady=(0, 12))
+        self.var_shared = tk.BooleanVar(f, False)
+        ttk.Checkbutton(p, text="Same settings for all images", variable=self.var_shared, command=self.on_shared).pack(anchor="w", pady=(0, 12))
         self.var_thr = tk.IntVar(f, 100)
         self.var_thr_text = tk.StringVar(f, "")
         ttk.Label(p, textvariable=self.var_thr_text).pack(anchor="w")
@@ -569,8 +730,9 @@ class SectionLoader:
         self.scale_pad.pack(fill=tk.X, pady=(0, 12))
         self.var_found = tk.StringVar(f, "")
         ttk.Label(p, textvariable=self.var_found, foreground="gray30").pack(anchor="w")
-        ttk.Button(p, text="Accept detection for this image", command=self.accept).pack(fill=tk.X, pady=(18, 0))
-        ttk.Button(p, text="Accept detection for all images", command=self.accept_all).pack(fill=tk.X, pady=(6, 0))
+        # one button: it accepts the image on show, or, while all the images are shown on the grid, all of them (and says so)
+        self.accept_button = ttk.Button(p, text="Accept detection for this image", command=self.accept_clicked)
+        self.accept_button.pack(fill=tk.X, pady=(18, 0))
         self.image_buttons(p)
         ttk.Label(p, text="The outline of each tinted region is drawn around its outside; holes inside it (ventricles) stay in.",
                   wraplength=300, foreground="gray40").pack(anchor="w", pady=8)
@@ -578,7 +740,7 @@ class SectionLoader:
         ttk.Label(p, text="Edit the outlines", font=("Segoe UI", 12, "bold")).pack(anchor="w")
         self.var_edit_help = tk.StringVar(f, "")
         ttk.Label(p, textvariable=self.var_edit_help, wraplength=300, foreground="gray30").pack(anchor="w", pady=(2, 12))
-        self.btn_merge = ttk.Button(p, text="Merge selected", command=self.merge_selected)
+        self.btn_merge = ttk.Button(p, text="Merge (M)", command=self.merge_selected)
         self.btn_merge.pack(fill=tk.X)
         self.btn_delete = ttk.Button(p, text="Delete selected", command=self.delete_selected)
         self.btn_delete.pack(fill=tk.X, pady=6)
@@ -587,12 +749,15 @@ class SectionLoader:
         self.btn_undo = ttk.Button(p, text="Undo", command=self.undo_last)
         self.btn_undo.pack(fill=tk.X, pady=6)
         ttk.Separator(p).pack(fill=tk.X, pady=12)
-        ttk.Button(p, text="Change the threshold", command=self.back_to_threshold).pack(fill=tk.X)
-        ttk.Button(p, text="Accept detection for all images", command=self.accept_all).pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(p, text="Change detect parameters", command=self.back_to_threshold).pack(fill=tk.X)
+        btn = ttk.Button(p, text="Accept detection for all images", command=self.accept_all)
+        btn.pack(fill=tk.X, pady=(6, 0))
+        self.accept_all_buttons.append(btn)
         self.image_buttons(p)
         ttk.Label(p, text="Click an outline to select it; shift-click adds to the selection. Merge joins two outlines along "
                           "their closest vertices (the two halves of a section). To draw one, click its points; double-click the "
                           "last point or press C to close it; Esc cancels.", wraplength=300, foreground="gray40").pack(anchor="w", pady=10)
+        self.update_slider_states()
         return f
 
     def image_buttons(self, parent):
@@ -604,6 +769,9 @@ class SectionLoader:
         nxt = ttk.Button(row, text="Next image", command=lambda: self.goto_slide(self.cur + 1))
         nxt.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
         self.panel_nav.append((prev, nxt))
+        grid = ttk.Button(parent, text="Show all images", command=self.toggle_grid)
+        grid.pack(fill=tk.X, pady=(6, 0))
+        self.grid_buttons.append(grid)
 
     def on_pick_image(self, event=None):
         i = self.combo.current()
@@ -615,7 +783,23 @@ class SectionLoader:
     def refresh_image_menu(self):
         n = len(self.project.slides)
         names = [f"Image {i + 1} of {n}:  {os.path.basename(s.path)}" for i, s in enumerate(self.project.slides)]
-        self.combo.config(values=names, width=min(max((len(t) for t in names), default=20) + 1, 80))
+        self.combo.config(values=names)
+        for b in self.grid_buttons:             # (a grid of all the images means nothing with just one)
+            b.config(state="normal" if n > 1 else "disabled")
+        self.combo_chars = max((len(t) for t in names), default=20) + 1      # (wide enough for the longest name)
+        self.fit_combo()
+
+    def fit_combo(self):
+        """The image menu as wide as its longest name needs, or as the row allows: the arrows stay against it, and the checkboxes and
+        the Fit button are never pushed out of view."""
+        import tkinter.font as tkfont
+        if not hasattr(self, "combo_chars"):
+            return
+        others = sum(w.winfo_reqwidth() for w in self.nav.grid_slaves(row=0) if w is not self.combo) + 150      # (the gaps, with some to spare)
+        avail = self.nav.winfo_width() - others
+        char = tkfont.Font(font=("Segoe UI", 11, "bold")).measure("0")
+        chars = self.combo_chars if avail <= 1 else min(self.combo_chars, max(int(avail // max(char, 1)), 6))
+        self.combo.config(width=min(chars, 80))
 
     # -- entering and leaving the stage
 
@@ -625,6 +809,8 @@ class SectionLoader:
         self.goto_slide(self.cur, force=True)
 
     def leave_detect(self):
+        if self.grid_mode:
+            self.set_grid_mode(False)
         self.sync_project()
 
     def slide(self):
@@ -638,6 +824,8 @@ class SectionLoader:
         self.cur = i
         s = self.slide()
         self.selected, self.draw_pts = set(), []
+        if self.grid_mode:
+            self.set_grid_mode(False)
         last = len(self.project.slides) - 1
         self.btn_prev.config(state="normal" if i else "disabled")
         self.btn_fwd.config(state="normal" if i < last else "disabled")
@@ -661,6 +849,8 @@ class SectionLoader:
         s = self.slide()
         img, geo = self.ov[s.path]
         self.set_base()
+        if self.project.shared:                   # (the settings are shared: this image has them too, not its own automatic ones)
+            self.apply_settings(s, self.project.shared)
         if s.threshold < 0:
             s.threshold = sp.auto_threshold(img)
         if s.path in self.pending_min_mm2:        # (a size asked for from another image, in mm2: in pixels now that the scale is known)
@@ -724,13 +914,13 @@ class SectionLoader:
         print(f"Project file: {path}", flush=True)
         return path
 
-    def sync_project(self):
-        """Write the editor's outlines of every slide visited back into the project, and save it."""
+    def sync_project(self, save=True):
+        """Write the editor's outlines of every slide visited back into the project, and (unless save is False) save it."""
         for i, polys in self.polys.items():
             s = self.project.slides[i]
             if s.path in self.ov:
                 s.polygons = [self.to_slide(p, s.path) for p in polys]
-        if self.project.slides and any(s.polygons for s in self.project.slides):
+        if save and self.project.slides and any(s.polygons for s in self.project.slides):
             try:
                 self.write_project(self.project)
             except OSError as e:
@@ -782,6 +972,7 @@ class SectionLoader:
             return
         self.slide().threshold = int(round(float(v)))
         self.update_labels()
+        self.sync_shared()
         self.schedule_mask()
 
     def on_min_area(self, v):
@@ -789,6 +980,7 @@ class SectionLoader:
             return
         self.slide().min_area = max(int(round(float(v) / self.px_mm2())), 1)
         self.update_labels()
+        self.sync_shared()
         self.schedule_mask()
 
     def on_smooth(self, v):
@@ -798,6 +990,7 @@ class SectionLoader:
         if n != self.slide().smooth:
             self.slide().smooth = n
             self.update_labels()
+            self.sync_shared()
             self.schedule_mask()
 
     def on_pad(self, v):
@@ -807,6 +1000,7 @@ class SectionLoader:
         if n != self.slide().pad:
             self.slide().pad = n
             self.update_labels()
+            self.sync_shared()
             self.schedule_mask()
 
     def schedule_mask(self):
@@ -816,7 +1010,7 @@ class SectionLoader:
 
     def recompute_mask(self):
         self.job = None
-        if self.base_rgb is None or self.mode != "threshold":
+        if self.base_rgb is None or self.mode != "threshold" or self.grid_mode:
             return
         s = self.slide()
         img = self.ov[s.path][0]
@@ -838,28 +1032,75 @@ class SectionLoader:
         self.sync_project()
         self.set_mode("edit")
 
-    def apply_to_all(self):
-        """Give every other image the settings on show: brightness threshold, smallest region (the same area in mm2, whatever the
-        image's scale), smoothing and padding. Images whose detection has been accepted are left as they are."""
+    def apply_settings(self, s, shared):
+        """Give image `s` the shared settings: brightness threshold, smoothing, padding, and the smallest region (the same area in mm2,
+        whatever the image's scale)."""
+        s.threshold, s.smooth, s.pad = shared["threshold"], shared["smooth"], shared["pad"]
+        if s.path in self.ov:
+            k = self.ov[s.path][1][2]
+            side = k * (self.slide_px(s) or 0.65) / 1000
+            s.min_area = max(int(round(shared["min_mm2"] / (side * side))), 1)
+            self.pending_min_mm2.pop(s.path, None)
+        else:
+            self.pending_min_mm2[s.path] = shared["min_mm2"]
+
+    def sync_shared(self):
+        """While the settings are shared: the image on show sets them for all the others."""
+        if not self.project.shared:
+            return
         cur = self.slide()
-        mm2 = self.min_area_mm2()
-        n = skipped = 0
+        self.project.shared = dict(threshold=cur.threshold, smooth=cur.smooth, pad=cur.pad, min_mm2=self.min_area_mm2())
         for i, s in enumerate(self.project.slides):
-            if i == self.cur:
-                continue
-            if s.accepted:
-                skipped += 1
-                continue
-            s.threshold, s.smooth, s.pad = cur.threshold, cur.smooth, cur.pad
-            if s.path in self.ov:
-                k = self.ov[s.path][1][2]
-                side = k * (self.slide_px(s) or 0.65) / 1000
-                s.min_area = max(int(round(mm2 / (side * side))), 1)
-            else:
-                self.pending_min_mm2[s.path] = mm2
-            n += 1
-        self.var_status.set(f"Threshold {cur.threshold}, smoothing {cur.smooth} px, padding {cur.pad} px and smallest region {mm2:.2f} mm² "
-                            f"applied to {n} other image(s)" + (f"; {skipped} already accepted left as they are." if skipped else "."))
+            if i != self.cur:
+                self.apply_settings(s, self.project.shared)
+        if self.grid_mode:
+            self.schedule_grid()
+
+    def on_shared(self):
+        """"Same settings for all images": checked, the settings on show become every image's (each image's own are kept); unchecked,
+        every image goes back to its own."""
+        slides = self.project.slides
+        if self.base_rgb is None or not slides:
+            self.var_shared.set(bool(self.project.shared))
+            return
+        if self.var_shared.get():
+            for s in slides:
+                s.own = dict(threshold=s.threshold, smooth=s.smooth, pad=s.pad, min_area=s.min_area)
+            cur = self.slide()
+            self.project.shared = dict(threshold=cur.threshold, smooth=cur.smooth, pad=cur.pad, min_mm2=self.min_area_mm2())
+            for i, s in enumerate(slides):
+                if i != self.cur:
+                    self.apply_settings(s, self.project.shared)
+            self.var_status.set("The settings on show are now every image's.")
+        else:
+            for s in slides:
+                if s.own:
+                    s.threshold, s.smooth, s.pad, s.min_area = (s.own["threshold"], s.own["smooth"], s.own["pad"], s.own["min_area"])
+                s.own = None
+                self.pending_min_mm2.pop(s.path, None)
+            self.project.shared = None
+            self.var_status.set("Each image has its own settings again.")
+            if self.mode == "threshold":
+                self.set_mode("threshold")
+        self.update_slider_states()
+        if self.grid_mode:
+            self.schedule_grid()
+
+    def update_slider_states(self):
+        """The sliders work on one image: on the grid of all of them they are greyed out, unless the settings are shared."""
+        state = "disabled" if (self.grid_mode and not self.var_shared.get()) else "normal"
+        for sc in (self.scale_thr, self.scale_min, self.scale_smooth, self.scale_pad):
+            sc.config(state=state)
+        for btn in self.accept_all_buttons:       # (the edit view's button: for all the images, usable while they are all shown)
+            btn.config(state="normal" if self.grid_mode else "disabled")
+        self.accept_button.config(text="Accept detection for all images" if self.grid_mode else "Accept detection for this image")
+
+    def accept_clicked(self):
+        """The accept button: the image on show, or all the images when they are shown on the grid."""
+        if self.grid_mode:
+            self.accept_all()
+        else:
+            self.accept()
 
     def accept_all(self):
         """Accept the detection for every image not accepted yet: each with its own brightness threshold (the automatic one where it
@@ -871,11 +1112,16 @@ class SectionLoader:
             return
         cur = self.slide()
         smooth, pad, min_mm2 = cur.smooth, cur.pad, self.min_area_mm2()
+        if self.project.shared:
+            how = (f"All of them use the same settings, those now displayed: brightness threshold {cur.threshold}, smoothing {smooth} px, "
+                   f"padding {pad} px and smallest region {min_mm2:.2f} mm².")
+        else:
+            how = ("Each uses its own brightness threshold (the automatic one if you haven't set it), with the smoothing, "
+                   "padding and smallest region now displayed in the panel.")
         if not messagebox.askyesno(
                 "Accept detection for all images",
-                f"Accept the detection for the {len(targets)} image(s) that aren't accepted yet?\n\n"
-                "Each uses its own brightness threshold (the automatic one if you haven't set it), with this image's smoothing, "
-                "padding and smallest region. Images already accepted stay as they are, and you can still edit any of them.",
+                f"Accept the detection for the {len(targets)} image(s) that aren't accepted yet?\n\n" + how
+                + " Images already accepted stay as they are, and you can still edit any of them.",
                 parent=self.root):
             return
         jobs = [(i, slides[i].path, slides[i].threshold, self.slide_px(slides[i]) or 0.65, self.ov.get(slides[i].path)) for i in targets]
@@ -909,6 +1155,8 @@ class SectionLoader:
             if self.cur in targets and self.stage == 1 and self.base_rgb is not None:
                 self.selected = set()
                 self.set_mode("edit")
+            if self.grid_mode:                       # (the grid shows the outlines of the images just accepted, not the blue preview)
+                self.start_grid()
             self.var_status.set(f"Accepted the detection for {len(res)} image(s): "
                                 f"{sum(len(slides[i].polygons) for i, *_ in res)} outlines in all.")
 
@@ -921,7 +1169,7 @@ class SectionLoader:
 
     def back_to_threshold(self):
         if self.polys.get(self.cur) and not messagebox.askyesno(
-                "Change the threshold", "Finding the sections again replaces the outlines of this slide, including any you have edited. Go on?",
+                "Change detect parameters", "Finding the sections again replaces the outlines of this image, including any you have edited. Go on?",
                 parent=self.root):
             return
         self.slide().accepted = False
@@ -952,7 +1200,13 @@ class SectionLoader:
         self.polys[self.cur] = self.undo[self.cur].pop()
         self.selected = set()
         self.update_edit_help()
+        self.sync_project()
         self.redraw()
+
+    def merge_key(self):
+        """The M key: the same as the Merge button (which is usable only for two or more selected outlines in the editing view)."""
+        if self.stage == 1 and self.mode == "edit" and not self.grid_mode and len(self.selected) >= 2:
+            self.merge_selected()
 
     def merge_selected(self):
         idx = sorted(self.selected)
@@ -967,6 +1221,7 @@ class SectionLoader:
         self.polys[self.cur] = self.sorted_polys(keep)
         self.selected = {next(i for i, p in enumerate(self.polys[self.cur]) if p is merged)}
         self.update_edit_help()
+        self.sync_project()           # (saved at once: an edit is not lost if the window is closed)
         self.redraw()
 
     def delete_selected(self):
@@ -976,6 +1231,7 @@ class SectionLoader:
         self.polys[self.cur] = [p for i, p in enumerate(self.polys[self.cur]) if i not in self.selected]
         self.selected = set()
         self.update_edit_help()
+        self.sync_project()
         self.redraw()
 
     def start_draw(self):
@@ -1009,6 +1265,7 @@ class SectionLoader:
         self.draw_pts = []
         self.canvas.config(cursor="arrow")
         self.update_edit_help()
+        self.sync_project()
         self.redraw()
 
     # -- the picture
@@ -1024,6 +1281,145 @@ class SectionLoader:
         s = min(cw / w, ch / h) * 0.98
         self.view = (s, (cw - w * s) / 2, (ch - h * s) / 2)
         self.redraw()
+
+    # -- all the images on a grid
+
+    def toggle_grid(self):
+        self.set_grid_mode(not self.grid_mode)
+
+    def set_grid_mode(self, on):
+        self.grid_mode = on
+        for b in self.grid_buttons:
+            b.config(text="Show one image" if on else "Show all images")
+        if on:
+            self.sync_project(save=False)             # (outlines worked on are written back, to be drawn here)
+            self.selected, self.draw_pts = set(), []
+            self.grid_rgb = {}
+            for s in self.project.slides:
+                self.want(s.path)
+            self.canvas.config(cursor="arrow")
+        self.update_slider_states()
+        if on:
+            self.start_grid()
+        self.redraw()
+
+    def grid_layout(self):
+        """(columns, rows, picture width, picture height) of the grid that gives the pictures the most room in the window."""
+        cw, ch = self.canvas_size()
+        n = max(len(self.project.slides), 1)
+        ars = [self.ov[s.path][0].shape[1] / self.ov[s.path][0].shape[0] for s in self.project.slides if s.path in self.ov]
+        ar = float(np.median(ars)) if ars else 1.6
+        best = None
+        for cols in range(1, n + 1):
+            rows = -(-n // cols)
+            w, h = cw / cols - 10, ch / rows - 10 - GRID_LABEL
+            if w < 20 or h < 20:
+                continue
+            size = min(w, h * ar)
+            if best is None or size > best[0]:
+                best = (size, cols, rows, w, h)
+        if best is None:
+            return n, 1, max(cw / n - 10, 20), max(ch - 10 - GRID_LABEL, 20)
+        return best[1:]
+
+    def schedule_grid(self):
+        if self.grid_job is not None:
+            self.root.after_cancel(self.grid_job)
+        self.grid_job = self.root.after(150, self.start_grid)
+
+    def start_grid(self):
+        """Make the pictures of the grid in the background (the settings and outlines of each image as they are now)."""
+        self.grid_job = None
+        if not self.grid_mode:
+            return
+        self.grid_version += 1
+        cols, rows, w, h = self.grid_layout()
+        self.grid_size = self.canvas_size()
+        color = bool(self.var_color.get())
+        jobs = []
+        for i, s in enumerate(self.project.slides):
+            ov = self.ov.get(s.path)
+            if ov is None:
+                continue
+            gray, (x0, y0, k) = ov
+            side = k * (self.slide_px(s) or 0.65) / 1000
+            if s.path in self.pending_min_mm2:
+                min_area = max(int(round(self.pending_min_mm2[s.path] / (side * side))), 1)
+            elif s.min_area >= 0:
+                min_area = s.min_area
+            else:
+                min_area = max(int(round(DEFAULT_MIN_AREA_MM2 / (side * side))), 1)
+            polys = None
+            if s.accepted:
+                polys = self.polys.get(i)
+                if polys is None:
+                    polys = [(p - np.array([x0, y0])) / k for p in s.polygons]
+            jobs.append((i, gray, self.ovc.get(s.path) if color else None, s.threshold if s.threshold >= 0 else None,
+                         min_area, s.smooth, s.pad, polys))
+        threading.Thread(target=self.grid_worker, args=(self.grid_version, jobs, int(w), int(h)), daemon=True).start()
+
+    def grid_worker(self, version, jobs, tw, th):
+        ns.lower_thread_priority()
+        for i, gray, rgb_full, thr, min_area, smooth, pad, polys in jobs:
+            if version != self.grid_version:
+                return
+            H, W = gray.shape
+            f = min(tw / W, th / H)
+            w2, h2 = max(int(W * f), 1), max(int(H * f), 1)
+            small = cv2.resize(gray, (w2, h2), interpolation=cv2.INTER_AREA)
+            base = cv2.resize(rgb_full, (w2, h2), interpolation=cv2.INTER_AREA) if rgb_full is not None else np.repeat(small[:, :, None], 3, axis=2)
+            if polys is None:      # (not accepted: the detection as the sliders have it now, at this size)
+                t = thr if thr is not None else sp.auto_threshold(gray)
+                sm = max(int(round(smooth * f)), 1) if smooth else 0
+                pd = max(int(round(pad * f)), 1) if pad else 0
+                mask = sp.fill_holes(sp.detect_mask(small, t, max(int(round(min_area * f * f)), 1), sm, pd)).astype(bool)
+                tinted = base.astype(np.float32)
+                a = 0.3 if rgb_full is not None else 0.55
+                tinted[mask] = tinted[mask] * (1 - a) + TINT * a
+                base = tinted.astype(np.uint8)
+            else:                  # (accepted: its outlines)
+                for n, q in enumerate(polys, 1):
+                    pts = np.asarray(q, float) * f
+                    cv2.polylines(base, [np.round(pts).astype(np.int32)], True, (255, 212, 0), 1, cv2.LINE_AA)
+                    # the outline's number, as in the single-image view, at its centre (its size follows the outline's)
+                    scale = float(np.clip(np.sqrt(abs(sp.signed_area(pts))) / 70, 0.35, 0.9))
+                    thick = 1 if scale < 0.6 else 2
+                    (tw_, th_), _ = cv2.getTextSize(str(n), cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+                    cx, cy = sp.polygon_centroid(pts)
+                    cv2.putText(base, str(n), (int(cx - tw_ / 2), int(cy + th_ / 2)), cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 212, 0), thick, cv2.LINE_AA)
+            self.msgs.put(("grid", (version, i, base)))
+
+    def draw_grid(self):
+        c = self.canvas
+        slides = self.project.slides
+        if not slides:
+            return
+        size = self.canvas_size()
+        if self.grid_size is not None and size != self.grid_size and self.grid_job is None:
+            self.schedule_grid()                        # (the window changed size: the pictures are made again to fit)
+        cols, rows, w, h = self.grid_layout()
+        cw, ch = size
+        self.grid_cells, self.grid_photos = [], []
+        for i, s in enumerate(slides):
+            col, row = i % cols, i // cols
+            x0, y0 = col * (cw / cols) + 5, row * (ch / rows) + 5
+            rgb = self.grid_rgb.get(i)
+            if rgb is not None:
+                ph = ImageTk.PhotoImage(Image.fromarray(rgb))
+                self.grid_photos.append(ph)
+                ix, iy = x0 + (w - rgb.shape[1]) / 2, y0 + (h - rgb.shape[0]) / 2
+                c.create_image(ix, iy, image=ph, anchor="nw")
+                box = (ix, iy, ix + rgb.shape[1], iy + rgb.shape[0])
+            else:
+                box = (x0, y0, x0 + w, y0 + h)
+                c.create_rectangle(*box, outline="#555555")
+                c.create_text((box[0] + box[2]) / 2, (box[1] + box[3]) / 2, text="loading...", fill="#a0a0a0", font=("Segoe UI", 10))
+            if i == self.cur:
+                c.create_rectangle(box[0] - 2, box[1] - 2, box[2] + 2, box[3] + 2, outline=ACCENT, width=3)
+            name = os.path.basename(s.path)
+            c.create_text(x0 + 2, y0 + h + 3, anchor="nw", fill="white", font=("Segoe UI", 9, "bold" if i == self.cur else "normal"),
+                          text=f"{i + 1}  {name if len(name) < 34 else name[:15] + '...' + name[-16:]}" + ("   \u2713" if s.accepted else ""))
+            self.grid_cells.append((box[0], box[1], box[2], box[3] + GRID_LABEL, i))
 
     def fit_scale(self):
         h, w = self.base_rgb.shape[:2]
@@ -1052,6 +1448,9 @@ class SectionLoader:
     def redraw(self):
         c = self.canvas
         c.delete("all")
+        if self.stage == 1 and self.grid_mode:
+            self.draw_grid()
+            return
         if self.stage != 1 or self.base_rgb is None:
             return
         if self.view is None:
@@ -1106,7 +1505,7 @@ class SectionLoader:
                 c.create_oval(x - 3, y - 3, x + 3, y + 3, fill=DRAW_COLOR, outline="")
 
     def on_wheel(self, e):
-        if self.base_rgb is None or self.view is None:
+        if self.grid_mode or self.base_rgb is None or self.view is None:
             return
         s, ox, oy = self.view
         f = 1.25 if e.delta > 0 else 1 / 1.25
@@ -1116,15 +1515,23 @@ class SectionLoader:
         self.redraw()
 
     def pan_start(self, e):
+        if self.grid_mode:
+            return
         self.pan = (e.x, e.y, self.view)
 
     def pan_move(self, e):
-        if self.pan and self.view:
+        if not self.grid_mode and self.pan and self.view:
             x, y, (s, ox, oy) = self.pan
             self.view = self.clamp_view((s, ox + e.x - x, oy + e.y - y))
             self.redraw()
 
     def on_click(self, e, shift=False):
+        if self.stage == 1 and self.grid_mode:
+            for x0, y0, x1, y1, i in self.grid_cells:      # (a click on an image opens it)
+                if x0 <= e.x <= x1 and y0 <= e.y <= y1:
+                    self.goto_slide(i)
+                    return
+            return
         if self.stage != 1 or self.base_rgb is None or self.view is None:
             return
         self.canvas.focus_set()
@@ -1152,11 +1559,11 @@ class SectionLoader:
             self.redraw()
 
     def on_double(self, e):
-        if self.mode == "draw":
+        if not self.grid_mode and self.mode == "draw":
             self.close_polygon()
 
     def on_motion(self, e):
-        if self.mode == "draw" and self.draw_pts and self.view:
+        if not self.grid_mode and self.mode == "draw" and self.draw_pts and self.view:
             self.redraw()
             last = self.to_canvas([self.draw_pts[-1]])[0]
             self.canvas.create_line(last[0], last[1], e.x, e.y, fill=DRAW_COLOR, dash=(4, 3))
