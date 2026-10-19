@@ -332,6 +332,64 @@ def sort_by_scene(polys, boxes, to_slide):
     return [t[3] for t in keyed], [t[0] for t in keyed]
 
 
+def split_polygon(p, min_steps=2, min_part=0.1):
+    """Two outlines from one, cut along the chord between the pair of its vertices with the lowest ratio of straight-line distance to
+    steps along the outline (the shorter way round). A neck, where the outline comes close to itself after a long way round, scores
+    lowest; so does the bridge a merge leaves (a chord of no length), which this undoes. Pairs are tried from the lowest ratio up, and
+    the first that leaves each part with at least `min_part` of the area (a bridge needs no such size) and `min_steps` + 1 vertices
+    is used: without that the lowest ratios are of the tiny bumps where the outline's vertices crowd together. Returns (a, b), or None
+    if no cut is possible."""
+    p = np.asarray(p, float)
+    n = len(p)
+    if n < 2 * min_steps + 2:
+        return None
+    cands = []
+    for i in range(n - 1):
+        j = np.arange(i + min_steps, n)
+        steps = np.minimum(j - i, n - (j - i))
+        ok = steps >= min_steps
+        if not ok.any():
+            continue
+        j, steps = j[ok], steps[ok]
+        d = np.hypot(p[j, 0] - p[i, 0], p[j, 1] - p[i, 1])
+        cands += [(float(dd / ss), float(dd), i, int(jj)) for dd, ss, jj in zip(d, steps, j)]
+    cands.sort()
+    total = abs(signed_area(p))
+    for ratio, d, i, j in cands:
+        a, b = p[i:j + 1], np.vstack([p[j:], p[:i + 1]])
+        if d < 1e-6 or min(abs(signed_area(a)), abs(signed_area(b))) >= min_part * total:
+            return a.copy(), b
+    return None
+
+
+def merge_group(polys):
+    """One outline from several: it starts from the biggest and takes in, one at a time, the one nearest to what it has so far (each is
+    joined along the two closest vertices, as merge_polygons does)."""
+    rest = sorted(polys, key=lambda q: -abs(signed_area(q)))
+    merged = rest.pop(0)
+    while rest:
+        near = min(range(len(rest)), key=lambda i: float(np.min(np.hypot(merged[:, None, 0] - rest[i][None, :, 0],
+                                                                         merged[:, None, 1] - rest[i][None, :, 1]))))
+        merged = merge_polygons(merged, rest.pop(near))
+    return merged
+
+
+def merge_within_scenes(polys, boxes):
+    """The outlines (in slide pixels) with all those in one scene merged into one: (the new list in scene order, the number of scenes
+    where that was done)."""
+    by_scene = {}
+    for q in polys:
+        c = polygon_centroid(q)
+        by_scene.setdefault(scene_of(boxes, c[0], c[1]), []).append(q)
+    out, n = [], 0
+    for scene in sorted(by_scene):
+        group = by_scene[scene]
+        if len(group) > 1:
+            n += 1
+        out.append(merge_group(group) if len(group) > 1 else group[0])
+    return sort_by_scene(out, boxes, lambda q: q)[0], n
+
+
 def signed_area(p):
     x, y = p[:, 0], p[:, 1]
     return 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))

@@ -742,6 +742,10 @@ class SectionLoader:
         ttk.Label(p, textvariable=self.var_edit_help, wraplength=300, foreground="gray30").pack(anchor="w", pady=(2, 12))
         self.btn_merge = ttk.Button(p, text="Merge (M)", command=self.merge_selected)
         self.btn_merge.pack(fill=tk.X)
+        self.btn_split = ttk.Button(p, text="Split", command=self.split_selected)
+        self.btn_split.pack(fill=tk.X, pady=(6, 0))
+        self.btn_merge_scenes = ttk.Button(p, text="Merge all images within scenes", command=self.merge_all_within_scenes)
+        self.btn_merge_scenes.pack(fill=tk.X, pady=(6, 0))
         self.btn_delete = ttk.Button(p, text="Delete selected", command=self.delete_selected)
         self.btn_delete.pack(fill=tk.X, pady=6)
         self.btn_add = ttk.Button(p, text="Add an outline...", command=self.start_draw)
@@ -1185,6 +1189,9 @@ class SectionLoader:
             self.var_edit_help.set(f"{n} outline(s), numbered in the order of the scenes of the .czi; {sel} selected.")
         for b in (self.btn_merge,):
             b.config(state="normal" if sel >= 2 and self.mode == "edit" else "disabled")
+        self.btn_split.config(state="normal" if sel == 1 and self.mode == "edit" else "disabled")
+        # (scenes are a .czi's: an image of one section has none to merge within)
+        self.btn_merge_scenes.config(state="disabled" if self.project.slides and sp.is_jp2(self.slide().path) else "normal")
         self.btn_delete.config(state="normal" if sel and self.mode == "edit" else "disabled")
         self.btn_add.config(state="normal" if self.mode == "edit" else "disabled")
         self.btn_undo.config(state="normal" if self.undo.get(self.cur) and self.mode == "edit" else "disabled")
@@ -1202,6 +1209,66 @@ class SectionLoader:
         self.update_edit_help()
         self.sync_project()
         self.redraw()
+
+    def merge_all_within_scenes(self):
+        """Merge, in every accepted image, all the outlines that lie in one scene into a single outline (the fragments of a section:
+        two hemispheres, a piece broken off). Outlines are counted in the scene their centre is in."""
+        slides = self.project.slides
+        self.sync_project(save=False)
+        plan = []
+        for i, s in enumerate(slides):
+            if not s.accepted or len(s.polygons) < 2 or sp.is_jp2(s.path):      # (only a .czi has scenes)
+                continue
+            merged, n = sp.merge_within_scenes(s.polygons, sp.scene_boxes(s.path))
+            if n:
+                plan.append((i, merged, n, len(s.polygons) - len(merged)))
+        if not plan:
+            messagebox.showinfo("Merge within scenes", "No scene of any accepted image has more than one outline.", parent=self.root)
+            return
+        total_scenes = sum(n for _, _, n, _ in plan)
+        total_outlines = sum(d for _, _, _, d in plan)
+        if not messagebox.askyesno(
+                "Merge all images within scenes",
+                f"In {len(plan)} image(s), {total_scenes} scene(s) have more than one outline. Merging each scene's outlines into one "
+                f"takes away {total_outlines} outline(s).\n\nFragments are joined along their closest points, so a small piece far "
+                "from the section would be joined to it by a thin bridge: delete stray pieces first. Only the image on show can be "
+                "undone afterwards. Go on?", parent=self.root):
+            return
+        for i, merged, n, d in plan:
+            s = slides[i]
+            if i == self.cur and i in self.polys:
+                self.push_undo()                       # (the image on show can be undone)
+            s.polygons = merged
+            self.polys.pop(i, None)
+            if s.path in self.ov:
+                x0, y0, k = self.ov[s.path][1]
+                self.polys[i] = [(q - np.array([x0, y0])) / k for q in merged]
+        self.selected = set()
+        self.sync_project()
+        self.update_edit_help()
+        if self.grid_mode:
+            self.start_grid()
+        self.redraw()
+        self.var_status.set(f"Merged the outlines within {total_scenes} scene(s) of {len(plan)} image(s): {total_outlines} outline(s) fewer.")
+
+    def split_selected(self):
+        """Cut the selected outline in two along the chord whose ends are closest together for the way round the outline between them
+        (see sp.split_polygon): the pieces of a pinched outline come apart, and a merge is undone."""
+        if self.stage != 1 or self.mode != "edit" or len(self.selected) != 1:
+            return
+        i = next(iter(self.selected))
+        parts = sp.split_polygon(self.polys[self.cur][i])
+        if parts is None:
+            self.var_status.set("This outline is too small to split.")
+            return
+        self.push_undo()
+        keep = [q for k, q in enumerate(self.polys[self.cur]) if k != i] + list(parts)
+        self.polys[self.cur] = self.sorted_polys(keep)
+        self.selected = {k for k, q in enumerate(self.polys[self.cur]) if any(q is part for part in parts)}
+        self.update_edit_help()
+        self.sync_project()
+        self.redraw()
+        self.var_status.set("Split into two outlines (Undo goes back).")
 
     def merge_key(self):
         """The M key: the same as the Merge button (which is usable only for two or more selected outlines in the editing view)."""
