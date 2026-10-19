@@ -91,7 +91,7 @@ comparing converted files with NeuroInfo's own.
 
 ## SECTION WORKFLOW (from slide scans to an aligned stack)
 
-Double-click `RUN_jpx_aligner.bat` for the start window, with two steps in order:
+Double-click `RUN_WORKFLOW.bat` for the start window, with two steps in order:
 
 1. **Load / detect images** (`section_loader.py`): choose Zeiss `.czi` slide scans; for each slide, set a
    brightness threshold (the preview tints what will be found) and accept it to outline each section
@@ -103,7 +103,7 @@ Double-click `RUN_jpx_aligner.bat` for the start window, with two steps in order
 ## JPX ALIGNER (adjust NeuroInfo section stacks)
 
 NeuroInfo's serial section assembler can't revise an alignment once it's made. `jpx_aligner.py`
-(double-click `RUN_jpx_aligner.bat`) opens a NeuroInfo `reconstruction.jpx` (with the
+(double-click `RUN_WORKFLOW.bat`) opens a NeuroInfo `reconstruction.jpx` (with the
 `reconstruction.xml` and `CaseFile.H5` NeuroInfo writes beside it) and lets you move, rotate and
 flip individual sections against their neighbors, then exports a new JPX that NeuroInfo opens.
 

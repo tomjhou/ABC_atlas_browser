@@ -41,6 +41,8 @@ def choose():
          "Choose slide scans (.czi), find the sections on them, and put the sections in order.", "detect", True)
     card("2", "Align images",
          "Line up the sections and export the stack. Opens the sections from step 1, or a JPX you already have.", "align", False)
+    ttk.Separator(outer).pack(fill=tk.X, pady=(14, 8))
+    ttk.Button(outer, text="Exit", width=10, command=root.destroy).pack(side=tk.BOTTOM, anchor="e")
     root.mainloop()
     return choice[0] if choice else None
 

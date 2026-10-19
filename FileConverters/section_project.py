@@ -238,9 +238,9 @@ class Project:
             if not os.path.isfile(p):      # (the slide may have moved with the project file: look beside it)
                 alt = os.path.join(os.path.dirname(os.path.abspath(path)), os.path.basename(p))
                 p = alt if os.path.isfile(alt) else p
-            slides.append(Slide(p, d.get("threshold", -1), d.get("min_area", 200),
-                                [np.array(q, float).reshape(-1, 2) for q in d["polygons"]], d.get("accepted", False),
-                                d.get("smooth", 8)))
+            slides.append(Slide(p, threshold=d.get("threshold", -1), min_area=d.get("min_area", 200), smooth=d.get("smooth", 8),
+                                polygons=[np.array(q, float).reshape(-1, 2) for q in d["polygons"]],
+                                accepted=d.get("accepted", False)))
         proj = Project(slides, [tuple(o) for o in doc.get("order", [])], os.path.abspath(path))
         return proj
 

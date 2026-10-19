@@ -1725,6 +1725,7 @@ def export_stack(stack, out_path, quality_db=DEFAULT_QUALITY_DB, rerender_all=Fa
     the opened file are copied unchanged unless rerender_all (a stack made in memory from slide scans has no file to copy from:
     every section is rendered, and the JPX is written from scratch).
     progress(i, n, text) is called before each section."""
+    t_export = time.time()
     fresh = not stack.jpx_path
     frames = [] if fresh else [b for b in read_boxes(stack.jpx_path) if b.kind == b"jp2c"]
     # (a section whose source image cannot be read, e.g. a .czi, is never re-rendered: its frame is copied as it is)
@@ -1779,8 +1780,10 @@ def export_stack(stack, out_path, quality_db=DEFAULT_QUALITY_DB, rerender_all=Fa
     else:
         write_jpx_like(stack.jpx_path, codestreams, out_path, extra_payloads=extra,
                        pixel_um=stack.pixel_um if stack.pixel_corrected else None)
+    elapsed = time.time() - t_export
     log(f"Wrote {out_path} ({os.path.getsize(out_path) / 1e6:.0f} MB; {n_render} re-rendered, "
         f"{len(stack.sections) - n_render} copied)")
+    log(f"Export took {elapsed:.1f} s in total" + (f" ({elapsed / n_render:.1f} s per re-rendered section)" if n_render else "") + ".")
     return n_render
 
 
