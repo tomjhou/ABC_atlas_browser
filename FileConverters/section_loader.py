@@ -626,6 +626,7 @@ class SectionLoader:
         sp.add_recent_project(path)
         self.project = proj
         self.var_shared.set(bool(proj.shared))
+        self.var_numbering.set(proj.numbering)
         self.update_title()
         self.infos, self.ov, self.ovc = {}, {}, {}
         self.order_key = proj.polygons_key() if proj.order else None
@@ -702,6 +703,12 @@ class SectionLoader:
         right.pack_propagate(False)
         left.pack_forget()                 # (packed again after the panel, so that a wide row above the picture can't push it off)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # how the outlines are numbered (for all the images): by scene number, across then down, or down then across
+        number_box = ttk.LabelFrame(right, text="Number the outlines", padding=(8, 2, 8, 4))
+        number_box.pack(fill=tk.X, pady=(0, 10))
+        self.var_numbering = tk.StringVar(f, "scene")
+        for value, text in (("rows", "Order by rows"), ("columns", "Order by columns"), ("scene", "Order by scene number")):
+            ttk.Radiobutton(number_box, text=text, value=value, variable=self.var_numbering, command=self.on_numbering).pack(anchor="w")
         self.panel_threshold = ttk.Frame(right)
         self.panel_edit = ttk.Frame(right)
         p = self.panel_threshold
@@ -744,7 +751,7 @@ class SectionLoader:
         self.btn_merge.pack(fill=tk.X)
         self.btn_split = ttk.Button(p, text="Split", command=self.split_selected)
         self.btn_split.pack(fill=tk.X, pady=(6, 0))
-        self.btn_merge_scenes = ttk.Button(p, text="Merge all images within scenes", command=self.merge_all_within_scenes)
+        self.btn_merge_scenes = ttk.Button(p, text="Merge contours within scenes", command=self.merge_all_within_scenes)
         self.btn_merge_scenes.pack(fill=tk.X, pady=(6, 0))
         self.btn_delete = ttk.Button(p, text="Delete selected", command=self.delete_selected)
         self.btn_delete.pack(fill=tk.X, pady=6)
@@ -1128,6 +1135,7 @@ class SectionLoader:
                 + " Images already accepted stay as they are, and you can still edit any of them.",
                 parent=self.root):
             return
+        numbering = self.project.numbering
         jobs = [(i, slides[i].path, slides[i].threshold, self.slide_px(slides[i]) or 0.65, self.ov.get(slides[i].path)) for i in targets]
         self.var_status.set(f"Finding the sections of {len(targets)} images...")
 
@@ -1140,7 +1148,7 @@ class SectionLoader:
                     thr = sp.auto_threshold(gray)
                 min_area = max(int(round(min_mm2 / ((k * px / 1000) ** 2))), 1)
                 polys = sp.mask_to_polygons(sp.detect_mask(gray, thr, min_area, smooth, pad))
-                polys = sp.sort_by_scene(polys, sp.scene_boxes(path), lambda q: q * k + np.array([x0, y0]))[0]
+                polys = sp.sort_by_scene(polys, sp.scene_boxes(path), lambda q: q * k + np.array([x0, y0]), numbering)[0]
                 out.append((i, thr, min_area, polys, (x0, y0, k)))
             return out
 
@@ -1166,10 +1174,35 @@ class SectionLoader:
 
         self.background(work, done)
 
+    def on_numbering(self):
+        """The outlines of every accepted image are numbered anew in the order chosen; the order of the sections (the third tab) starts
+        again, since it is by these numbers."""
+        mode = self.var_numbering.get()
+        if mode == self.project.numbering:
+            return
+        self.project.numbering = mode
+        self.sync_project(save=False)
+        for i, s in enumerate(self.project.slides):
+            if s.polygons:
+                s.polygons = sp.sort_by_scene(s.polygons, sp.scene_boxes(s.path), lambda q: q, mode)[0]
+                self.polys.pop(i, None)
+                if s.path in self.ov:
+                    x0, y0, k = self.ov[s.path][1]
+                    self.polys[i] = [(q - np.array([x0, y0])) / k for q in s.polygons]
+            self.undo[i] = []
+        self.project.order = []
+        self.order_key = None
+        self.selected = set()
+        self.sync_project()
+        self.update_edit_help()
+        if self.grid_mode:
+            self.start_grid()
+        self.redraw()
+
     def sorted_polys(self, polys):
-        """The outlines in the order of the scenes of the current slide's .czi (see sp.sort_by_scene)."""
+        """The outlines in the order chosen at the top of the panel (see sp.sort_by_scene)."""
         boxes = sp.scene_boxes(self.slide().path)
-        return sp.sort_by_scene(polys, boxes, self.to_slide)[0]
+        return sp.sort_by_scene(polys, boxes, self.to_slide, self.project.numbering)[0]
 
     def back_to_threshold(self):
         if self.polys.get(self.cur) and not messagebox.askyesno(
@@ -1186,12 +1219,20 @@ class SectionLoader:
             self.var_edit_help.set(f"Drawing: {len(self.draw_pts)} point(s). Double-click the last point, or press C, to close the "
                                    "outline; Esc cancels.")
         else:
-            self.var_edit_help.set(f"{n} outline(s), numbered in the order of the scenes of the .czi; {sel} selected.")
+            how = {"scene": "in the order of the scenes of the .czi", "rows": "across, then down",
+                   "columns": "down, then across"}[self.project.numbering]
+            self.var_edit_help.set(f"{n} outline(s), numbered {how}; {sel} selected.")
         for b in (self.btn_merge,):
             b.config(state="normal" if sel >= 2 and self.mode == "edit" else "disabled")
         self.btn_split.config(state="normal" if sel == 1 and self.mode == "edit" else "disabled")
         # (scenes are a .czi's: an image of one section has none to merge within)
-        self.btn_merge_scenes.config(state="disabled" if self.project.slides and sp.is_jp2(self.slide().path) else "normal")
+        # (on the grid it acts on all the images shown, so it needs just one with scenes; otherwise on the image on show)
+        if self.grid_mode:
+            usable = any(not sp.is_jp2(s.path) and s.accepted for s in self.project.slides)
+        else:
+            usable = bool(self.project.slides) and not sp.is_jp2(self.slide().path)
+        self.btn_merge_scenes.config(state="normal" if usable else "disabled",
+                                     text="Merge contours within scenes (all images)" if self.grid_mode else "Merge contours within scenes")
         self.btn_delete.config(state="normal" if sel and self.mode == "edit" else "disabled")
         self.btn_add.config(state="normal" if self.mode == "edit" else "disabled")
         self.btn_undo.config(state="normal" if self.undo.get(self.cur) and self.mode == "edit" else "disabled")
@@ -1211,28 +1252,34 @@ class SectionLoader:
         self.redraw()
 
     def merge_all_within_scenes(self):
-        """Merge, in every accepted image, all the outlines that lie in one scene into a single outline (the fragments of a section:
-        two hemispheres, a piece broken off). Outlines are counted in the scene their centre is in."""
+        """Merge all the outlines that lie in one scene into a single outline (the fragments of a section: two hemispheres, a piece
+        broken off), in the image on show, or in every image while all of them are shown on the grid. Outlines are counted in the scene
+        their centre is in."""
         slides = self.project.slides
         self.sync_project(save=False)
+        shown = range(len(slides)) if self.grid_mode else [self.cur]
         plan = []
-        for i, s in enumerate(slides):
+        for i in shown:
+            s = slides[i]
             if not s.accepted or len(s.polygons) < 2 or sp.is_jp2(s.path):      # (only a .czi has scenes)
                 continue
-            merged, n = sp.merge_within_scenes(s.polygons, sp.scene_boxes(s.path))
+            merged, n = sp.merge_within_scenes(s.polygons, sp.scene_boxes(s.path), self.project.numbering)
             if n:
                 plan.append((i, merged, n, len(s.polygons) - len(merged)))
         if not plan:
-            messagebox.showinfo("Merge within scenes", "No scene of any accepted image has more than one outline.", parent=self.root)
+            messagebox.showinfo("Merge contours within scenes", "No scene of " + ("any image shown" if self.grid_mode else "this image")
+                                + " has more than one outline.", parent=self.root)
             return
         total_scenes = sum(n for _, _, n, _ in plan)
         total_outlines = sum(d for _, _, _, d in plan)
+        where = f"In {len(plan)} image(s)," if self.grid_mode else "In this image,"
+        undo_note = "Only the image on the panel can be undone afterwards. " if self.grid_mode else "Undo goes back. "
         if not messagebox.askyesno(
-                "Merge all images within scenes",
-                f"In {len(plan)} image(s), {total_scenes} scene(s) have more than one outline. Merging each scene's outlines into one "
+                "Merge contours within scenes",
+                f"{where} {total_scenes} scene(s) have more than one outline. Merging each scene's outlines into one "
                 f"takes away {total_outlines} outline(s).\n\nFragments are joined along their closest points, so a small piece far "
-                "from the section would be joined to it by a thin bridge: delete stray pieces first. Only the image on show can be "
-                "undone afterwards. Go on?", parent=self.root):
+                "from the section would be joined to it by a thin bridge: delete stray pieces first. " + undo_note + "Go on?",
+                parent=self.root):
             return
         for i, merged, n, d in plan:
             s = slides[i]
@@ -1366,6 +1413,7 @@ class SectionLoader:
                 self.want(s.path)
             self.canvas.config(cursor="arrow")
         self.update_slider_states()
+        self.update_edit_help()                   # (the merge-within-scenes button follows what is shown)
         if on:
             self.start_grid()
         self.redraw()

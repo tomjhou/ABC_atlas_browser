@@ -321,15 +321,42 @@ def scene_of(boxes, x, y):
     return min(cand, key=lambda i: float(np.hypot(*(centres[i] - (x, y)))))
 
 
-def sort_by_scene(polys, boxes, to_slide):
-    """The outlines in the order of the scenes of the .czi they lie in (scene 1 first); outlines in one scene go top to bottom,
-    left to right. `to_slide` turns an outline's points into slide pixels. Returns (sorted outlines, their scene indices)."""
+NUMBERINGS = ("scene", "rows", "columns")      # how outlines are numbered: by scene number, across then down, down then across
+
+
+def _grid_ids(boxes, axis):
+    """For each scene, the number of its row (axis 1) or column (axis 0) in the grid the scenes lie in: scenes whose centres are within
+    half a scene's size of each other along the axis share a row or column."""
+    centres = [(b[0] + b[2] / 2, b[1] + b[3] / 2)[axis] for b in boxes]
+    size = float(np.median([b[2 + axis] for b in boxes])) if boxes else 1.0
+    ids, group, last = [0] * len(boxes), -1, None
+    for i in sorted(range(len(boxes)), key=lambda i: centres[i]):
+        if last is None or centres[i] - last > 0.5 * size:
+            group += 1
+        ids[i], last = group, centres[i]
+    return ids
+
+
+def sort_by_scene(polys, boxes, to_slide, mode="scene"):
+    """The outlines in order, by `mode`: "scene" (the order of the scenes of the .czi they lie in, scene 1 first; outlines in one scene
+    go top to bottom, left to right), "rows" (the scenes' rows from the top, and in a row from left to right) or "columns" (the
+    columns from the left, each from top to bottom). `to_slide` turns an outline's points into slide pixels. Returns (sorted outlines,
+    their scene indices)."""
+    rows = _grid_ids(boxes, 1) if mode == "rows" else None
+    cols = _grid_ids(boxes, 0) if mode == "columns" else None
     keyed = []
     for p in polys:
         c = polygon_centroid(to_slide(p))
-        keyed.append((scene_of(boxes, c[0], c[1]), round(c[1] / 300), c[0], p))
-    keyed.sort(key=lambda t: t[:3])
-    return [t[3] for t in keyed], [t[0] for t in keyed]
+        scene = scene_of(boxes, c[0], c[1])
+        if mode == "rows":
+            key = (rows[scene], c[0], c[1])
+        elif mode == "columns":
+            key = (cols[scene], c[1], c[0])
+        else:
+            key = (scene, round(c[1] / 300), c[0])
+        keyed.append((key, scene, p))
+    keyed.sort(key=lambda t: t[0])
+    return [t[2] for t in keyed], [t[1] for t in keyed]
 
 
 def split_polygon(p, min_steps=2, min_part=0.1):
@@ -374,7 +401,7 @@ def merge_group(polys):
     return merged
 
 
-def merge_within_scenes(polys, boxes):
+def merge_within_scenes(polys, boxes, mode="scene"):
     """The outlines (in slide pixels) with all those in one scene merged into one: (the new list in scene order, the number of scenes
     where that was done)."""
     by_scene = {}
@@ -387,7 +414,7 @@ def merge_within_scenes(polys, boxes):
         if len(group) > 1:
             n += 1
         out.append(merge_group(group) if len(group) > 1 else group[0])
-    return sort_by_scene(out, boxes, lambda q: q)[0], n
+    return sort_by_scene(out, boxes, lambda q: q, mode)[0], n
 
 
 def signed_area(p):
@@ -446,6 +473,7 @@ class Project:
     alignment: dict = None                         # the aligner's state (stack_json): its edits, outline changes, order, canvas
     alignment_key: str = ""                        # fingerprint() of the outlines and order that alignment was made from
     shared: dict = None                            # the settings every image shares ("same settings for all images"), or None
+    numbering: str = "scene"                       # how outlines are numbered: NUMBERINGS
 
     def polygons_key(self):
         """Something that changes when any slide's outlines do (the order is kept while this is the same)."""
@@ -474,7 +502,7 @@ class Project:
                            "smooth": s.smooth, "pad": s.pad, "own": s.own, "pixel_um": s.pixel_um, "accepted": s.accepted, "polygons": [np.round(p, 2).tolist() for p in s.polygons]}
                           for s in self.slides],
                "order": [list(o) for o in self.order], "z_spacing_um": self.z_spacing_um,
-               "shared": self.shared, "alignment": alignment, "alignment_key": self.alignment_key}
+               "shared": self.shared, "numbering": self.numbering, "alignment": alignment, "alignment_key": self.alignment_key}
         tmp = path + ".partial"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(doc, f, separators=(",", ":"))
@@ -508,6 +536,7 @@ class Project:
         proj = Project(slides, [tuple(o) for o in doc.get("order", [])], os.path.abspath(path), float(doc.get("z_spacing_um", 0.0)),
                        doc.get("alignment"), doc.get("alignment_key", ""))
         proj.shared = doc.get("shared")
+        proj.numbering = doc.get("numbering", "scene") if doc.get("numbering") in NUMBERINGS else "scene"
         return proj
 
     def new_path(self):
