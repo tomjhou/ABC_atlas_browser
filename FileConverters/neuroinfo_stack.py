@@ -268,6 +268,7 @@ class Section:
     raw_points: np.ndarray = None   # the outline exactly as the case file (CaseFile.H5) stores it (um); None for stacks without one
     xml_points: np.ndarray = None   # the outline exactly as reconstruction.xml has it (the stack's coordinates, um); None without one
     frame: int = -1            # which frame of the opened JPX is this section's (index is its position now, which the user can change)
+    origin_key: str = ""       # for a section made in step 1: a code for the outline it was given there (see section_project.outline_key)
 
     def __post_init__(self):
         if self.frame < 0:
@@ -654,7 +655,7 @@ def stack_from_json(doc, folder, jpx_path=""):
             edit=copy.copy(e), saved_edit=copy.copy(e), source_abs_hint=d.get("source_absolute", ""),
             pivot_src=d["pivot_src"] if d.get("pivot_src") is not None else (    # (no pivot recorded: the first versions' default)
                 np.array(d["case_points"], float).reshape(-1, 2).mean(0) if len(d["case_points"]) else None),
-            czi_origin=tuple(d["czi_origin"]) if d.get("czi_origin") else None))
+            czi_origin=tuple(d["czi_origin"]) if d.get("czi_origin") else None, origin_key=d.get("origin_key", "")))
     return stack
 
 
@@ -705,6 +706,7 @@ def stack_json(stack, out_path):
             "case_points": np.round(s.case_points, 4).tolist(),
             "pivot_src": np.round(s.pivot_src, 6).tolist(),
             "edit": asdict(s.edit),
+            "origin_key": s.origin_key,
         })
         if s.czi_origin is not None:
             secs[-1]["czi_origin"] = [round(float(v), 4) for v in s.czi_origin]

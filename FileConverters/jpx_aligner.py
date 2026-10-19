@@ -962,6 +962,8 @@ class Aligner:
                             + (f" ({os.path.basename(path)})" if path else ""))
         if path:
             add_recent(path)
+            if sp.is_project_path(path):
+                sp.add_recent_project(path)
         self.refresh_list()
         self.update_controls()
         self.redraw(fit_if_needed=True)

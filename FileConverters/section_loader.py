@@ -12,6 +12,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -45,7 +46,7 @@ class SectionLoader:
     def __init__(self, on_done=None, slides=(), project=None):
         self.on_done = on_done
         self.root = tk.Tk()
-        self.root.title("Find the sections")
+        self.root.title("Load/detect/order sections")
         self.root.geometry("1450x900")
         self.project = project or sp.Project()
         self.infos = {}                 # slide path -> sp.SlideInfo
@@ -60,6 +61,7 @@ class SectionLoader:
         self.ov_gray_q, self.ov_color_q, self.ov_active = [], [], set()
         self.ov_wake = threading.Event()
         self.waiting_for = None          # the image shown as soon as its picture arrives
+        self.pending_min_mm2 = {}        # slide path -> smallest region (mm2) to use when its picture is first shown
         for _ in range(2):
             threading.Thread(target=self.ov_worker, daemon=True).start()
         self.result = None
@@ -97,6 +99,7 @@ class SectionLoader:
         self.refresh_slide_list()
         if self.project.slides:
             self.read_infos()
+        self.update_title()
         self.show_stage(0)
 
     # ------------------------------------------------------------------ plumbing
@@ -311,6 +314,7 @@ class SectionLoader:
         ttk.Button(side, text="Set pixel size...", command=self.set_pixel_size).pack(fill=tk.X)
         ttk.Separator(side).pack(fill=tk.X, pady=10)
         ttk.Button(side, text="Open a saved project...", command=self.open_project).pack(fill=tk.X)
+        ttk.Button(side, text="Open recent projects...", command=self.open_recent_project).pack(fill=tk.X, pady=(6, 0))
         return f
 
     def refresh_slide_list(self):
@@ -396,9 +400,69 @@ class SectionLoader:
             self.refresh_slide_list()
             self.slide_tree.selection_set(str(j))
 
-    def open_project(self):
-        path = filedialog.askopenfilename(parent=self.root, title="Open a saved project",
-                                          filetypes=[("Section projects", "*" + sp.PROJECT_SUFFIX + " *" + sp.OLD_PROJECT_SUFFIX), ("All files", "*.*")])
+    def open_recent_project(self):
+        """A list of the recently used projects to choose from."""
+        paths = sp.recent_projects()
+        if not paths:
+            messagebox.showinfo("Recent projects", "No projects have been saved or opened yet.", parent=self.root)
+            return
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Recent projects")
+        dlg.transient(self.root)
+        dlg.geometry(f"+{self.root.winfo_rootx() + 120}+{self.root.winfo_rooty() + 100}")
+        ttk.Label(dlg, text="Choose a project (double-click opens it):", padding=(10, 10, 10, 4)).pack(anchor="w")
+        cols = ("name", "folder", "when")
+        tree = ttk.Treeview(dlg, columns=cols, show="headings", selectmode="browse", height=min(max(len(paths), 4), 12))
+        for c, t, w, a in (("name", "Project", 280, "w"), ("folder", "Folder", 420, "w"), ("when", "Last saved", 190, "w")):
+            tree.heading(c, text=t)
+            tree.column(c, width=w, anchor=a)
+        for i, p in enumerate(paths):
+            try:
+                when = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(p)))
+                name = os.path.basename(p)
+            except OSError:
+                when, name = "(missing)", os.path.basename(p)
+            tree.insert("", tk.END, iid=str(i), values=(name, os.path.dirname(p), when))
+        tree.pack(fill=tk.BOTH, expand=True, padx=10)
+        if paths:
+            tree.selection_set("0")
+            tree.focus("0")
+        chosen = []
+
+        def choose(event=None):
+            sel = tree.selection()
+            if sel:
+                chosen.append(paths[int(sel[0])])
+                dlg.destroy()
+
+        def forget():
+            sel = tree.selection()
+            if sel:
+                sp.remove_recent_project(paths[int(sel[0])])
+                tree.delete(sel[0])
+
+        tree.bind("<Double-1>", choose)
+        tree.bind("<Return>", choose)
+        bar = ttk.Frame(dlg, padding=10)
+        bar.pack(fill=tk.X)
+        ttk.Button(bar, text="Open", command=choose).pack(side=tk.LEFT)
+        ttk.Button(bar, text="Remove from the list", command=forget).pack(side=tk.LEFT, padx=8)
+        ttk.Button(bar, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT)
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.grab_set()
+        tree.focus_set()
+        self.root.wait_window(dlg)
+        if chosen:
+            if not os.path.isfile(chosen[0]):
+                messagebox.showerror("Can't open", f"This project file no longer exists:\n{chosen[0]}", parent=self.root)
+                sp.remove_recent_project(chosen[0])
+                return
+            self.open_project(chosen[0])
+
+    def open_project(self, path=None):
+        if path is None:
+            path = filedialog.askopenfilename(parent=self.root, title="Open a saved project",
+                                              filetypes=[("Section projects", "*" + sp.PROJECT_SUFFIX + " *" + sp.OLD_PROJECT_SUFFIX), ("All files", "*.*")])
         if not path:
             return
         try:
@@ -410,7 +474,9 @@ class SectionLoader:
         if missing:
             messagebox.showerror("Slides not found", "These slide scans weren't found:\n\n" + "\n".join(missing[:6]), parent=self.root)
             return
+        sp.add_recent_project(path)
         self.project = proj
+        self.update_title()
         self.infos, self.ov, self.ovc = {}, {}, {}
         self.order_key = proj.polygons_key() if proj.order else None
         self.refresh_slide_list()
@@ -481,7 +547,8 @@ class SectionLoader:
         p = self.panel_threshold
         ttk.Label(p, text="Find the sections", font=("Segoe UI", 12, "bold")).pack(anchor="w")
         ttk.Label(p, text="Pixels brighter than the threshold are tinted blue. Move the slider until each section is tinted "
-                          "as a whole and the debris is not.", wraplength=300, foreground="gray30").pack(anchor="w", pady=(2, 12))
+                          "as a whole and the debris is not.", wraplength=300, foreground="gray30").pack(anchor="w", pady=(2, 8))
+        ttk.Button(p, text="Apply current settings to all images", command=self.apply_to_all).pack(fill=tk.X, pady=(0, 12))
         self.var_thr = tk.IntVar(f, 100)
         self.var_thr_text = tk.StringVar(f, "")
         ttk.Label(p, textvariable=self.var_thr_text).pack(anchor="w")
@@ -596,6 +663,8 @@ class SectionLoader:
         self.set_base()
         if s.threshold < 0:
             s.threshold = sp.auto_threshold(img)
+        if s.path in self.pending_min_mm2:        # (a size asked for from another image, in mm2: in pixels now that the scale is known)
+            s.min_area = max(int(round(self.pending_min_mm2.pop(s.path) / self.px_mm2())), 1)
         if s.min_area < 0:
             s.min_area = max(int(round(DEFAULT_MIN_AREA_MM2 / self.px_mm2())), 1)
         if self.cur not in self.polys:
@@ -631,6 +700,18 @@ class SectionLoader:
         x0, y0, k = self.ov[path or self.slide().path][1]
         return poly * k + np.array([x0, y0])
 
+    def update_title(self):
+        """The window's title: what this step is for, and the project's file name (or that it is new, not saved yet)."""
+        name = os.path.basename(self.project.path) if self.project.path else "new project (not saved yet)"
+        self.root.title(f"Load/detect/order sections - {name}")
+
+    def write_project(self, proj):
+        """Save the project (to its own file, or a new one) and note it in the list of recent projects."""
+        path = self.save_path()
+        proj.save(path)
+        sp.add_recent_project(path)
+        self.update_title()
+
     def save_path(self):
         """Where the project is saved: the file it was opened from, else a new name that doesn't take the place of another project's
         file (a project's name comes from its first image, so two projects can start alike)."""
@@ -651,7 +732,7 @@ class SectionLoader:
                 s.polygons = [self.to_slide(p, s.path) for p in polys]
         if self.project.slides and any(s.polygons for s in self.project.slides):
             try:
-                self.project.save(self.save_path())
+                self.write_project(self.project)
             except OSError as e:
                 self.var_status.set(f"Couldn't save the project: {e}")
 
@@ -756,6 +837,29 @@ class SectionLoader:
         self.selected = set()
         self.sync_project()
         self.set_mode("edit")
+
+    def apply_to_all(self):
+        """Give every other image the settings on show: brightness threshold, smallest region (the same area in mm2, whatever the
+        image's scale), smoothing and padding. Images whose detection has been accepted are left as they are."""
+        cur = self.slide()
+        mm2 = self.min_area_mm2()
+        n = skipped = 0
+        for i, s in enumerate(self.project.slides):
+            if i == self.cur:
+                continue
+            if s.accepted:
+                skipped += 1
+                continue
+            s.threshold, s.smooth, s.pad = cur.threshold, cur.smooth, cur.pad
+            if s.path in self.ov:
+                k = self.ov[s.path][1][2]
+                side = k * (self.slide_px(s) or 0.65) / 1000
+                s.min_area = max(int(round(mm2 / (side * side))), 1)
+            else:
+                self.pending_min_mm2[s.path] = mm2
+            n += 1
+        self.var_status.set(f"Threshold {cur.threshold}, smoothing {cur.smooth} px, padding {cur.pad} px and smallest region {mm2:.2f} mm² "
+                            f"applied to {n} other image(s)" + (f"; {skipped} already accepted left as they are." if skipped else "."))
 
     def accept_all(self):
         """Accept the detection for every image not accepted yet: each with its own brightness threshold (the automatic one where it
@@ -1246,16 +1350,21 @@ class SectionLoader:
         proj.z_spacing_um = spacing
         proj.order = list(self.order)
         if proj.alignment and proj.alignment_key != proj.fingerprint():
-            if not messagebox.askyesno(
-                    "Start the alignment again?",
-                    "The outlines or their order have changed since this project's alignment was made, so the alignment "
-                    "edits (moves, rotations, flips) can't be kept and would be dropped.\n\nGo on?", parent=self.root):
+            # The outlines or their order have changed since the alignment was saved. The alignment is of the images, so it carries over to redrawn outlines and to another order. What can't: sections whose
+            # outline was deleted or merged into another (and so has nothing to go with).
+            assign, dropped, fresh = sp.match_alignment(proj)
+            lost = [i for i in dropped if not ns.Edit(**proj.alignment["sections"][i]["edit"]).is_identity()]
+            if lost and not messagebox.askyesno(
+                    "Alignment of removed outlines",
+                    f"{len(lost)} section(s) with alignment edits (moves, rotations or flips) have no outline now (deleted, or merged "
+                    "into another), so their alignment will be dropped:\n\n"
+                    + "\n".join(proj.alignment["sections"][i].get("name", "?") for i in lost[:8]) + (
+                        "\n..." if len(lost) > 8 else "") + f"\n\nThe other {len(assign)} keep theirs. Go on?", parent=self.root):
                 return
-            proj.alignment, proj.alignment_key = None, ""
         proj.order = list(self.order)
         self.order_key = proj.polygons_key()
         try:
-            proj.save(self.save_path())
+            self.write_project(proj)
         except OSError as e:
             messagebox.showwarning("Project not saved", f"Couldn't save the project file: {e}", parent=self.root)
         self.var_status.set("Preparing the sections...")

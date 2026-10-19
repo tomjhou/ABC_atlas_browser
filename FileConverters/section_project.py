@@ -26,6 +26,48 @@ MAX_VERTICES = 80           # NeuroInfo's own outlines have 60-80 points
 DEFAULT_COLORS = ((0, 160, 255), (0, 255, 91), (255, 1, 0), (255, 255, 255))
 
 
+SETTINGS_FILE = os.path.join(os.path.dirname(CACHE_DIR), "jpx_aligner_settings.json")     # (the aligner's settings file: shared)
+RECENT_PROJECTS_MAX = 20
+
+
+def recent_projects():
+    """The recently used project files, newest first (the settings file's "recent_projects"); [] if there are none."""
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        recent = data.get("recent_projects", []) if isinstance(data, dict) else []
+        return [p for p in recent if isinstance(p, str)]
+    except (OSError, ValueError):
+        return []
+
+
+def _save_recent_projects(paths):
+    try:
+        try:
+            with open(SETTINGS_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            data = data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            data = {}
+        data["recent_projects"] = paths[:RECENT_PROJECTS_MAX]
+        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1)
+    except OSError:
+        pass            # (the list is only a convenience)
+
+
+def add_recent_project(path):
+    """Put a project file first in the recent list (once, whatever the letter case)."""
+    key = os.path.normcase(os.path.abspath(path))
+    _save_recent_projects([os.path.abspath(path)] + [p for p in recent_projects() if os.path.normcase(os.path.abspath(p)) != key])
+
+
+def remove_recent_project(path):
+    key = os.path.normcase(os.path.abspath(path))
+    _save_recent_projects([p for p in recent_projects() if os.path.normcase(os.path.abspath(p)) != key])
+
+
 def is_project_path(path):
     """Whether a file name is a project file's (the current ending, or the one used at first)."""
     return path.lower().endswith((PROJECT_SUFFIX, OLD_PROJECT_SUFFIX))
@@ -406,10 +448,77 @@ class Project:
 #
 ##################################################
 
+def outline_key(poly):
+    """A short code for an outline (in slide pixels), to tell whether it is the same one later."""
+    return hashlib.sha1(np.round(np.asarray(poly, float), 1).tobytes()).hexdigest()[:12]
+
+
+def _order_items(project):
+    """[(slide, outline in slide pixels, name)] of the project's sections in their order."""
+    items = []
+    for si, pi in (project.order or project.default_order()):
+        slide = project.slides[si]
+        items.append((slide, slide.polygons[pi], f"{os.path.splitext(os.path.basename(slide.path))[0]} #{pi + 1}"))   # (# is the outline's number in step 1, whatever order it ends up in)
+    return items
+
+
+def match_alignment(project):
+    """Which section of the project's saved alignment each of its sections now is. The alignment is of the images, so it still holds when
+    an outline is redrawn (another threshold, padding, a merge), or the sections are put in another order: a transform of the section's
+    image is as good for the new outline as for the old. Outlines are matched by how much they overlap on the same slide.
+    Returns (assign, dropped, new): {position in the new order: index in the alignment's sections}, the indices of alignment sections
+    with nothing to go with (their outline was deleted, or merged into another), and the positions of sections with no alignment yet."""
+    old = project.alignment
+    items = _order_items(project)
+    if not old:
+        return {}, [], list(range(len(items)))
+    old_px = float(old.get("pixel_um") or 1.0)
+    olds = []
+    for o in old["sections"]:
+        P = np.array(o["case_points"], float).reshape(-1, 2)
+        base = os.path.basename((o.get("source_absolute") or o.get("name", "")).replace("\\", "/")).lower()
+        olds.append((base, np.column_stack([P[:, 0] / old_px, -P[:, 1] / old_px]) if len(P) else None))
+    assign, taken = {}, set()
+    groups = {}
+    for n, (slide, poly, _) in enumerate(items):
+        groups.setdefault(os.path.basename(slide.path).lower(), []).append(n)
+    for base, news in groups.items():
+        cand = [i for i, (b, p) in enumerate(olds) if p is not None and (b == base or b.startswith(os.path.splitext(base)[0]))]
+        if not cand:
+            continue
+        polys = [items[n][1] for n in news] + [olds[i][1] for i in cand]
+        lo = np.min([p.min(0) for p in polys], axis=0)
+        hi = np.max([p.max(0) for p in polys], axis=0)
+        scale = min(1.0, 1200 / max(float((hi - lo).max()), 1.0))
+        shape = (int(np.ceil((hi[1] - lo[1]) * scale)) + 2, int(np.ceil((hi[0] - lo[0]) * scale)) + 2)
+
+        def raster(p):
+            m = np.zeros(shape, np.uint8)
+            cv2.fillPoly(m, [np.round((p - lo) * scale).astype(np.int32)], 1)
+            return m.astype(bool)
+
+        mn = [raster(items[n][1]) for n in news]
+        mo = [raster(olds[i][1]) for i in cand]
+        pairs = []
+        for a, n in enumerate(news):
+            for b, i in enumerate(cand):
+                inter = int((mn[a] & mo[b]).sum())
+                if inter and inter >= 0.5 * min(int(mn[a].sum()), int(mo[b].sum())):
+                    pairs.append((inter, n, i))
+        for inter, n, i in sorted(pairs, reverse=True):        # (the biggest overlaps first; each used once)
+            if n not in assign and i not in taken:
+                assign[n] = i
+                taken.add(i)
+    dropped = [i for i in range(len(olds)) if i not in taken]
+    return assign, dropped, [n for n in range(len(items)) if n not in assign]
+
+
 def build_stack(project, margin=0.2):
     """The in-memory Stack of a project, ready for the alignment tool: one section per outline, in order, each rendered from its
     slide scan (so no JPX is needed) and placed unrotated at the middle of a canvas big enough for the largest of them. If the project
-    holds an alignment made from these same outlines and order, that is what comes back: the work picks up where it was left."""
+    holds an alignment made from these same outlines and order, that is what comes back, exactly as it was left (including the order and
+    deletions made in the aligner). If the outlines or order have changed since, every section that matches one of the alignment's sections
+    (see match_alignment) comes back placed as it was, on the same canvas; the others start at the middle."""
     if project.alignment and project.alignment_key == project.fingerprint():
         stack = ns.stack_from_json(project.alignment, os.path.dirname(os.path.abspath(project.path or project.slides[0].path)))
         stack.channel_info = list(slide_info(project.slides[0].path).channels)
@@ -434,12 +543,7 @@ def build_stack(project, margin=0.2):
                              f"has {px:g} um. Sections are aligned in one stack, so the pixel sizes must match.")
     if any(len(infos[s.path].channels) != len(first.channels) for s in project.slides):
         raise ValueError("The slides have different numbers of channels, so their sections can't go in one stack.")
-    order = project.order or project.default_order()
-    items = []
-    for si, pi in order:
-        slide = project.slides[si]
-        poly = slide.polygons[pi]
-        items.append((slide, poly, f"{os.path.splitext(os.path.basename(slide.path))[0]} #{pi + 1}"))   # (# is the outline's number in step 1, whatever order it ends up in)
+    items = _order_items(project)
     if not items:
         raise ValueError("There are no section outlines.")
     # section outlines in the scan's own um (y up, as NeuroInfo keeps them), whatever the slide's pixel size
@@ -448,15 +552,30 @@ def build_stack(project, margin=0.2):
         k = px_of(slide)
         pts.append(np.column_stack([poly[:, 0] * k, -poly[:, 1] * k]))
     extent = max(max(np.ptp(p[:, 0]), np.ptp(p[:, 1])) for p in pts)
-    side = int(math.ceil(extent * (1 + 2 * margin) / px / 16) * 16)
-    stack = ns.Stack("", side, side, len(first.channels), px)
+    old = project.alignment
+    assign = match_alignment(project)[0] if old else {}
+    if old:
+        cw, ch = old["canvas"]                              # (the canvas the alignment was made on)
+    else:
+        cw = ch = int(math.ceil(extent * (1 + 2 * margin) / px / 16) * 16)
+    stack = ns.Stack("", cw, ch, len(first.channels), px)
     stack.channel_info = list(first.channels)
-    stack.z_spacing_um = project.z_spacing_um
+    stack.z_spacing_um = (old or {}).get("z_spacing_um") or project.z_spacing_um
     stack.unsaved = True
-    centre = np.array([side / 2 * px, -side / 2 * px])
+    centre = np.array([cw / 2 * px, -ch / 2 * px])
     for n, ((slide, poly, name), p) in enumerate(zip(items, pts)):
         c = polygon_centroid(p)
         sec = ns.Section(n, name, slide.path, p, np.eye(2), centre - c, pivot_src=c,
-                         czi_origin=None if is_jp2(slide.path) else (0.0, 0.0))
+                         czi_origin=None if is_jp2(slide.path) else (0.0, 0.0), origin_key=outline_key(poly))
+        if n in assign:
+            o = old["sections"][assign[n]]
+            # the image keeps the placement it was given: same base transform, same edit about the same pivot (a point of the image)
+            sec.R, sec.t = np.array(o["base_R"], float), np.array(o["base_t"], float)
+            sec.edit, sec.saved_edit = ns.Edit(**o["edit"]), ns.Edit(**o["edit"])
+            if o.get("pivot_src") is not None:
+                sec.pivot_src = np.array(o["pivot_src"], float)
+            if o.get("origin_key") and o["origin_key"] == sec.origin_key:     # (the outline is the one step 1 gave it, as it was: keep it as it is
+                sec.case_points = np.array(o["case_points"], float).reshape(-1, 2)    # now, with any changes made to it in the aligner)
+                sec.saved_points = sec.case_points.copy()
         stack.sections.append(sec)
     return stack
