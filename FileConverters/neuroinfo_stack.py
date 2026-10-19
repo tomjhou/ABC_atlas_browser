@@ -865,6 +865,16 @@ def czi_scene_of(section, stack):
     return int(np.argmax(inside))
 
 
+def czi_scene_if_known(section, stack):
+    """czi_scene_of, or None where it can't be told without waiting: the section isn't from a .czi, isn't located on it yet, or the
+    scan's scenes haven't been read (so that a list of sections can ask for every one at any time)."""
+    if section.czi_origin is None or not section.source_path.lower().endswith(".czi"):
+        return None
+    if os.path.normcase(os.path.abspath(section.source_path)) not in _czi_boxes:
+        return None
+    return czi_scene_of(section, stack)
+
+
 def section_source_offset(section, stack):
     """(dx, dy): the section's source pixel (col, row) is at (col + dx, row + dy) in the array that is read for it (the scene
     of a .czi; zero for ordinary images)."""
@@ -1366,8 +1376,14 @@ def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progr
             def report(text=None):
                 if progress:
                     if text is None:
-                        text = (f"Locating section {min(active) + 1} of {len(stack.sections)} on the slide scan..."
-                                if active else "Locating sections on the slide scan...")
+                        if not done[0]:
+                            # (the first section takes the longest: the scan is searched for where it lies, and the others then
+                            # only have to be checked at the place it showed; so that the wait is not taken for the speed of the rest)
+                            text = ("Preparing load: locating sections on slide scan\n"
+                                    "(the first section takes longest, the rest go quickly)...")
+                        else:
+                            text = (f"Locating section {min(active) + 1} of {len(stack.sections)} on the slide scan..."
+                                    if active else "Locating sections on the slide scan...")
                     progress(done[0], total[0], text)
 
             located_so_far = []   # (outline y in pixels, X0, Y0) of the sections placed so far

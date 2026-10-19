@@ -39,6 +39,7 @@ import queue
 import sys
 import threading
 import time
+import weakref
 from dataclasses import asdict
 
 import neuroinfo_stack as ns
@@ -53,6 +54,35 @@ import cv2  # noqa: E402
 import imagecodecs  # noqa: E402
 import numpy as np  # noqa: E402
 from PIL import Image, ImageTk  # noqa: E402
+
+# Brightness histograms of the section pictures (for the Auto buttons of the display levels): the pixel values 1..65535 in LEVEL_BINS bins
+# equal in ratio (about 0.5 % wide each), so that the dim end, where the black point lies, is as finely resolved as the bright end.
+LEVEL_BINS = 2048
+_LEVEL_LN = math.log(65536.0)
+
+
+def _level_bin_table():
+    v = np.arange(65536, dtype=np.float64)
+    v[0] = 1.0
+    return np.minimum((np.log(v) / _LEVEL_LN * LEVEL_BINS).astype(np.int64), LEVEL_BINS - 1)
+
+
+LEVEL_BIN_OF = _level_bin_table()
+
+
+def histogram_percentile(h, q):
+    """The q-th percentile (0-100) of the pixel values counted in the histogram h (LEVEL_BINS counts), or None if it is empty."""
+    total = float(h.sum())
+    if total <= 0:
+        return None
+    cum = np.cumsum(h)
+    target = q / 100.0 * total
+    b = min(int(np.searchsorted(cum, target)), LEVEL_BINS - 1)
+    before = float(cum[b - 1]) if b else 0.0
+    frac = min(max((target - before) / max(float(h[b]), 1.0), 0.0), 1.0)
+    lo, hi = math.exp(b / LEVEL_BINS * _LEVEL_LN), math.exp((b + 1) / LEVEL_BINS * _LEVEL_LN)
+    return lo + frac * (hi - lo)
+
 
 PREVIEW_MAX_PX = 2500   # longest side of the cached preview of each section
 THUMB_MAX_PX = 1600     # longest side of the slide thumbnail as it is built (it is scaled to the left pane's width when shown)
@@ -269,6 +299,7 @@ class Aligner:
         self.loading_previews = False   # section images are still being loaded in the background
         self.levels = []            # per channel [lo, hi] (display only)
         self.levels_set = False
+        self.level_cache = {}       # id(picture) -> (weak reference to it, its brightness histograms), see level_hist
         self._busy = False
         self.calibrating = False    # the .czi sections are being located on their slide scans
         self.locating_done = False  # that has finished (what is still not located then is shown in red)
@@ -390,6 +421,11 @@ class Aligner:
         self.list_scroll.config(command=self.listbox.yview)
         self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.listbox.bind("<<ListboxSelect>>", self.on_list_select)
+        # drag a section to a new place in the order
+        self.list_drag = None
+        self.listbox.bind("<ButtonPress-1>", self.list_press, add="+")
+        self.listbox.bind("<B1-Motion>", self.list_motion)          # (replaces the default, which would select what the pointer passes)
+        self.listbox.bind("<ButtonRelease-1>", self.list_release, add="+")
 
         self.canvas = tk.Canvas(self.paned, bg="black", highlightthickness=0, cursor="fleur")
         self.paned.add(left, minsize=180, stretch="never")
@@ -492,7 +528,7 @@ class Aligner:
         ttk.Checkbutton(f, text="Crosshair at the centre of the canvas", variable=self.var_crosshair,
                         command=self.redraw).pack(anchor="w")
 
-        self.chan_frame = ttk.LabelFrame(right, text="Display brightness (view only)", padding=6)
+        self.chan_frame = ttk.LabelFrame(right, text="Brightness (applies to all sections, affects view only)", padding=6)
         self.chan_frame.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(self.chan_frame, text="(open a stack)").pack()
 
@@ -529,6 +565,21 @@ class Aligner:
         for w in self.chan_frame.winfo_children():
             w.destroy()
         self.chan_vars = []
+        self.chan_frame.columnconfigure(2, weight=1)
+        # buttons above the sliders that set the black and white points of all the channels at once
+        bar = ttk.Frame(self.chan_frame)
+        bar.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        for c in range(3):
+            bar.columnconfigure(c, weight=1, uniform="levelbtn")
+        for c, (text, how, tip) in enumerate((
+                ("Auto1", "current", "Set each channel's black point to the 1st percentile and its white point to the 99.7th percentile of "
+                                     "the pixel values (ignoring empty pixels) in the current section only."),
+                ("Auto2", "all", "The same, but the percentiles are taken over all the sections whose pictures have loaded."),
+                ("Full", "full", "Full scale: set every channel's black point to 0 and its white point to 65535, the whole range of "
+                                 "16-bit pixel values. No analysis of the pictures."))):
+            b = ttk.Button(bar, text=text, command=lambda how=how: self.set_levels(how))
+            b.grid(row=0, column=c, sticky="ew", padx=(0 if c == 0 else 2, 0))
+            Tooltip(b, tip)
         for i, ch in enumerate(self.stack.channel_info):
             lo, hi = self.levels[i]
             vis = tk.BooleanVar(self.root, True)
@@ -541,7 +592,7 @@ class Aligner:
             row = self.chan_frame
             row.columnconfigure(2, weight=1)
             sq_col = ttk.Frame(row)
-            sq_col.grid(row=2 * i, column=0, rowspan=2, sticky="nw", padx=(0, 4), pady=(4 if i else 0, 0))
+            sq_col.grid(row=1 + 2 * i, column=0, rowspan=2, sticky="nw", padx=(0, 4), pady=(4 if i else 0, 0))
             # The colored square is the show/hide checkbox: while the channel is shown, two thin lines join its opposite corners
             # (black, or white on a very dark color so that they can be seen).
             dark = 0.299 * ch.color[0] + 0.587 * ch.color[1] + 0.114 * ch.color[2] < 60
@@ -570,9 +621,9 @@ class Aligner:
             name.bind("<Button-1>", toggle)
             for r, (text, var) in enumerate((("black", vlo), ("white", vhi))):
                 pad = (4 if i and r == 0 else 0, 0)
-                ttk.Label(row, text=text).grid(row=2 * i + r, column=1, sticky="w", padx=(0, 4), pady=pad)
+                ttk.Label(row, text=text).grid(row=1 + 2 * i + r, column=1, sticky="w", padx=(0, 4), pady=pad)
                 ttk.Scale(row, from_=0, to=65535, variable=var,
-                          command=lambda v: self.redraw()).grid(row=2 * i + r, column=2, sticky="ew", pady=pad)
+                          command=lambda v: self.redraw()).grid(row=1 + 2 * i + r, column=2, sticky="ew", pady=pad)
 
     # ---------------------------------------------------------------- busy cursor
 
@@ -763,7 +814,7 @@ class Aligner:
             menu.add_command(label="Clear list", command=clear_recent)
 
     def open_recent(self, path):
-        if self.busy or not self.confirm_discard():
+        if self.busy or self.opening or not self.confirm_discard():
             return
         if not os.path.exists(path):
             messagebox.showerror("Can't open", f"This file or folder no longer exists:\n{path}", parent=self.root)
@@ -771,7 +822,7 @@ class Aligner:
         self.open_path(path)
 
     def open_dialog(self):
-        if self.busy or not self.confirm_discard():
+        if self.busy or self.opening or not self.confirm_discard():
             return
         path = filedialog.askopenfilename(
             parent=self.root, title="Open a reconstruction (NeuroInfo or exported by this tool)",
@@ -861,22 +912,52 @@ class Aligner:
         self.show_stack(stack, path)
 
     def open_path(self, path):
+        """Open a JPX (or a section project). A JPX's NeuroInfo files are read in a thread, so that the window stays alive and can say
+        what is happening (a big stack takes some seconds to read); a dialog asking for one of those files is made by the window itself."""
         if sp.is_project_path(path):
             return self.open_project(path)
         self.opening = True
         self.update_cursor()
+        self.var_status.set("Preparing for load...")
         self.root.update()
         t_open = time.time()
-        try:
-            stack = ns.open_stack(path, locate=self.locate_file)
-            self.open_seconds = time.time() - t_open   # (includes any dialog asking for the NeuroInfo files)
-        except Exception as e:
-            self.opening = False
-            self.update_cursor()
-            messagebox.showerror("Can't open", str(e), parent=self.root)
-            return
+
+        def ask(*args, **kwargs):
+            """locate_file for the thread: the dialog is made, and waited for, by the window's own thread."""
+            done, answer = threading.Event(), {}
+
+            def run():
+                try:
+                    answer["value"] = self.locate_file(*args, **kwargs)
+                except BaseException as e:
+                    answer["error"] = e
+                done.set()
+
+            self.msgs.put(("call", run))
+            done.wait()
+            if "error" in answer:
+                raise answer["error"]
+            return answer["value"]
+
+        def work():
+            try:
+                stack = ns.open_stack(path, locate=ask)
+            except BaseException as e:
+                self.msgs.put(("opened", (path, None, e, t_open)))
+            else:
+                self.msgs.put(("opened", (path, stack, None, t_open)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def opened(self, path, stack, error, t_open):
+        """The NeuroInfo files of a JPX have been read (or not): the questions that can come before the stack is shown."""
+        self.open_seconds = time.time() - t_open   # (includes any dialog asking for the NeuroInfo files)
         self.opening = False
         self.update_cursor()
+        if error is not None:
+            self.var_status.set("")
+            messagebox.showerror("Can't open", str(error) or type(error).__name__, parent=self.root)
+            return
         missing = [s.name for s in stack.sections if not s.source_path]
         if missing:
             if not messagebox.askokcancel(
@@ -885,6 +966,7 @@ class Aligner:
                     "(their current images in the JPX are kept as they are):\n\n" + "\n".join(missing)
                     + "\n\nOK opens the stack anyway; Cancel doesn't open it.",
                     icon="warning", parent=self.root):
+                self.var_status.set("")
                 return
         if stack.source_pixel_um and abs(stack.source_pixel_um / stack.pixel_um - 1) > 0.01:
             answer = messagebox.askyesnocancel(
@@ -896,6 +978,7 @@ class Aligner:
                     "export writes the corrected pixel size into the JPX's metadata. reconstruction.xml is not changed.",
                     icon="warning", parent=self.root)
             if answer is None:   # Cancel: don't open the stack at all
+                self.var_status.set("")
                 return
             if answer:
                 stack.apply_pixel_size(stack.source_pixel_um)
@@ -916,6 +999,7 @@ class Aligner:
                 "Download from OneDrive?",
                 f"{len(czi_online)} slide scan(s) ({human_gb(sum(os.path.getsize(p) for p in czi_online))}) are online-only in "
                 "OneDrive and must be downloaded to show and re-render their sections. Continue?", parent=self.root):
+            self.var_status.set("")
             return
         need = [s for s in stack.sections if s.renderable and not preview_is_cached(s.source_path)]
         online = [s for s in need if ns.is_online_only(s.source_path)]
@@ -925,6 +1009,7 @@ class Aligner:
                     "Download from OneDrive?",
                     f"{len(online)} section image(s) ({human_gb(size)}) are online-only in OneDrive and "
                     "must be downloaded to build previews. Continue?", parent=self.root):
+                self.var_status.set("")
                 return
         self.show_stack(stack, path)
 
@@ -1012,6 +1097,10 @@ class Aligner:
                 n = len(posted)
                 if not first:
                     first.append(time.time() - t_start)
+            try:
+                self.level_hist(pv[0])      # (ready for the Auto buttons of the display levels, which then need no time)
+            except Exception:
+                pass
             self.msgs.put(("preview", (stack, s.frame, pv, n, is_frame)))
 
         def czi_picture(s):
@@ -1062,7 +1151,7 @@ class Aligner:
             ns.lower_thread_priority()   # (the window stays responsive while the images load)
             frame_boxes = None
             if any(s.source_path.lower().endswith(".czi") and s.czi_origin is None for s in todo):
-                self.msgs.put(("status", "Preparing the Zeiss .czi reader (installed first if it is missing)..."))
+                self.msgs.put(("status", "Preparing for load: starting the Zeiss .czi reader (installed first if it is missing)..."))
                 t_locate = time.time()
                 try:
                     problems = ns.calibrate_stack_czi(stack, progress=lambda i, n, text: self.msgs.put(("status", text)),
@@ -1110,7 +1199,11 @@ class Aligner:
         try:
             while True:
                 kind, payload = self.msgs.get_nowait()
-                if kind == "status":
+                if kind == "call":
+                    payload()
+                elif kind == "opened":
+                    self.opened(*payload)
+                elif kind == "status":
                     self.var_status.set(payload)
                     for item in self.canvas.find_withtag("loadtext"):   # (the message in the middle of the picture follows it)
                         self.canvas.itemconfig(item, text=payload)
@@ -1184,17 +1277,77 @@ class Aligner:
         for c in range(min(img.shape[2], len(self.levels))):
             v = img[..., c][img[..., c] > 0]
             if v.size:
-                self.levels[c] = [float(np.percentile(v, 1)), float(np.percentile(v, 99.7))]
+                # (the white point is raised by half, so that the brightest 0.3 % are at two thirds: the first section alone tends to show
+                # brighter than the stack as a whole, which the Auto2 button, once everything has loaded, gets right)
+                self.levels[c] = [float(np.percentile(v, 1)), min(float(np.percentile(v, 99.7)) * 1.5, 65535.0)]
                 self.chan_vars[c][1].set(self.levels[c][0])
                 self.chan_vars[c][2].set(self.levels[c][1])
         self.levels_set = True
+
+    def set_levels(self, how):
+        """The Auto1 / Auto2 / Full buttons: "current" = percentiles (1 and 99.7) of the current section's picture, "all" = of all
+        the pictures loaded so far, "full" = 0 and 65535 with no analysis. Empty pixels (0) don't count. View only."""
+        if not self.stack or not self.stack.sections:
+            return
+        if how == "full":
+            pvs = []
+        elif how == "current":
+            pvs = [self.previews.get(self.stack.sections[self.cur].frame)]
+        else:
+            pvs = list(self.previews.values())
+        pvs = [pv for pv in pvs if pv is not None]
+        if how != "full" and not pvs:
+            self.var_status.set("The picture isn't loaded yet.")
+            return
+        for c in range(len(self.levels)):
+            if how == "full":
+                lo, hi = 0.0, 65535.0
+            else:
+                hs = [self.level_hist(img)[c] for img, _, _ in pvs if c < img.shape[2]]
+                if not hs:
+                    continue
+                h = np.sum(hs, axis=0)
+                lo, hi = histogram_percentile(h, 1), histogram_percentile(h, 99.7)
+                if lo is None:
+                    continue
+            self.levels[c] = [lo, hi]
+            self.chan_vars[c][1].set(lo)
+            self.chan_vars[c][2].set(hi)
+        self.levels_set = True                    # (the automatic setting from the first picture must not override this)
+        self.redraw()
+
+    def level_hist(self, img):
+        """The brightness histograms of a section picture, one per channel (channels x LEVEL_BINS counts; empty pixels, 0, are left
+        out). Made once per picture: the loading thread asks for it as each picture arrives, so that the Auto buttons only have to
+        add up what is there."""
+        hit = self.level_cache.get(id(img))
+        if hit is not None and hit[0]() is img:
+            return hit[1]
+        h = np.zeros((img.shape[2], LEVEL_BINS), np.float64)
+        for c in range(img.shape[2]):
+            v = img[..., c]
+            if v.dtype != np.uint16:
+                v = np.clip(v, 0, 65535).astype(np.uint16)
+            counts = np.bincount(v.ravel(), minlength=65536).astype(np.float64)
+            counts[0] = 0
+            h[c] = np.bincount(LEVEL_BIN_OF, weights=counts, minlength=LEVEL_BINS)
+        try:
+            self.level_cache[id(img)] = (weakref.ref(img), h)
+        except TypeError:
+            pass
+        if len(self.level_cache) > 4 * max(len(self.previews), 64):       # (forget those of pictures that are gone)
+            self.level_cache = {k: v for k, v in self.level_cache.items() if v[0]() is not None}
+        return h
 
     # ---------------------------------------------------------------- list / controls
 
     def section_label(self, s):
         marks = ("*" if s.changed else " ") + ("~" if not s.edit.is_identity() else " ") + \
                 ("F" if s.edit.flip else " ")
-        return f"{marks}  {s.index + 1}. {os.path.splitext(s.name)[0]}"
+        # "(scene N)": the scene of the slide scan that holds the section (as in the scan, counted from 1; it is not a position)
+        scene = ns.czi_scene_if_known(s, self.stack) if self.stack is not None else None
+        where = f"  (scene {scene + 1})" if scene is not None else ""
+        return f"{marks}  {s.index + 1}. {os.path.splitext(s.name)[0]}{where}"
 
     def refresh_list(self):
         self.listbox.delete(0, tk.END)
@@ -1475,14 +1628,57 @@ class Aligner:
         if not self.stack or self.busy:
             return
         i, j = self.cur, self.cur + delta
-        secs = self.stack.sections
-        if not 0 <= j < len(secs):
+        if not 0 <= j < len(self.stack.sections):
             return
-        secs[i], secs[j] = secs[j], secs[i]
+        self.move_to(i, j)
+
+    def move_to(self, i, j):
+        """Take section i out of the order and put it back at position j (the others shift), and show it selected."""
+        secs = self.stack.sections
+        secs.insert(j, secs.pop(i))
         self.renumber()
         self.select(j)
         self.refresh_list()
         self.var_status.set(f"Moved section {i + 1} to position {j + 1}. Export to save the new order.")
+
+    def list_press(self, event):
+        """The start of a possible drag of a row of the section list (a plain click selects it, as before)."""
+        i = self.listbox.nearest(event.y)
+        if self.stack and not self.busy and 0 <= i < len(self.stack.sections):
+            self.list_drag = {"from": i, "y0": event.y, "moved": False, "target": i}
+        else:
+            self.list_drag = None
+
+    def list_motion(self, event):
+        d = self.list_drag
+        if d is None:
+            return "break"
+        if not d["moved"]:
+            if abs(event.y - d["y0"]) < 5:
+                return "break"
+            d["moved"] = True
+            self.listbox.config(cursor="sb_v_double_arrow")
+        h = self.listbox.winfo_height()
+        if event.y < 0:                                  # (the pointer is above or below the list: it scrolls)
+            self.listbox.yview_scroll(-1, "units")
+        elif event.y > h:
+            self.listbox.yview_scroll(1, "units")
+        t = max(0, min(self.listbox.nearest(event.y), len(self.stack.sections) - 1))
+        if t != d["target"]:
+            self.listbox.itemconfig(d["target"], background="")
+            d["target"] = t
+        if t != d["from"]:
+            self.listbox.itemconfig(t, background="#cfe3ff")   # (where the section would go)
+        return "break"
+
+    def list_release(self, event):
+        d, self.list_drag = self.list_drag, None
+        if d is None or not d["moved"]:
+            return
+        self.listbox.config(cursor="")
+        self.listbox.itemconfig(d["target"], background="")
+        if d["target"] != d["from"] and self.stack and not self.busy:
+            self.move_to(d["from"], d["target"])
 
     def delete_section(self):
         """Remove the current section from the stack (after asking); the exported JPX will not contain it."""
