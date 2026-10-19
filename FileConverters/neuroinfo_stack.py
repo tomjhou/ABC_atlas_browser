@@ -235,6 +235,20 @@ class Edit:
                 and abs(self.dx_um - other.dx_um) < tol and abs(self.dy_um - other.dy_um) < tol)
 
 
+def polygon_area_centroid(P):
+    """The centroid of the area a closed outline encloses (the mean of the vertices if the area is nil). Differs from the mean of the
+    vertices where they are unevenly spaced: up to 1350 px on real sections."""
+    P = np.asarray(P, float).reshape(-1, 2)
+    if len(P) < 3:
+        return P.mean(0) if len(P) else np.zeros(2)
+    x, y = P[:, 0], P[:, 1]
+    cr = x * np.roll(y, -1) - np.roll(x, -1) * y
+    a = cr.sum() / 2
+    if abs(a) < 1e-9:
+        return P.mean(0)
+    return np.array([((x + np.roll(x, -1)) * cr).sum(), ((y + np.roll(y, -1)) * cr).sum()]) / (6 * a)
+
+
 @dataclass
 class Section:
     index: int               # position in the stack
@@ -246,7 +260,8 @@ class Section:
     edit: Edit = field(default_factory=Edit)
     saved_edit: Edit = field(default_factory=Edit)  # what the opened file's frame shows
     source_abs_hint: str = ""                        # path recorded in the file
-    pivot_src: np.ndarray = None   # the edit pivot in source um (fixed when first opened, so editing the outline does not move it)
+    pivot_src: np.ndarray = None   # the edit pivot in source um: the outline's area centroid when first opened, then fixed (so editing
+                                   # the outline does not move the image)
     saved_points: np.ndarray = None  # the outline as the opened file has it (to tell whether it was edited)
     czi_origin: tuple = None   # for a Zeiss .czi source: where its source pixel (0, 0) is in the slide's pixel grid (see calibrate_czi)
     czi_assumed: bool = False  # that origin is the one its scan's other sections share, not yet checked against the section itself
@@ -259,7 +274,7 @@ class Section:
             self.frame = self.index
         self.case_points = np.asarray(self.case_points, float).reshape(-1, 2)
         if self.pivot_src is None:
-            self.pivot_src = self.case_points.mean(0) if len(self.case_points) else np.zeros(2)
+            self.pivot_src = polygon_area_centroid(self.case_points)
         self.pivot_src = np.asarray(self.pivot_src, float)
         if self.saved_points is None:
             self.saved_points = self.case_points.copy()
@@ -623,19 +638,28 @@ def _load_neuroinfo(jpx_path, locate=None):
     return stack
 
 
-def _load_aligner(jpx_path, doc):
+def stack_from_json(doc, folder, jpx_path=""):
+    """The Stack an alignment description (see stack_json) stands for. `folder` is where relative source paths are taken from; with
+    no jpx_path the stack is in memory only (a project's: its sections are rendered from their source images)."""
     if doc.get("format") != JSON_FORMAT or doc.get("version", 0) > JSON_VERSION:
-        raise ValueError("Unrecognized alignment data in this JPX (made by a newer version?)")
-    folder = os.path.dirname(os.path.abspath(jpx_path))
+        raise ValueError("Unrecognized alignment data (made by a newer version?)")
     stack = Stack(jpx_path, doc["canvas"][0], doc["canvas"][1], doc["channels"], doc["pixel_um"],
-                  origin=doc.get("origin", ""), from_aligner=True, source_pixel_um=float(doc.get("source_pixel_um", 0.0)))
+                  origin=doc.get("origin", ""), from_aligner=True, source_pixel_um=float(doc.get("source_pixel_um", 0.0)),
+                  z_spacing_um=float(doc.get("z_spacing_um", 0.0)), unsaved=not jpx_path)
     for i, d in enumerate(doc["sections"]):
         e = Edit(**d["edit"])
         stack.sections.append(Section(
             i, d["name"], resolve_source(folder, d["name"], d.get("source_relative", ""), d.get("source_absolute", "")),
             np.array(d["case_points"], float).reshape(-1, 2), np.array(d["base_R"], float), np.array(d["base_t"], float),
             edit=copy.copy(e), saved_edit=copy.copy(e), source_abs_hint=d.get("source_absolute", ""),
-            pivot_src=d.get("pivot_src"), czi_origin=tuple(d["czi_origin"]) if d.get("czi_origin") else None))
+            pivot_src=d["pivot_src"] if d.get("pivot_src") is not None else (    # (no pivot recorded: the first versions' default)
+                np.array(d["case_points"], float).reshape(-1, 2).mean(0) if len(d["case_points"]) else None),
+            czi_origin=tuple(d["czi_origin"]) if d.get("czi_origin") else None))
+    return stack
+
+
+def _load_aligner(jpx_path, doc):
+    stack = stack_from_json(doc, os.path.dirname(os.path.abspath(jpx_path)), jpx_path)
     frames = [b for b in read_boxes(jpx_path) if b.kind == b"jp2c"]
     if len(stack.sections) != len(frames):
         raise ValueError("Alignment data doesn't match the number of images in this JPX")
@@ -1564,6 +1588,13 @@ def verify_czi_origins(stack, log=lambda m: None, progress=None, tolerance=3.0, 
     return summary
 
 
+def read_jp2_image(path):
+    """A JPEG 2000 section image as an array (H x W x C or H x W). imagecodecs.imread decodes on one thread (9 s for a 11211 x 14856
+    x 3 image); with every processor it takes 2 s."""
+    with open(path, "rb") as f:
+        return imagecodecs.jpeg2k_decode(f.read(), numthreads=os.cpu_count() or 1)
+
+
 def render_section(section, stack, source=None, interpolation=cv2.INTER_LINEAR, use_edit=True):
     """Full-resolution section image on the stack canvas (H x W x C)."""
     offset = (0.0, 0.0)
@@ -1575,7 +1606,7 @@ def render_section(section, stack, source=None, interpolation=cv2.INTER_LINEAR, 
             source = czi_read(section.source_path, scene, 0)
             offset = section_source_offset(section, stack)
         else:
-            source = imagecodecs.imread(section.source_path)
+            source = read_jp2_image(section.source_path)
     if source.ndim == 2:
         source = source[..., None]
     R, t = section.effective() if use_edit else (section.R, section.t)
@@ -1814,6 +1845,31 @@ def export_stack(stack, out_path, quality_db=DEFAULT_QUALITY_DB, rerender_all=Fa
         f"{len(stack.sections) - n_render} copied)")
     log(f"Export took {elapsed:.1f} s in total" + (f" ({elapsed / n_render:.1f} s per re-rendered section)" if n_render else "") + ".")
     return n_render
+
+
+def fitted_copy(stack, margin=0.1):
+    """(a copy of the stack, a description) with the canvas fitted to the sections, as they are placed now: as big as their outlines
+    together plus `margin` (a fraction of their size) on every side, and every section moved with them so that the group sits in the
+    middle. The edits are relative to each section's base placement, which is what moves, so they stay as they are. The original
+    stack is not changed. A smaller canvas is quicker to export (the time follows the canvas's area)."""
+    pts = [s.stack_points for s in stack.sections if len(s.stack_points)]
+    if not pts:
+        return stack, "no outlines to fit the canvas to"
+    allp = np.vstack(pts)
+    lo, hi = allp.min(0), allp.max(0)
+    px = stack.pixel_um
+    w = int(np.ceil((hi[0] - lo[0]) / px * (1 + 2 * margin) / 16) * 16)
+    h = int(np.ceil((hi[1] - lo[1]) / px * (1 + 2 * margin) / 16) * 16)
+    shift = np.array([w / 2 * px, -h / 2 * px]) - (lo + hi) / 2      # (um: from the middle of the group to the middle of the new canvas)
+    out = copy.copy(stack)
+    out.canvas_w, out.canvas_h = w, h
+    out.sections = []
+    for s in stack.sections:
+        c = copy.copy(s)
+        c.t = s.t + shift
+        out.sections.append(c)
+    return out, (f"canvas fitted to the sections: {w} x {h} px ({w * h / 1e6:.0f} MP), was {stack.canvas_w} x {stack.canvas_h} px "
+                 f"({stack.canvas_w * stack.canvas_h / 1e6:.0f} MP)")
 
 
 def next_free_name(folder, stem="reconstruction", ext=".jpx"):

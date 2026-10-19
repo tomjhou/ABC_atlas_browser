@@ -1,6 +1,7 @@
 """The data side of step 1 of the workflow (find the sections on Zeiss .czi slide scans): detecting section outlines from a
 brightness threshold, merging outlines, the project (slides, outlines, order) with its file, and turning a project into the
 in-memory Stack that the alignment tool (jpx_aligner) opens. No windows here; see section_loader for those."""
+import hashlib
 import json
 import math
 import os
@@ -16,11 +17,18 @@ import neuroinfo_stack as ns
 
 PROJECT_FORMAT = "section-project"
 PROJECT_VERSION = 1
-PROJECT_SUFFIX = ".sections.json"
+PROJECT_SUFFIX = "_project.json"             # the name of a project file ends like this, so that it is not taken for some other .json
+OLD_PROJECT_SUFFIX = ".sections.json"       # what project files were called at first: still opened
+CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "JhouLab", "jpx_aligner_cache")   # (beside the aligner's)
 OVERVIEW_PX = 2400          # the longest side of the slide picture that outlines are detected on (a pixel is ~15 um on a big slide)
 OUTWARD_CUTOFF = 0.35       # smoothing keeps a pixel when this much of its neighbourhood is in the region (below 0.5: outward)
 MAX_VERTICES = 80           # NeuroInfo's own outlines have 60-80 points
 DEFAULT_COLORS = ((0, 160, 255), (0, 255, 91), (255, 1, 0), (255, 255, 255))
+
+
+def is_project_path(path):
+    """Whether a file name is a project file's (the current ending, or the one used at first)."""
+    return path.lower().endswith((PROJECT_SUFFIX, OLD_PROJECT_SUFFIX))
 
 
 ##################################################
@@ -123,20 +131,52 @@ def compose(chans, colors):
     return gray, (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
 
 
-def overview(path, max_px=OVERVIEW_PX):
-    """A picture of the whole slide for finding sections on: (8-bit gray image, (x0, y0, k), the same in the channels' colors
-    as an 8-bit RGB image) where slide pixel (X, Y) is at ((X - x0) / k, (Y - y0) / k)."""
+def _overview_cache_file(path, max_px):
+    st = os.stat(path)
+    key = f"overview1|{os.path.abspath(path).lower()}|{st.st_size}|{st.st_mtime_ns}|{max_px}"
+    return os.path.join(CACHE_DIR, "ov_" + hashlib.sha1(key.encode()).hexdigest() + ".npz")
+
+
+def overview(path, max_px=OVERVIEW_PX, color=False):
+    """A picture of the whole slide for finding sections on: (8-bit gray image, (x0, y0, k), RGB or None) where slide pixel (X, Y) is
+    at ((X - x0) / k, (Y - y0) / k). The RGB picture (the channels in their colors) costs half as much again to make for a .czi, so
+    it comes only when `color` asks for it (a .jp2 always gives it: it is made from the same decode). Pictures are kept on disk, so
+    that the second time is quick."""
+    cache = None
+    try:
+        cache = _overview_cache_file(path, max_px)
+        with np.load(cache) as d:
+            rgb = d["rgb"] if "rgb" in d.files else None
+            if rgb is not None or not color:
+                return d["gray"], tuple(float(v) for v in d["geo"]), rgb
+            gray, geo = d["gray"], tuple(float(v) for v in d["geo"])
+    except Exception:
+        gray = geo = None            # (no cache file, or a damaged one)
     info = slide_info(path)
     colors = [c.color for c in info.channels]
-    if is_jp2(path):
+    rgb = None
+    if gray is not None:             # (the gray picture was cached; only the color is missing)
+        rgb = ns.czi_slide_thumbnail(path, max_px, colors=colors)[2]
+    elif is_jp2(path):
         w, h = jp2_header(path)[:2]
         r = max(0, int(math.ceil(math.log2(max(w, h) / max_px))))     # (the picture is decoded at 1/2**r: quick, whatever the size)
         with open(path, "rb") as f:
             img = imagecodecs.jpeg2k_decode(f.read(), skipres=r)
         chans = (img[:, :, None] if img.ndim == 2 else img).astype(np.float32)
         gray, rgb = compose(chans, colors)
-        return gray, (0, 0, float(2 ** r)), rgb
-    return ns.czi_slide_thumbnail(path, max_px, colors=colors)
+        geo = (0.0, 0.0, float(2 ** r))
+    elif color:
+        gray, geo, rgb = ns.czi_slide_thumbnail(path, max_px, colors=colors)
+    else:
+        gray, geo = ns.czi_slide_thumbnail(path, max_px)
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        tmp = cache + ".partial.npz"
+        np.savez(tmp, gray=gray, geo=np.array(geo, float), **({"rgb": rgb} if rgb is not None else {}))
+        os.replace(tmp, cache)
+    except Exception:
+        pass                          # (the cache is only a convenience)
+    return gray, tuple(float(v) for v in geo), rgb
 
 
 ##################################################
@@ -151,32 +191,46 @@ def auto_threshold(img):
     return int(t)
 
 
-def detect_mask(img, threshold, min_area, smooth=0):
+def fill_holes(mask):
+    """The mask with the holes inside its regions filled (as the outlines go round the outside of each region)."""
+    found, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = np.zeros_like(mask)
+    cv2.drawContours(out, found, -1, 1, cv2.FILLED)
+    return out
+
+
+def detect_mask(img, threshold, min_area, smooth=0, pad=0):
     """Pixels brighter than `threshold` (after a slight blur), without the regions smaller than `min_area` pixels: 0/1, uint8.
     `smooth` (pixels) evens out the boundary, outward by preference: notches and inlets narrower than 2 * smooth are filled in
     first (a closing, which only adds pixels), then the boundary is rounded with a blur whose cut-off lies below the middle, so
-    that the boundary settles outside of where it was rather than inside."""
+    that the boundary settles outside of where it was rather than inside. `pad` (pixels) then grows each region outward by that much."""
     mask = (cv2.GaussianBlur(img, (0, 0), 1.5) > threshold).astype(np.uint8)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     keep = np.zeros(n, np.uint8)
     keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= max(min_area, 1)
     mask = keep[labels]
-    if smooth > 0:
+    if smooth > 0 or pad > 0:
         # Region by region, so that smoothing never joins two regions (the sections of a slide can lie only a few hundred um
         # apart): what a region gains stays nearer to it than to any other, by a margin.
         k = 2 * int(smooth) + 1
+        margin = 2 * k + int(pad)
         n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
         out = mask.copy()
         h, w = mask.shape
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
         for i in range(1, n):
             x, y, bw, bh, _a = stats[i]
-            x0, y0, x1, y1 = max(x - 2 * k, 0), max(y - 2 * k, 0), min(x + bw + 2 * k, w), min(y + bh + 2 * k, h)
+            x0, y0, x1, y1 = max(x - margin, 0), max(y - margin, 0), min(x + bw + margin, w), min(y + bh + margin, h)
             mine = (labels[y0:y1, x0:x1] == i).astype(np.uint8)
             others = ((labels[y0:y1, x0:x1] != i) & (labels[y0:y1, x0:x1] > 0)).astype(np.uint8)
-            padded = cv2.copyMakeBorder(mine, k, k, k, k, cv2.BORDER_CONSTANT, value=0)
-            closed = cv2.morphologyEx(padded, cv2.MORPH_CLOSE, kernel)
-            rounded = (cv2.GaussianBlur(closed.astype(np.float32), (0, 0), 0.7 * smooth) > OUTWARD_CUTOFF)[k:-k, k:-k]
+            if smooth > 0:
+                padded = cv2.copyMakeBorder(mine, k, k, k, k, cv2.BORDER_CONSTANT, value=0)
+                closed = cv2.morphologyEx(padded, cv2.MORPH_CLOSE, kernel)
+                rounded = (cv2.GaussianBlur(closed.astype(np.float32), (0, 0), 0.7 * smooth) > OUTWARD_CUTOFF)[k:-k, k:-k]
+            else:
+                rounded = mine.astype(bool)
+            if pad > 0:
+                rounded = cv2.dilate(rounded.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(pad) + 1,) * 2)).astype(bool)
             if others.any():   # (only where this region is nearer than any other, by a margin: so grown regions stay apart)
                 near = cv2.distanceTransform(1 - mine, cv2.DIST_L2, 3) < cv2.distanceTransform(1 - others, cv2.DIST_L2, 3) - 2
                 grown = rounded.astype(np.uint8) & near.astype(np.uint8)
@@ -265,8 +319,9 @@ def polygon_centroid(p):
 class Slide:
     path: str
     threshold: int = -1               # brightness threshold used (-1: not set yet)
-    min_area: int = 200               # smallest region kept, in overview pixels
+    min_area: int = -1                # smallest region kept, in overview pixels (-1: not set yet: 0.25 mm2 when first shown)
     smooth: int = 8                   # how much the boundary is smoothed (pixels; outward by preference)
+    pad: int = 2                      # how far each outline is grown outward (pixels)
     pixel_um: float = 0.0             # pixel size set by the user (0: the file's own)
     polygons: list = field(default_factory=list)   # outlines in the slide's pixel grid (n x 2, x then y), once accepted
     accepted: bool = False
@@ -278,10 +333,17 @@ class Project:
     order: list = field(default_factory=list)      # [(slide index, polygon index)] in section order (empty: not ordered yet)
     path: str = ""                                 # the project file ("" until saved)
     z_spacing_um: float = 0.0                      # distance between adjacent sections (um); NeuroInfo asks for it too
+    alignment: dict = None                         # the aligner's state (stack_json): its edits, outline changes, order, canvas
+    alignment_key: str = ""                        # fingerprint() of the outlines and order that alignment was made from
 
     def polygons_key(self):
         """Something that changes when any slide's outlines do (the order is kept while this is the same)."""
         return [(s.path, [np.round(p, 1).tolist() for p in s.polygons]) for s in self.slides]
+
+    def fingerprint(self):
+        """A short code for the outlines and their order: the saved alignment belongs to these, and is dropped if they change."""
+        text = json.dumps([self.polygons_key(), self.order or self.default_order()])
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
     def default_order(self):
         """Slide by slide, each in reading order (the order the outlines were found in)."""
@@ -293,9 +355,10 @@ class Project:
             raise ValueError("no project file name")
         doc = {"format": PROJECT_FORMAT, "version": PROJECT_VERSION,
                "slides": [{"path": s.path.replace("\\", "/"), "threshold": s.threshold, "min_area": s.min_area,
-                           "smooth": s.smooth, "pixel_um": s.pixel_um, "accepted": s.accepted, "polygons": [np.round(p, 2).tolist() for p in s.polygons]}
+                           "smooth": s.smooth, "pad": s.pad, "pixel_um": s.pixel_um, "accepted": s.accepted, "polygons": [np.round(p, 2).tolist() for p in s.polygons]}
                           for s in self.slides],
-               "order": [list(o) for o in self.order], "z_spacing_um": self.z_spacing_um}
+               "order": [list(o) for o in self.order], "z_spacing_um": self.z_spacing_um,
+               "alignment": self.alignment, "alignment_key": self.alignment_key}
         tmp = path + ".partial"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(doc, f, separators=(",", ":"))
@@ -314,11 +377,23 @@ class Project:
             if not os.path.isfile(p):      # (the slide may have moved with the project file: look beside it)
                 alt = os.path.join(os.path.dirname(os.path.abspath(path)), os.path.basename(p))
                 p = alt if os.path.isfile(alt) else p
-            slides.append(Slide(p, threshold=d.get("threshold", -1), min_area=d.get("min_area", 200), smooth=d.get("smooth", 8), pixel_um=d.get("pixel_um", 0.0),
+            slides.append(Slide(p, threshold=d.get("threshold", -1), min_area=d.get("min_area", -1), smooth=d.get("smooth", 8), pad=d.get("pad", 2), pixel_um=d.get("pixel_um", 0.0),
                                 polygons=[np.array(q, float).reshape(-1, 2) for q in d["polygons"]],
                                 accepted=d.get("accepted", False)))
-        proj = Project(slides, [tuple(o) for o in doc.get("order", [])], os.path.abspath(path), float(doc.get("z_spacing_um", 0.0)))
+        proj = Project(slides, [tuple(o) for o in doc.get("order", [])], os.path.abspath(path), float(doc.get("z_spacing_um", 0.0)),
+                       doc.get("alignment"), doc.get("alignment_key", ""))
         return proj
+
+    def new_path(self):
+        """The file name for a project not saved yet: <first image>_project.json, or ..._2_project.json, ..._3_project.json if that name
+        is taken (by a project that was not opened here: one that was opened keeps its own name and is written to)."""
+        base = self.default_path()
+        stem = base[:-len(PROJECT_SUFFIX)]
+        path, n = base, 1
+        while os.path.exists(path):
+            n += 1
+            path = f"{stem}_{n}{PROJECT_SUFFIX}"
+        return path
 
     def default_path(self):
         first = self.slides[0].path
@@ -333,7 +408,13 @@ class Project:
 
 def build_stack(project, margin=0.2):
     """The in-memory Stack of a project, ready for the alignment tool: one section per outline, in order, each rendered from its
-    slide scan (so no JPX is needed) and placed unrotated at the middle of a canvas big enough for the largest of them."""
+    slide scan (so no JPX is needed) and placed unrotated at the middle of a canvas big enough for the largest of them. If the project
+    holds an alignment made from these same outlines and order, that is what comes back: the work picks up where it was left."""
+    if project.alignment and project.alignment_key == project.fingerprint():
+        stack = ns.stack_from_json(project.alignment, os.path.dirname(os.path.abspath(project.path or project.slides[0].path)))
+        stack.channel_info = list(slide_info(project.slides[0].path).channels)
+        stack.z_spacing_um = stack.z_spacing_um or project.z_spacing_um
+        return stack
     infos = {}
     for s in project.slides:
         if s.path not in infos:
@@ -355,12 +436,10 @@ def build_stack(project, margin=0.2):
         raise ValueError("The slides have different numbers of channels, so their sections can't go in one stack.")
     order = project.order or project.default_order()
     items = []
-    counts = {}
     for si, pi in order:
         slide = project.slides[si]
         poly = slide.polygons[pi]
-        counts[si] = counts.get(si, 0) + 1
-        items.append((slide, poly, f"{os.path.splitext(os.path.basename(slide.path))[0]} #{counts[si]}"))
+        items.append((slide, poly, f"{os.path.splitext(os.path.basename(slide.path))[0]} #{pi + 1}"))   # (# is the outline's number in step 1, whatever order it ends up in)
     if not items:
         raise ValueError("There are no section outlines.")
     # section outlines in the scan's own um (y up, as NeuroInfo keeps them), whatever the slide's pixel size
@@ -377,6 +456,7 @@ def build_stack(project, margin=0.2):
     centre = np.array([side / 2 * px, -side / 2 * px])
     for n, ((slide, poly, name), p) in enumerate(zip(items, pts)):
         c = polygon_centroid(p)
-        sec = ns.Section(n, name, slide.path, p, np.eye(2), centre - c, czi_origin=None if is_jp2(slide.path) else (0.0, 0.0))
+        sec = ns.Section(n, name, slide.path, p, np.eye(2), centre - c, pivot_src=c,
+                         czi_origin=None if is_jp2(slide.path) else (0.0, 0.0))
         stack.sections.append(sec)
     return stack

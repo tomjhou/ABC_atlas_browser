@@ -96,9 +96,11 @@ Double-click `RUN_WORKFLOW.bat` for the start window, with two steps in order:
 1. **Load / detect images** (`section_loader.py`): choose Zeiss `.czi` slide scans; for each slide, set a
    brightness threshold (the preview tints what will be found) and accept it to outline each section
    (holes such as ventricles stay in); merge, delete or hand-draw outlines; then drag the sections into their order.
-   The result is saved beside the first slide as `<name>.sections.json` and handed, in memory, to step 2.
-2. **Align images**: the aligner below. Open a `.jpx` or a saved `.sections.json` (File > Open). A project that
+   The result is saved beside the first slide as `<name>_project.json` and handed, in memory, to step 2.
+2. **Align images**: the aligner below. Open a `.jpx` or a saved `_project.json` (File > Open). A project that
    starts from slide scans has no JPX yet; its first export writes one.
+   The alignment edits (moves, rotations, flips, outline changes, order) are saved into the same project file as you
+   work, every couple of seconds, so you can close the tool and pick up later by opening the project again.
 
 ## JPX ALIGNER (adjust NeuroInfo section stacks)
 

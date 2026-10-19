@@ -29,8 +29,16 @@ SELECT_COLOR, OUTLINE_COLOR, DRAW_COLOR = "#ff3030", "#ffd400", "#00e5ff"
 TINT = np.array([0, 190, 255], np.float32)
 
 
-def human_gb(n):
-    return f"{n / 2 ** 30:.1f} GB"
+def human_size(n):
+    """A file size in the unit that suits it (bytes, KB, MB, GB or TB)."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f} B" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+DEFAULT_MIN_AREA_MM2 = 0.25    # the smallest region kept, until the user moves the slider
 
 
 class SectionLoader:
@@ -46,6 +54,14 @@ class SectionLoader:
         self.stage = 0
         self.msgs = queue.Queue()
         self.busy = 0
+        self.closing = False
+        # pictures are loaded in the background, the one wanted now first (two at a time: they are different files)
+        self.ov_lock = threading.Lock()
+        self.ov_gray_q, self.ov_color_q, self.ov_active = [], [], set()
+        self.ov_wake = threading.Event()
+        self.waiting_for = None          # the image shown as soon as its picture arrives
+        for _ in range(2):
+            threading.Thread(target=self.ov_worker, daemon=True).start()
         self.result = None
         self.order_key = None           # project.polygons_key() when the order was last set
         # ---- the strip of stages
@@ -75,7 +91,7 @@ class SectionLoader:
         self.btn_back.pack(side=tk.RIGHT, padx=6)
         self.frames = [self.build_load(), self.build_detect(), self.build_order()]
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
-        self.root.after(50, self.poll)
+        self.poll_id = self.root.after(50, self.poll)
         for p in slides:
             self.project.slides.append(sp.Slide(p))
         self.refresh_slide_list()
@@ -89,12 +105,22 @@ class SectionLoader:
         self.root.mainloop()
         return self.result
 
+    def close(self):
+        """Close the window (its timer cancelled first, so that it can't go off in the next window)."""
+        self.closing = True
+        self.ov_wake.set()
+        try:
+            self.root.after_cancel(self.poll_id)
+        except (tk.TclError, AttributeError):
+            pass
+        self.root.destroy()
+
     def quit(self):
         if self.project.slides and not messagebox.askyesno("Quit", "Close without handing the sections to the alignment tool?\n"
                                                            "(What you have done is saved in the project file when you go on.)",
                                                            parent=self.root):
             return
-        self.root.destroy()
+        self.close()
 
     def background(self, work, done):
         """Run work() in a thread, then done(result or exception) in the window's thread."""
@@ -110,11 +136,89 @@ class SectionLoader:
 
         threading.Thread(target=target, daemon=True).start()
 
+    def want(self, path, kind="gray", urgent=False):
+        """Ask for a slide's picture to be loaded in the background: `kind` "gray" (the one outlines are found on) or "color". Urgent
+        ones go to the front; the rest are taken in the order asked."""
+        if (kind == "gray" and path in self.ov) or (kind == "color" and path in self.ovc):
+            return
+        key = (kind, path)
+        q = self.ov_gray_q if kind == "gray" else self.ov_color_q
+        with self.ov_lock:
+            if key in self.ov_active:
+                return
+            if key in q:
+                q.remove(key)
+            q.insert(0, key) if urgent else q.append(key)
+        self.ov_wake.set()
+
+    def queue_preload(self):
+        """Load every slide's picture in the background (grays first, then the colors), without waiting for it to be looked at."""
+        for s in self.project.slides:
+            self.want(s.path, "gray")
+        for s in self.project.slides:
+            if not sp.is_jp2(s.path):       # (a .jp2's color comes with its gray)
+                self.want(s.path, "color")
+
+    def ov_worker(self):
+        ns.lower_thread_priority()
+        while not self.closing:
+            self.ov_wake.wait()
+            while not self.closing:
+                with self.ov_lock:
+                    q = self.ov_gray_q or self.ov_color_q
+                    if not q:
+                        self.ov_wake.clear()
+                        break
+                    kind, path = q.pop(0)
+                    self.ov_active.add((kind, path))
+                if all(s.path != path for s in self.project.slides):
+                    res = None                  # (the slide was taken out of the list)
+                else:
+                    try:
+                        res = sp.overview(path, color=(kind == "color"))
+                        if kind == "color":
+                            res = res[2]
+                    except BaseException as e:
+                        res = e
+                with self.ov_lock:
+                    self.ov_active.discard((kind, path))
+                self.msgs.put(("overview", (kind, path, res)))
+
+    def on_overview(self, kind, path, res):
+        """A picture arrived from the background loader."""
+        if res is None:
+            return
+        if isinstance(res, BaseException):
+            if kind == "gray" and self.waiting_for == path:
+                self.waiting_for = None
+                self.var_status.set("")
+                messagebox.showerror("Can't read the image", f"{os.path.basename(path)}\n\n{type(res).__name__}: {res}", parent=self.root)
+            return
+        if kind == "gray":
+            self.ov[path] = res[:2]
+            if res[2] is not None:
+                self.ovc[path] = res[2]
+        else:
+            self.ovc[path] = res
+        if self.stage == 1 and self.project.slides and self.slide().path == path:
+            if kind == "gray" and self.waiting_for == path:
+                self.waiting_for = None
+                self.var_status.set("")
+                self.slide_ready()
+            elif kind == "color" and self.var_color.get() and self.base_rgb is not None:
+                self.var_status.set("")
+                self.set_base()
+                self.redraw()
+        elif self.stage == 2 and kind == "gray":
+            self.finish_thumbs()
+
     def poll(self):
         try:
             while True:
                 kind, payload = self.msgs.get_nowait()
-                if kind == "done":
+                if kind == "overview":
+                    self.on_overview(*payload)
+                elif kind == "done":
                     done, res = payload
                     self.busy -= 1
                     if not self.busy:
@@ -122,7 +226,7 @@ class SectionLoader:
                     done(res)
         except queue.Empty:
             pass
-        self.root.after(50, self.poll)
+        self.poll_id = self.root.after(50, self.poll)
 
     def show_stage(self, n):
         self.stage = n
@@ -168,11 +272,11 @@ class SectionLoader:
             bad = [os.path.basename(s.path) for s in self.project.slides if not s.accepted]
             n = sum(len(s.polygons) for s in self.project.slides)
             if not n:
-                messagebox.showinfo("No outlines", "No section outlines yet: accept the outlines of at least one slide.", parent=self.root)
+                messagebox.showinfo("No outlines", "No section outlines yet: accept the outlines of at least one image.", parent=self.root)
                 return
             if bad and not messagebox.askyesno(
-                    "Slides without outlines",
-                    "The outlines of these slides haven't been accepted, so they will have no sections:\n\n" + "\n".join(bad[:8])
+                    "Images without outlines",
+                    "The outlines of these images haven't been accepted, so they will have no sections:\n\n" + "\n".join(bad[:8])
                     + "\n\nGo on anyway?", parent=self.root):
                 return
             self.show_stage(2)
@@ -200,7 +304,7 @@ class SectionLoader:
         sb.pack(side=tk.LEFT, fill=tk.Y)
         side = ttk.Frame(mid, padding=(12, 0))
         side.pack(side=tk.LEFT, fill=tk.Y)
-        ttk.Button(side, text="Add slides...", command=self.add_slides).pack(fill=tk.X)
+        ttk.Button(side, text="Add images...", command=self.add_slides).pack(fill=tk.X)
         ttk.Button(side, text="Remove", command=self.remove_slides).pack(fill=tk.X, pady=6)
         ttk.Button(side, text="Move up", command=lambda: self.move_slide(-1)).pack(fill=tk.X)
         ttk.Button(side, text="Move down", command=lambda: self.move_slide(1)).pack(fill=tk.X, pady=6)
@@ -215,14 +319,15 @@ class SectionLoader:
             info = self.infos.get(s.path)
             px = self.slide_px(s)
             self.slide_tree.insert("", tk.END, iid=str(i), values=(
-                s.path, info.scenes if info else "...", human_gb(info.size_bytes) if info else "",
+                s.path, info.scenes if info else "...", human_size(info.size_bytes) if info else "",
                 (f"{px:g}" if px else "unknown") if info else ""))
 
     def read_infos(self):
         todo = [s.path for s in self.project.slides if s.path not in self.infos]
+        self.queue_preload()
         if not todo:
             return
-        self.var_status.set("Reading the slides...")
+        self.var_status.set("Reading the files...")
 
         def work():
             return [(p, sp.slide_info(p)) for p in todo]
@@ -235,6 +340,7 @@ class SectionLoader:
             for p, info in res:
                 self.infos[p] = info
             self.refresh_slide_list()
+            self.queue_preload()
             self.var_status.set(f"{len(self.project.slides)} slide(s).")
 
         self.background(work, done)
@@ -292,7 +398,7 @@ class SectionLoader:
 
     def open_project(self):
         path = filedialog.askopenfilename(parent=self.root, title="Open a saved project",
-                                          filetypes=[("Section projects", "*" + sp.PROJECT_SUFFIX), ("All files", "*.*")])
+                                          filetypes=[("Section projects", "*" + sp.PROJECT_SUFFIX + " *" + sp.OLD_PROJECT_SUFFIX), ("All files", "*.*")])
         if not path:
             return
         try:
@@ -305,7 +411,7 @@ class SectionLoader:
             messagebox.showerror("Slides not found", "These slide scans weren't found:\n\n" + "\n".join(missing[:6]), parent=self.root)
             return
         self.project = proj
-        self.infos, self.ov = {}, {}
+        self.infos, self.ov, self.ovc = {}, {}, {}
         self.order_key = proj.polygons_key() if proj.order else None
         self.refresh_slide_list()
         self.read_infos()
@@ -322,10 +428,12 @@ class SectionLoader:
         self.draw_pts = []
         self.view = None                   # (scale, ox, oy): overview pixel -> canvas pixel
         self.mask = None
+        self.mask_show = None
         self.base_rgb = None
         self.photo = None
         self.pan = None
         self.job = None
+        self.panel_nav = []                # (previous, next) buttons of the panels at the right
         # ---- the picture
         left = ttk.Frame(f)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -334,13 +442,16 @@ class SectionLoader:
         self.btn_prev = ttk.Button(nav, text="◀", width=3, command=lambda: self.goto_slide(self.cur - 1))
         self.btn_prev.pack(side=tk.LEFT)
         self.var_slide = tk.StringVar(f, "")
-        ttk.Label(nav, textvariable=self.var_slide, font=("Segoe UI", 11, "bold")).pack(side=tk.LEFT, padx=10)
+        # the heading is a menu of the images, to jump to any of them (its text keeps the bold type of the heading it replaces)
+        self.combo = ttk.Combobox(nav, textvariable=self.var_slide, state="readonly", font=("Segoe UI", 11, "bold"), width=60)
+        self.combo.pack(side=tk.LEFT, padx=10)
+        self.combo.bind("<<ComboboxSelected>>", self.on_pick_image)
+        self.root.option_add("*TCombobox*Listbox.font", ("Segoe UI", 10))
         self.btn_fwd = ttk.Button(nav, text="▶", width=3, command=lambda: self.goto_slide(self.cur + 1))
         self.btn_fwd.pack(side=tk.LEFT)
         ttk.Button(nav, text="Fit", width=5, command=self.fit_view).pack(side=tk.RIGHT)
         self.var_color = tk.BooleanVar(f, False)
         ttk.Checkbutton(nav, text="Show sections in color", variable=self.var_color, command=self.on_color).pack(side=tk.RIGHT, padx=14)
-        ttk.Label(nav, text="Wheel: zoom   Right button: pan", foreground="gray40").pack(side=tk.RIGHT, padx=10)
         self.canvas = tk.Canvas(left, bg="#202020", highlightthickness=0, cursor="arrow")
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.canvas.bind("<Configure>", lambda e: self.redraw())
@@ -359,6 +470,8 @@ class SectionLoader:
         right = ttk.Frame(f, padding=12, width=330)
         right.pack(side=tk.RIGHT, fill=tk.Y)
         right.pack_propagate(False)
+        left.pack_forget()                 # (packed again after the panel, so that a wide row above the picture can't push it off)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.panel_threshold = ttk.Frame(right)
         self.panel_edit = ttk.Frame(right)
         p = self.panel_threshold
@@ -379,9 +492,15 @@ class SectionLoader:
         ttk.Label(p, textvariable=self.var_smooth_text).pack(anchor="w")
         self.scale_smooth = ttk.Scale(p, from_=0, to=20, command=self.on_smooth)
         self.scale_smooth.pack(fill=tk.X, pady=(0, 12))
+        self.var_pad_text = tk.StringVar(f, "")
+        ttk.Label(p, textvariable=self.var_pad_text).pack(anchor="w")
+        self.scale_pad = ttk.Scale(p, from_=0, to=10, command=self.on_pad)
+        self.scale_pad.pack(fill=tk.X, pady=(0, 12))
         self.var_found = tk.StringVar(f, "")
         ttk.Label(p, textvariable=self.var_found, foreground="gray30").pack(anchor="w")
-        ttk.Button(p, text="Accept", command=self.accept).pack(fill=tk.X, pady=(18, 0))
+        ttk.Button(p, text="Accept detection for this image", command=self.accept).pack(fill=tk.X, pady=(18, 0))
+        ttk.Button(p, text="Accept detection for all images", command=self.accept_all).pack(fill=tk.X, pady=(6, 0))
+        self.image_buttons(p)
         ttk.Label(p, text="The outline of each tinted region is drawn around its outside; holes inside it (ventricles) stay in.",
                   wraplength=300, foreground="gray40").pack(anchor="w", pady=8)
         p = self.panel_edit
@@ -398,10 +517,34 @@ class SectionLoader:
         self.btn_undo.pack(fill=tk.X, pady=6)
         ttk.Separator(p).pack(fill=tk.X, pady=12)
         ttk.Button(p, text="Change the threshold", command=self.back_to_threshold).pack(fill=tk.X)
+        ttk.Button(p, text="Accept detection for all images", command=self.accept_all).pack(fill=tk.X, pady=(6, 0))
+        self.image_buttons(p)
         ttk.Label(p, text="Click an outline to select it; shift-click adds to the selection. Merge joins two outlines along "
                           "their closest vertices (the two halves of a section). To draw one, click its points; double-click the "
                           "last point or press C to close it; Esc cancels.", wraplength=300, foreground="gray40").pack(anchor="w", pady=10)
         return f
+
+    def image_buttons(self, parent):
+        """Previous image / Next image, in the panel at the right (the arrows above the picture do the same)."""
+        row = ttk.Frame(parent)
+        row.pack(fill=tk.X, pady=(10, 0))
+        prev = ttk.Button(row, text="Previous image", command=lambda: self.goto_slide(self.cur - 1))
+        prev.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        nxt = ttk.Button(row, text="Next image", command=lambda: self.goto_slide(self.cur + 1))
+        nxt.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+        self.panel_nav.append((prev, nxt))
+
+    def on_pick_image(self, event=None):
+        i = self.combo.current()
+        self.combo.selection_clear()
+        self.canvas.focus_set()
+        if i >= 0 and i != self.cur:
+            self.goto_slide(i)
+
+    def refresh_image_menu(self):
+        n = len(self.project.slides)
+        names = [f"Image {i + 1} of {n}:  {os.path.basename(s.path)}" for i, s in enumerate(self.project.slides)]
+        self.combo.config(values=names, width=min(max((len(t) for t in names), default=20) + 2, 80))
 
     # -- entering and leaving the stage
 
@@ -424,28 +567,24 @@ class SectionLoader:
         self.cur = i
         s = self.slide()
         self.selected, self.draw_pts = set(), []
+        last = len(self.project.slides) - 1
         self.btn_prev.config(state="normal" if i else "disabled")
-        self.btn_fwd.config(state="normal" if i < len(self.project.slides) - 1 else "disabled")
-        self.var_slide.set(f"Slide {i + 1} of {len(self.project.slides)}:  {os.path.basename(s.path)}")
+        self.btn_fwd.config(state="normal" if i < last else "disabled")
+        for prev, nxt in self.panel_nav:
+            prev.config(state="normal" if i else "disabled")
+            nxt.config(state="normal" if i < last else "disabled")
+        self.refresh_image_menu()
+        self.var_slide.set(f"Image {i + 1} of {len(self.project.slides)}:  {os.path.basename(s.path)}")
         if s.path in self.ov:
+            self.waiting_for = None
             self.slide_ready()
         else:
             self.base_rgb = None
             self.canvas.delete("all")
-            self.canvas.create_text(30, 30, anchor="nw", fill="white", text="Loading the slide picture...", font=("Segoe UI", 12))
-            path = s.path
-            self.var_status.set("Loading the slide picture...")
-
-            def done(res):
-                if isinstance(res, BaseException):
-                    messagebox.showerror("Can't read the slide", f"{type(res).__name__}: {res}", parent=self.root)
-                    return
-                self.ov[path], self.ovc[path] = res[:2], res[2]
-                self.var_status.set("")
-                if self.stage == 1 and self.slide().path == path:
-                    self.slide_ready()
-
-            self.background(lambda: sp.overview(path), done)
+            self.canvas.create_text(30, 30, anchor="nw", fill="white", text="Loading the picture...", font=("Segoe UI", 12))
+            self.var_status.set("Loading the picture...")
+            self.waiting_for = s.path
+            self.want(s.path, "gray", urgent=True)
 
     def slide_ready(self):
         s = self.slide()
@@ -453,6 +592,8 @@ class SectionLoader:
         self.set_base()
         if s.threshold < 0:
             s.threshold = sp.auto_threshold(img)
+        if s.min_area < 0:
+            s.min_area = max(int(round(DEFAULT_MIN_AREA_MM2 / self.px_mm2())), 1)
         if self.cur not in self.polys:
             self.polys[self.cur] = [self.to_overview(p) for p in s.polygons]
         self.set_mode("edit" if s.accepted else "threshold")
@@ -463,12 +604,20 @@ class SectionLoader:
         s = self.slide()
         gray = self.ov[s.path][0]
         color = self.ovc.get(s.path)
+        if self.var_color.get() and color is None:
+            self.want(s.path, "color", urgent=True)      # (gray until the color picture is ready)
         self.base_rgb = color if self.var_color.get() and color is not None else np.repeat(gray[:, :, None], 3, axis=2)
 
     def on_color(self):
-        if self.base_rgb is not None and self.slide().path in self.ov:
-            self.set_base()
-            self.redraw()
+        if self.base_rgb is None or self.slide().path not in self.ov:
+            return
+        path = self.slide().path
+        if self.var_color.get() and path not in self.ovc:
+            self.var_status.set("Building the color picture...")      # (the gray one stays until it is ready)
+            self.want(path, "color", urgent=True)
+            return
+        self.set_base()
+        self.redraw()
 
     def to_overview(self, poly):
         x0, y0, k = self.ov[self.slide().path][1]
@@ -478,6 +627,18 @@ class SectionLoader:
         x0, y0, k = self.ov[path or self.slide().path][1]
         return poly * k + np.array([x0, y0])
 
+    def save_path(self):
+        """Where the project is saved: the file it was opened from, else a new name that doesn't take the place of another project's
+        file (a project's name comes from its first image, so two projects can start alike)."""
+        if self.project.path:
+            return self.project.path
+        path = self.project.new_path()
+        taken = path != self.project.default_path()
+        self.var_status.set(f"Project file: {os.path.basename(path)}" + (
+            " (the usual name belongs to another project, which was left as it is)" if taken else ""))
+        print(f"Project file: {path}", flush=True)
+        return path
+
     def sync_project(self):
         """Write the editor's outlines of every slide visited back into the project, and save it."""
         for i, polys in self.polys.items():
@@ -486,7 +647,7 @@ class SectionLoader:
                 s.polygons = [self.to_slide(p, s.path) for p in polys]
         if self.project.slides and any(s.polygons for s in self.project.slides):
             try:
-                self.project.save(self.project.path or self.project.default_path())
+                self.project.save(self.save_path())
             except OSError as e:
                 self.var_status.set(f"Couldn't save the project: {e}")
 
@@ -503,6 +664,7 @@ class SectionLoader:
             self.scale_thr.set(s.threshold)
             self.scale_min.set(self.min_area_mm2())
             self.scale_smooth.set(s.smooth)
+            self.scale_pad.set(s.pad)
             self.update_labels()
             self.recompute_mask()
         else:
@@ -526,6 +688,8 @@ class SectionLoader:
         self.var_thr_text.set(f"Brightness threshold: {s.threshold}")
         self.var_min_text.set(f"Ignore regions smaller than {self.min_area_mm2():.2f} mm²")
         um = s.smooth * self.ov[s.path][1][2] * (self.slide_px(s) or 0.65)
+        pad_um = s.pad * self.ov[s.path][1][2] * (self.slide_px(s) or 0.65)
+        self.var_pad_text.set("Padding: none" if not s.pad else f"Padding: {s.pad} px ({pad_um:.0f} \u00b5m)")
         self.var_smooth_text.set("Smoothing: none" if not s.smooth else f"Smoothing: {s.smooth} px ({um:.0f} µm), outward")
 
     def on_threshold(self, v):
@@ -551,6 +715,15 @@ class SectionLoader:
             self.update_labels()
             self.schedule_mask()
 
+    def on_pad(self, v):
+        if self.mode != "threshold" or self.base_rgb is None:
+            return
+        n = int(round(float(v)))
+        if n != self.slide().pad:
+            self.slide().pad = n
+            self.update_labels()
+            self.schedule_mask()
+
     def schedule_mask(self):
         if self.job is not None:
             self.root.after_cancel(self.job)
@@ -562,7 +735,8 @@ class SectionLoader:
             return
         s = self.slide()
         img = self.ov[s.path][0]
-        self.mask = sp.detect_mask(img, s.threshold, s.min_area, s.smooth)
+        self.mask = sp.detect_mask(img, s.threshold, s.min_area, s.smooth, s.pad)
+        self.mask_show = sp.fill_holes(self.mask)      # (shown without the holes inside the regions: the outlines go round them)
         n, _ = cv2.connectedComponents(self.mask, connectivity=8)
         self.var_found.set(f"{n - 1} region(s) found")
         self.redraw()
@@ -578,6 +752,59 @@ class SectionLoader:
         self.selected = set()
         self.sync_project()
         self.set_mode("edit")
+
+    def accept_all(self):
+        """Accept the detection for every image not accepted yet: each with its own brightness threshold (the automatic one where it
+        hasn't been set), and the smoothing, padding and smallest region of the image on show."""
+        slides = self.project.slides
+        targets = [i for i, s in enumerate(slides) if not s.accepted]
+        if not targets:
+            messagebox.showinfo("Accept all", "Every image has been accepted already.", parent=self.root)
+            return
+        cur = self.slide()
+        smooth, pad, min_mm2 = cur.smooth, cur.pad, self.min_area_mm2()
+        if not messagebox.askyesno(
+                "Accept detection for all images",
+                f"Accept the detection for the {len(targets)} image(s) that aren't accepted yet?\n\n"
+                "Each uses its own brightness threshold (the automatic one if you haven't set it), with this image's smoothing, "
+                "padding and smallest region. Images already accepted stay as they are, and you can still edit any of them.",
+                parent=self.root):
+            return
+        jobs = [(i, slides[i].path, slides[i].threshold, self.slide_px(slides[i]) or 0.65, self.ov.get(slides[i].path)) for i in targets]
+        self.var_status.set(f"Finding the sections of {len(targets)} images...")
+
+        def work():
+            out = []
+            for i, path, thr, px, ov in jobs:
+                gray, geo = ov if ov is not None else sp.overview(path)[:2]
+                x0, y0, k = geo
+                if thr < 0:
+                    thr = sp.auto_threshold(gray)
+                min_area = max(int(round(min_mm2 / ((k * px / 1000) ** 2))), 1)
+                polys = sp.mask_to_polygons(sp.detect_mask(gray, thr, min_area, smooth, pad))
+                polys = sp.sort_by_scene(polys, sp.scene_boxes(path), lambda q: q * k + np.array([x0, y0]))[0]
+                out.append((i, thr, min_area, polys, (x0, y0, k)))
+            return out
+
+        def done(res):
+            self.var_status.set("")
+            if isinstance(res, BaseException):
+                messagebox.showerror("Can't go on", f"{type(res).__name__}: {res}", parent=self.root)
+                return
+            for i, thr, min_area, polys, (x0, y0, k) in res:
+                s = slides[i]
+                s.threshold, s.min_area, s.smooth, s.pad, s.accepted = thr, min_area, smooth, pad, True
+                s.polygons = [q * k + np.array([x0, y0]) for q in polys]
+                self.polys[i] = polys
+                self.undo[i] = []
+            self.sync_project()
+            if self.cur in targets and self.stage == 1 and self.base_rgb is not None:
+                self.selected = set()
+                self.set_mode("edit")
+            self.var_status.set(f"Accepted the detection for {len(res)} image(s): "
+                                f"{sum(len(slides[i].polygons) for i, *_ in res)} outlines in all.")
+
+        self.background(work, done)
 
     def sorted_polys(self, polys):
         """The outlines in the order of the scenes of the current slide's .czi (see sp.sort_by_scene)."""
@@ -690,6 +917,22 @@ class SectionLoader:
         self.view = (s, (cw - w * s) / 2, (ch - h * s) / 2)
         self.redraw()
 
+    def fit_scale(self):
+        h, w = self.base_rgb.shape[:2]
+        cw, ch = self.canvas_size()
+        return min(cw / w, ch / h) * 0.98
+
+    def clamp_view(self, view):
+        """The view with its zoom no smaller than the starting one (the whole picture in the window), and panned no further than the
+        picture's edges: there is nothing to see beyond it."""
+        s, ox, oy = view
+        s = min(max(s, self.fit_scale()), 40)
+        h, w = self.base_rgb.shape[:2]
+        cw, ch = self.canvas_size()
+        ox = (cw - w * s) / 2 if w * s <= cw else min(0.0, max(cw - w * s, ox))
+        oy = (ch - h * s) / 2 if h * s <= ch else min(0.0, max(ch - h * s, oy))
+        return (s, ox, oy)
+
     def to_canvas(self, pts):
         s, ox, oy = self.view
         return np.asarray(pts, float) * s + np.array([ox, oy])
@@ -707,21 +950,24 @@ class SectionLoader:
             self.fit_view()
             return
         cw, ch = self.canvas_size()
+        self.view = self.clamp_view(self.view)
         s, ox, oy = self.view
         img = self.base_rgb
         if self.mode == "threshold" and self.mask is not None:
+            shown = self.mask_show if self.mask_show is not None else self.mask
             tinted = img.astype(np.float32)
-            m = self.mask.astype(bool)
+            m = shown.astype(bool)
             color = bool(self.var_color.get()) and self.slide().path in self.ovc
             a = 0.3 if color else 0.55      # (lighter over the colors, with the edge of the region drawn solid)
             tinted[m] = tinted[m] * (1 - a) + TINT * a
             if color:
-                tinted[m & ~cv2.erode(self.mask, np.ones((3, 3), np.uint8)).astype(bool)] = TINT
+                tinted[m & ~cv2.erode(shown, np.ones((3, 3), np.uint8)).astype(bool)] = TINT
             img = tinted.astype(np.uint8)
         M = np.array([[s, 0, ox], [0, s, oy]], np.float32)
         out = cv2.warpAffine(img, M, (cw, ch), flags=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
         self.photo = ImageTk.PhotoImage(Image.fromarray(out))
         c.create_image(0, 0, image=self.photo, anchor="nw")
+        c.create_text(8, ch - 6, anchor="sw", fill="#a0a0a0", font=("Segoe UI", 9), text="Wheel: zoom    Right button: pan")
         if self.mode != "threshold":
             boxes = sp.scene_boxes(self.slide().path)
             for i, p in enumerate(self.polys.get(self.cur, [])):
@@ -747,9 +993,9 @@ class SectionLoader:
             return
         s, ox, oy = self.view
         f = 1.25 if e.delta > 0 else 1 / 1.25
-        s2 = min(max(s * f, 0.05), 40)
+        s2 = min(max(s * f, self.fit_scale()), 40)      # (zooming out stops at the starting view)
         f = s2 / s
-        self.view = (s2, e.x - (e.x - ox) * f, e.y - (e.y - oy) * f)
+        self.view = self.clamp_view((s2, e.x - (e.x - ox) * f, e.y - (e.y - oy) * f))
         self.redraw()
 
     def pan_start(self, e):
@@ -758,7 +1004,7 @@ class SectionLoader:
     def pan_move(self, e):
         if self.pan and self.view:
             x, y, (s, ox, oy) = self.pan
-            self.view = (s, ox + e.x - x, oy + e.y - y)
+            self.view = self.clamp_view((s, ox + e.x - x, oy + e.y - y))
             self.redraw()
 
     def on_click(self, e, shift=False):
@@ -813,7 +1059,7 @@ class SectionLoader:
         self.var_spacing = tk.StringVar(f, "")
         ttk.Entry(top, textvariable=self.var_spacing, width=7).pack(side=tk.RIGHT, padx=(4, 18))
         ttk.Label(top, text="Distance between adjacent sections (\u00b5m):").pack(side=tk.RIGHT)
-        ttk.Button(top, text="Slide by slide", command=self.reset_order).pack(side=tk.RIGHT, padx=8)
+        ttk.Button(top, text="Reset order", command=self.reset_order).pack(side=tk.RIGHT, padx=8)
         wrap = ttk.Frame(f)
         wrap.pack(fill=tk.BOTH, expand=True)
         self.ocanvas = tk.Canvas(wrap, bg="white", highlightthickness=0)
@@ -844,25 +1090,19 @@ class SectionLoader:
     def make_thumbs(self):
         need = {(si, pi) for si, pi in self.order}
         paths = {self.project.slides[si].path for si, _ in need if self.project.slides[si].path not in self.ov}
+        for p in paths:
+            self.want(p, "gray", urgent=True)
         if paths:
-            self.var_status.set("Loading the slide pictures...")
-
-            def work():
-                return {p: sp.overview(p) for p in paths}
-
-            def done(res):
-                self.var_status.set("")
-                if isinstance(res, BaseException):
-                    messagebox.showerror("Can't read a slide", f"{type(res).__name__}: {res}", parent=self.root)
-                    return
-                for p, r in res.items():
-                    self.ov[p], self.ovc[p] = r[:2], r[2]
-                self.build_thumbs()
-                self.draw_order()
-
-            self.background(work, done)
+            self.var_status.set("Loading the pictures...")
         else:
             self.build_thumbs()
+
+    def finish_thumbs(self):
+        """The ordering stage is waiting for pictures: once all are here, the thumbnails are made."""
+        if all(self.project.slides[si].path in self.ov for si, _ in self.order):
+            self.var_status.set("")
+            self.build_thumbs()
+            self.draw_order()
 
     def build_thumbs(self):
         for si, pi in self.order:
@@ -917,7 +1157,9 @@ class SectionLoader:
                 c.create_image(x + THUMB_W / 2, y + THUMB_H / 2, image=ph)
             slide = self.project.slides[key[0]]
             c.create_text(x + 2, y + THUMB_H + 2, anchor="nw", fill="black", font=("Segoe UI", 9),
-                          text=f"{i + 1}   {os.path.splitext(os.path.basename(slide.path))[0][-16:]}")
+                          text=f"{i + 1}   {os.path.splitext(os.path.basename(slide.path))[0][-9:]}")
+            c.create_text(x + THUMB_W - 2, y + THUMB_H + 2, anchor="ne", fill=ACCENT, font=("Segoe UI", 9, "bold"),
+                          text=f"#{key[1] + 1}")      # (the number of its outline in the previous tab)
         if self.drag and self.drag["moved"]:
             g = self.drag["slot"]
             x, y = self.cell_origin(g)
@@ -990,9 +1232,17 @@ class SectionLoader:
             return
         proj.z_spacing_um = spacing
         proj.order = list(self.order)
+        if proj.alignment and proj.alignment_key != proj.fingerprint():
+            if not messagebox.askyesno(
+                    "Start the alignment again?",
+                    "The outlines or their order have changed since this project's alignment was made, so the alignment "
+                    "edits (moves, rotations, flips) can't be kept and would be dropped.\n\nGo on?", parent=self.root):
+                return
+            proj.alignment, proj.alignment_key = None, ""
+        proj.order = list(self.order)
         self.order_key = proj.polygons_key()
         try:
-            proj.save(proj.path or proj.default_path())
+            proj.save(self.save_path())
         except OSError as e:
             messagebox.showwarning("Project not saved", f"Couldn't save the project file: {e}", parent=self.root)
         self.var_status.set("Preparing the sections...")
@@ -1003,7 +1253,7 @@ class SectionLoader:
                 messagebox.showerror("Can't go on", f"{type(res).__name__}: {res}", parent=self.root)
                 return
             self.result = res
-            self.root.destroy()
+            self.close()
             if self.on_done:
                 self.on_done(res)
 

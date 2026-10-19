@@ -39,6 +39,7 @@ import queue
 import sys
 import threading
 import time
+from dataclasses import asdict
 
 import neuroinfo_stack as ns
 import section_project as sp
@@ -100,7 +101,7 @@ def load_preview(src):
                 return d["img"], float(d["kx"]), float(d["ky"])
         except Exception:
             pass  # rebuild a damaged cache file
-    full = imagecodecs.imread(src)
+    full = ns.read_jp2_image(src)
     if full.ndim == 2:
         full = full[..., None]
     h, w = full.shape[:2]
@@ -283,6 +284,13 @@ class Aligner:
         self.var_dx = tk.StringVar(self.root, "0")
         self.var_dy = tk.StringVar(self.root, "0")
         self.var_quality = tk.StringVar(self.root, f"{ns.DEFAULT_QUALITY_DB:g}")
+        self.return_to_launcher = False   # set by the start window: closing this window goes back to it, instead of ending the program
+        self.timer_ids = {}         # the repeating timers (poll, autosave), to cancel when the window closes
+        self.project_path = ""      # the section project the stack came from (its edits are saved into it as you work), if it did
+        self.project_obj = None
+        self.saved_sig = None       # what stack_signature() was when the project was last written
+        self.var_fit = tk.BooleanVar(self.root, True)          # fit the canvas to the sections when exporting a stack made in memory
+        self.var_margin = tk.StringVar(self.root, "10")       # (the margin around them, %)
         self.var_spacing = tk.StringVar(self.root, "")        # distance between adjacent sections (um), written into the JPX
         self.var_rerender = tk.BooleanVar(self.root, True)   # every image is written again, so each JPX file has all of its images
         self.var_background = tk.BooleanVar(self.root, bool(load_settings().get("background_loading", True)))
@@ -295,7 +303,8 @@ class Aligner:
 
         self.build()
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
-        self.root.after(100, self.poll)
+        self.timer("poll", 100, self.poll)
+        self.timer("autosave", 2000, self.autosave_tick)
         if path:
             self.root.after(200, lambda: self.open_path(path))
 
@@ -306,6 +315,7 @@ class Aligner:
         menu = tk.Menu(root)
         fm = tk.Menu(menu, tearoff=0)
         fm.add_command(label="Open...", command=self.open_dialog, accelerator="Ctrl+O")
+        fm.add_command(label="Save project now (also done automatically)", command=lambda: self.save_project_state(force=True))
         self.recent_menu = tk.Menu(fm, tearoff=0)
         fm.add_cascade(label="Open recent", menu=self.recent_menu)
         fm.config(postcommand=self.fill_recent_menu)   # (refreshed each time the File menu opens)
@@ -498,7 +508,13 @@ class Aligner:
         self.export_advanced[2].grid(row=1, column=0, columnspan=2, sticky="w")
         ttk.Label(f, text="Distance between sections (\u00b5m)").grid(row=2, column=0, sticky="e", pady=(4, 0))
         ttk.Entry(f, textvariable=self.var_spacing, width=6).grid(row=2, column=1, sticky="w", padx=4, pady=(4, 0))
-        ttk.Button(f, text="Export JPX...", command=self.export_dialog).grid(row=3, column=0, columnspan=2,
+        self.fit_row = ttk.Frame(f)    # (only for a stack made in memory: one opened from a JPX keeps its canvas)
+        ttk.Checkbutton(self.fit_row, text="Fit the canvas to the sections, margin", variable=self.var_fit).pack(side=tk.LEFT)
+        ttk.Entry(self.fit_row, textvariable=self.var_margin, width=4).pack(side=tk.LEFT, padx=3)
+        ttk.Label(self.fit_row, text="%").pack(side=tk.LEFT)
+        self.fit_row.grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.fit_row.grid_remove()
+        ttk.Button(f, text="Export JPX...", command=self.export_dialog).grid(row=4, column=0, columnspan=2,
                                                                               pady=(6, 0), sticky="ew")
 
         self.apply_advanced_mode()   # (all the widgets it shows or hides exist now)
@@ -683,7 +699,48 @@ class Aligner:
 
     # ---------------------------------------------------------------- opening
 
+    # ---------------------------------------------------------------- the project file
+
+    def stack_signature(self):
+        """Something that changes when anything the project file keeps does: each section's edit, outline, pivot and source, in order."""
+        st = self.stack
+        if st is None:
+            return None
+        return (len(st.sections), st.z_spacing_um, tuple(
+            (s.name, s.source_path, tuple(asdict(s.edit).values()), len(s.case_points), round(float(s.case_points.sum()), 3),
+             round(float(s.pivot_src.sum()), 3), round(float(s.t.sum()), 3)) for s in st.sections))
+
+    def save_project_state(self, force=False):
+        """Write the stack's alignment into the project file it came from (nothing if it did not come from one). True if the file
+        holds the current state afterwards."""
+        if not self.project_path or self.stack is None:
+            return True
+        sig = self.stack_signature()
+        if not force and sig == self.saved_sig:
+            return True
+        try:
+            proj = self.project_obj or sp.Project.load(self.project_path)
+            proj.alignment = ns.stack_json(self.stack, self.project_path)
+            proj.alignment_key = proj.fingerprint()
+            proj.save(self.project_path)
+            self.project_obj = proj
+            self.saved_sig = sig
+            return True
+        except Exception as e:
+            self.var_status.set(f"Couldn't save the project file: {e}")
+            return False
+
+    def autosave_tick(self):
+        if not self.busy and not self.opening:
+            self.save_project_state()
+        self.timer("autosave", 2000, self.autosave_tick)
+
+    def timer(self, name, ms, fn):
+        self.timer_ids[name] = self.root.after(ms, fn)
+
     def confirm_discard(self):
+        if self.project_path and self.save_project_state():
+            return True      # (what was done is in the project file: nothing to lose)
         if self.stack is not None and self.stack.changed:
             return messagebox.askyesno("Unsaved changes",
                                        "Some sections have changes that haven't been exported.\n"
@@ -718,8 +775,8 @@ class Aligner:
             return
         path = filedialog.askopenfilename(
             parent=self.root, title="Open a reconstruction (NeuroInfo or exported by this tool)",
-            filetypes=[("JPX stacks and section projects", "*.jpx *" + sp.PROJECT_SUFFIX), ("JPX stacks", "*.jpx"),
-                       ("Section projects (from the step that finds the sections)", "*" + sp.PROJECT_SUFFIX), ("All files", "*.*")],
+            filetypes=[("JPX stacks and section projects", "*.jpx *" + sp.PROJECT_SUFFIX + " *" + sp.OLD_PROJECT_SUFFIX), ("JPX stacks", "*.jpx"),
+                       ("Section projects (from the step that finds the sections)", "*" + sp.PROJECT_SUFFIX + " *" + sp.OLD_PROJECT_SUFFIX), ("All files", "*.*")],
             initialdir=self.stack.folder if self.stack else None)
         if path:
             self.open_path(path)
@@ -792,6 +849,7 @@ class Aligner:
             if missing:
                 raise FileNotFoundError("These slide scans weren't found:\n\n" + "\n".join(missing[:6]))
             stack = sp.build_stack(project)
+            self.pending_project = project
         except Exception as e:
             self.opening = False
             self.update_cursor()
@@ -803,7 +861,7 @@ class Aligner:
         self.show_stack(stack, path)
 
     def open_path(self, path):
-        if path.lower().endswith(sp.PROJECT_SUFFIX):
+        if sp.is_project_path(path):
             return self.open_project(path)
         self.opening = True
         self.update_cursor()
@@ -889,6 +947,14 @@ class Aligner:
         self.levels_set = False
         self.build_channel_controls()
         self.var_spacing.set(f"{stack.z_spacing_um:g}" if stack.z_spacing_um > 0 else "")
+        if stack.jpx_path:
+            self.fit_row.grid_remove()
+        else:
+            self.fit_row.grid()
+        self.project_path = os.path.abspath(path) if path and sp.is_project_path(path) else ""
+        self.project_obj = getattr(self, "pending_project", None) if self.project_path else None
+        self.pending_project = None
+        self.saved_sig = self.stack_signature() if (self.project_obj is not None and self.project_obj.alignment) else None
         if stack.jpx_path:
             self.root.title(f"JPX aligner - {os.path.basename(path or stack.jpx_path)}")
         else:
@@ -1110,7 +1176,7 @@ class Aligner:
                     self.export_finished(*payload)
         except queue.Empty:
             pass
-        self.root.after(100, self.poll)
+        self.timer("poll", 100, self.poll)
 
     def auto_levels(self, img):
         for c in range(min(img.shape[2], len(self.levels))):
@@ -2099,6 +2165,17 @@ class Aligner:
             return
         if spacing > 0:
             st.z_spacing_um = spacing
+        exp = st      # (the stack to export: with the canvas fitted to the sections, a copy of it, when that is asked for)
+        if not st.jpx_path and self.var_fit.get():
+            try:
+                margin = float(self.var_margin.get()) / 100
+                if not 0 <= margin <= 1:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Margin", "The margin must be a number of percent between 0 and 100, e.g. 10.", parent=self.root)
+                return
+            exp, note = ns.fitted_copy(st, margin)
+            print(note, flush=True)
         rerender_all = self.var_rerender.get() or not st.jpx_path   # (a stack made from slide scans has no frames to copy)
         todo = [s for s in st.sections if s.renderable and (rerender_all or s.dirty)]   # (others: frames copied as they are)
         if not st.changed:   # (also when "re-render unchanged sections too" would still write every image)
@@ -2108,7 +2185,7 @@ class Aligner:
                                        "No section has been edited since this file was opened, so an export would be a copy "
                                        f"of it ({same}).\n\nExport anyway?", parent=self.root):
                 return
-        bad = st.out_of_canvas()
+        bad = exp.out_of_canvas()
         if bad and not messagebox.askyesno(
                 "Sections past the canvas edge",
                 "These sections extend past the edge of the canvas, and the parts outside will be cut off:\n\n"
@@ -2144,7 +2221,7 @@ class Aligner:
         def work():
             t0 = time.time()
             try:
-                ns.export_stack(st, out, quality_db=quality, rerender_all=rerender_all,
+                ns.export_stack(exp, out, quality_db=quality, rerender_all=rerender_all,
                                 log=lambda m: print(m, flush=True), progress=progress,
                                 stop_event=self.stop_event)
                 self.msgs.put(("export_done", (out, None, time.time() - t0)))
@@ -2576,6 +2653,7 @@ class Aligner:
         win.analysis_tree = tree   # (for tests)
 
     def quit(self):
+        self.save_project_state()
         if self.busy:
             if not messagebox.askyesno("Export in progress", "An export is running. Cancel it and quit?",
                                        parent=self.root):
@@ -2583,7 +2661,17 @@ class Aligner:
             self.stop_event.set()
         elif not self.confirm_discard():
             return
+        for after_id in self.timer_ids.values():
+            try:
+                self.root.after_cancel(after_id)
+            except tk.TclError:
+                pass
         self.root.destroy()
+        if self.return_to_launcher:
+            # back to the start window: what is still loading in the background is told to stop, and the program goes on
+            self.stop_event_verify.set()
+            self.stack = None
+            return
         if not self._busy:
             # Nothing is left to protect (settings are saved as they change, and cache files are written under a temporary name
             # and then renamed), but background loading may still be mid-task: leave at once instead of waiting for it, so that
