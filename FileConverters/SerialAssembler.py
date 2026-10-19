@@ -39,7 +39,7 @@ def choose():
             b.focus_set()
 
     card("1", "Load / detect images",
-         "Choose slide scans (.czi), find the sections on them, and put the sections in order.", "detect", True)
+         "Choose slide scans (.czi), find the sections on them, and put the sections in order. Or open a .jpx stack to reorder its sections.", "detect", True)
     card("2", "Align images",
          "Line up the sections and export the stack. Opens the sections from step 1, or a JPX you already have.", "align", False)
     ttk.Separator(outer).pack(fill=tk.X, pady=(14, 8))
@@ -59,6 +59,24 @@ def run_aligner(stack=None, path=None, open_dialog=False, back_to_start=False):
     elif open_dialog and path is None:
         app.root.after(200, app.open_dialog)
     app.run()
+    return app.back_to_ordering
+
+
+def detect_and_align():
+    """Step 1, then the alignment tool. The alignment tool's "Back to step 1" returns to step 1's ordering tab with the same project (its
+    alignment is kept), as often as wanted."""
+    import section_loader
+    resume = None
+    while True:
+        loader = section_loader.SectionLoader()
+        if resume:
+            loader.resume(resume, 2)
+        stack = loader.run()
+        if stack is None:
+            return
+        if not run_aligner(stack=stack, path=loader.project.path, back_to_start=True):
+            return
+        resume = loader.project.path
 
 
 def main(argv=None):
@@ -71,11 +89,7 @@ def main(argv=None):
         if what == "align":
             run_aligner(open_dialog=True, back_to_start=True)
         elif what == "detect":
-            import section_loader
-            loader = section_loader.SectionLoader()
-            stack = loader.run()
-            if stack is not None:
-                run_aligner(stack=stack, path=loader.project.path, back_to_start=True)
+            detect_and_align()
         else:
             break
     sys.stdout.flush()                        # (leave at once: background threads may be mid-task)

@@ -655,7 +655,8 @@ def stack_from_json(doc, folder, jpx_path=""):
             edit=copy.copy(e), saved_edit=copy.copy(e), source_abs_hint=d.get("source_absolute", ""),
             pivot_src=d["pivot_src"] if d.get("pivot_src") is not None else (    # (no pivot recorded: the first versions' default)
                 np.array(d["case_points"], float).reshape(-1, 2).mean(0) if len(d["case_points"]) else None),
-            czi_origin=tuple(d["czi_origin"]) if d.get("czi_origin") else None, origin_key=d.get("origin_key", "")))
+            czi_origin=tuple(d["czi_origin"]) if d.get("czi_origin") else None, origin_key=d.get("origin_key", ""),
+            frame=d.get("frame", -1)))
     return stack
 
 
@@ -667,17 +668,24 @@ def _load_aligner(jpx_path, doc):
     return stack
 
 
-def open_stack(path, locate=None):
+def open_stack(path, locate=None, alignment=None):
     """Open a JPX written by this tool, or a NeuroInfo reconstruction (a .jpx
     with reconstruction.xml and CaseFile.H5 beside it, or that folder). `locate` is asked for NeuroInfo files that are not
-    beside the JPX (see _find_neuroinfo_files)."""
+    beside the JPX (see _find_neuroinfo_files). `alignment`, if given, is a project's saved alignment (see stack_json) of this JPX:
+    the stack is made from it (its sections name their frames), and no NeuroInfo file is needed."""
     if os.path.isdir(path):
         names = {n.lower(): n for n in os.listdir(path)}
         if "reconstruction.jpx" not in names:
             raise FileNotFoundError(f"No reconstruction.jpx in {path}")
         path = os.path.join(path, names["reconstruction.jpx"])
-    doc = find_aligner_json(path)
-    stack = _load_aligner(path, doc) if doc else _load_neuroinfo(path, locate)
+    if alignment is not None:
+        stack = stack_from_json(alignment, os.path.dirname(os.path.abspath(path)), path)
+        n_frames = len([b for b in read_boxes(path) if b.kind == b"jp2c"])
+        if any(s.frame >= n_frames for s in stack.sections):
+            raise ValueError("The project's alignment is of another JPX (it names frames this one doesn't have).")
+    else:
+        doc = find_aligner_json(path)
+        stack = _load_aligner(path, doc) if doc else _load_neuroinfo(path, locate)
     # The XMP repeats channel names once per image; the first `channels` apply
     stack.z_spacing_um = read_xmp_spacing(path)
     info = read_xmp_channels(path)[:stack.channels]
@@ -707,6 +715,7 @@ def stack_json(stack, out_path):
             "pivot_src": np.round(s.pivot_src, 6).tolist(),
             "edit": asdict(s.edit),
             "origin_key": s.origin_key,
+            "frame": s.frame,                      # (which frame of the JPX this section is: its position can change, and sections be deleted)
         })
         if s.czi_origin is not None:
             secs[-1]["czi_origin"] = [round(float(v), 4) for v in s.czi_origin]

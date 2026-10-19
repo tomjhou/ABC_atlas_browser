@@ -44,6 +44,7 @@ from dataclasses import asdict
 
 import neuroinfo_stack as ns
 import section_project as sp
+import neuroinfo_dialogs
 from section_order import OrderGrid, THUMB_W, THUMB_H
 
 ns.ensure_packages({"PIL": "pillow"})
@@ -317,6 +318,7 @@ class Aligner:
         self.var_dy = tk.StringVar(self.root, "0")
         self.var_quality = tk.StringVar(self.root, f"{ns.DEFAULT_QUALITY_DB:g}")
         self.return_to_launcher = False   # set by the start window: closing this window goes back to it, instead of ending the program
+        self.back_to_ordering = False     # closed with "Back to step 1": the start window reopens the project at the ordering tab
         self.timer_ids = {}         # the repeating timers (poll, autosave), to cancel when the window closes
         self.project_path = ""      # the section project the stack came from (its edits are saved into it as you work), if it did
         self.project_obj = None
@@ -370,6 +372,9 @@ class Aligner:
         tm = tk.Menu(menu, tearoff=0)
         tm.add_command(label="Analyze project", command=self.analyze_project)
         menu.add_cascade(label="Tools", menu=tm)
+        menu.add_command(label="\u25c4 Back to step 1: order sections", command=self.go_back_to_ordering)
+        self.back_menu_index = menu.index("end")
+        self.menubar = menu
         root.config(menu=menu)
 
         main = ttk.Frame(root)
@@ -760,7 +765,7 @@ class Aligner:
         if st is None:
             return None
         return (len(st.sections), st.z_spacing_um, tuple(
-            (s.name, s.source_path, tuple(asdict(s.edit).values()), len(s.case_points), round(float(s.case_points.sum()), 3),
+            (s.frame, s.name, s.source_path, tuple(asdict(s.edit).values()), len(s.case_points), round(float(s.case_points.sum()), 3),
              round(float(s.pivot_src.sum()), 3), round(float(s.t.sum()), 3)) for s in st.sections))
 
     def save_project_state(self, force=False):
@@ -773,6 +778,8 @@ class Aligner:
             return True
         try:
             proj = self.project_obj or sp.Project.load(self.project_path)
+            if proj.is_jpx:
+                proj.jpx_order = [s.frame for s in self.stack.sections]       # (the order made here is the project's now)
             proj.alignment = ns.stack_json(self.stack, self.project_path)
             proj.alignment_key = proj.fingerprint()
             proj.save(self.project_path)
@@ -835,61 +842,8 @@ class Aligner:
             self.open_path(path)
 
     def locate_file(self, kind, expected, folder, candidates, reason="missing", default=None, notes=None):
-        """Ask which NeuroInfo file to use: a list of the candidates in the folder (the likeliest selected), or Browse for
-        another; for a file that is not there at all, only Browse. Returns the path, or None if the user declines."""
-        notes = notes or {}
-        what = "case file (.h5)" if kind == "h5" else "reconstruction file (.xml)"
-        if reason == "ambiguous":
-            text = (f"Which {what} goes with this JPX?\n{folder}" if kind == "h5" else
-                    f"{expected} wasn't found beside the JPX. Which {what} goes with it?\n{folder}")
-        else:
-            text = f"No {what} was found beside the JPX, in\n{folder}\n\nLocate it?"
-        result = {"path": None}
-        dlg = tk.Toplevel(self.root)
-        dlg.title(f"Choose the {what}" if candidates else "File not found")
-        dlg.transient(self.root)
-        dlg.resizable(False, False)
-        ttk.Label(dlg, text=text, justify=tk.LEFT, padding=10, wraplength=520).pack(anchor="w")
-        box = None
-        if candidates:
-            box = tk.Listbox(dlg, height=min(max(len(candidates), 3), 10), width=70, exportselection=False, activestyle="none")
-            for name in candidates:
-                try:
-                    st = os.stat(os.path.join(folder, name))
-                    info = f"{st.st_size / 1e6:.1f} MB, {time.strftime('%Y-%m-%d', time.localtime(st.st_mtime))}"
-                except OSError:
-                    info = ""
-                note = notes.get(name)
-                box.insert(tk.END, f"{name}   ({info}{'; ' + note if note else ''})")
-            box.selection_set(candidates.index(default) if default in candidates else 0)
-            box.pack(padx=10)
-
-        def use():
-            if box is not None and box.curselection():
-                result["path"] = os.path.join(folder, candidates[box.curselection()[0]])
-            dlg.destroy()
-
-        def browse():
-            types = [("HDF5 files", "*.h5 *.H5")] if kind == "h5" else [("XML files", "*.xml")]
-            path = filedialog.askopenfilename(parent=dlg, title=f"Locate the {what}", initialdir=folder,
-                                              filetypes=types + [("All files", "*.*")])
-            if path:
-                result["path"] = path
-                dlg.destroy()
-
-        buttons = ttk.Frame(dlg, padding=10)
-        buttons.pack(fill=tk.X)
-        if box is not None:
-            ttk.Button(buttons, text="Use selected", command=use).pack(side=tk.LEFT)
-            box.bind("<Double-Button-1>", lambda e: use())
-        ttk.Button(buttons, text="Browse...", command=browse).pack(side=tk.LEFT, padx=6)
-        ttk.Button(buttons, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT)
-        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
-        dlg.update_idletasks()
-        dlg.geometry(f"+{self.root.winfo_rootx() + 80}+{self.root.winfo_rooty() + 80}")
-        dlg.grab_set()
-        self.root.wait_window(dlg)
-        return result["path"]
+        """Ask which NeuroInfo file to use (see neuroinfo_dialogs.locate_file). Returns the path, or None if the user declines."""
+        return neuroinfo_dialogs.locate_file(self.root, kind, expected, folder, candidates, reason, default, notes)
 
     def open_project(self, path):
         """A section project (step 1 of the workflow): its sections become an in-memory stack, rendered from the slide scans."""
@@ -901,7 +855,7 @@ class Aligner:
             missing = [s.path for s in project.slides if not os.path.isfile(s.path)]
             if missing:
                 raise FileNotFoundError("These slide scans weren't found:\n\n" + "\n".join(missing[:6]))
-            stack = sp.build_stack(project)
+            stack = sp.open_jpx_stack(project, locate=self.locate_file) if project.is_jpx else sp.build_stack(project)
             self.pending_project = project
         except Exception as e:
             self.opening = False
@@ -2964,6 +2918,23 @@ class Aligner:
                        "down in px); \"on the slide\" is in the slide scan's pixels.").pack(side=tk.LEFT, padx=12)
         ttk.Button(bar, text="Close", command=win.destroy).pack(side=tk.RIGHT)
         win.analysis_tree = tree   # (for tests)
+
+    def go_back_to_ordering(self):
+        """Back to the section loader (its ordering tab) with this project: its alignment is saved first, and kept (it is of the images, so
+        it holds through another order of the sections)."""
+        if not self.project_path:
+            messagebox.showinfo("Back to step 1", "Only a stack that came from step 1 (a project) can go back to it.", parent=self.root)
+            return
+        if self.busy or self.opening:
+            return
+        if not self.save_project_state(force=True):
+            return
+        self.back_to_ordering = True
+        self.return_to_launcher = True
+        self.quit()
+        if self.stack is not None:               # (quit was declined: stay)
+            self.back_to_ordering = False
+            self.return_to_launcher = False
 
     def quit(self):
         self.save_project_state()

@@ -13,6 +13,11 @@
   (`jpx_path == ""`, `Stack.unsaved`, sections rendered from the scans with `czi_origin = (0, 0)`; first export uses
   `write_jpx_new`). `j2k_partial.py` reads only the needed packets of NeuroInfo's JPEG 2000 frames. `section_order.py` is the thumbnail
   grid for ordering sections by dragging, shared by step 1's third tab and the aligner's "Thumbnails..." window.
+  A `.jpx` can be added in step 1 on its own: a single-row "JPX project" (`Project.is_jpx`; `jpx_order` = frames in section order,
+  `jpx_sections`), outlines tab skipped, order-tab thumbnails read from the JPX's own frames (`jpx_crop`, lazily, cached as `jt_*.npz`),
+  Done -> `ns.open_stack(..., alignment=project.alignment)` + `sp.apply_jpx_order`. `stack_json` records each section's `frame`. The
+  aligner's menu "Back to step 1" (`go_back_to_ordering`) saves the project and `SerialAssembler.detect_and_align` reopens the loader at
+  the order tab (`SectionLoader.resume`); the alignment is kept. `neuroinfo_dialogs.py` holds the "which NeuroInfo file?" dialog.
 
 # jpx_aligner / neuroinfo_stack
 

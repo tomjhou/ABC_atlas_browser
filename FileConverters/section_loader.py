@@ -6,23 +6,30 @@ Three stages in one window, shown by a strip along the top:
                         and drawn by hand;
   3. Order sections   - thumbnails are dragged into their order along the brain.
 "Done" saves the project beside the first slide and hands the sections, in memory, to the alignment tool (no JPX is written).
+A .jpx stack can be added on its own (not mixed with scans): its sections come with outlines, so the outlines tab is skipped and the
+order tab shows the JPX's own pictures of its sections.
 
 Run it directly (python section_loader.py [slides...]), or from the start window (SerialAssembler.py)."""
+import hashlib
+import math
 import os
 import queue
 import sys
 import threading
 import time
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import cv2
+import imagecodecs
 import numpy as np
 from PIL import Image, ImageTk
 
+import neuroinfo_dialogs
 import neuroinfo_stack as ns
 import section_project as sp
-from section_order import OrderGrid, THUMB_W, THUMB_H
+from section_order import OrderGrid, THUMB_W, THUMB_H, CELL_PAD
 
 STAGES = ("Load slides", "Detect outlines", "Order sections", "Align")
 ACCENT = "#1f5fa8"
@@ -41,6 +48,73 @@ def human_size(n):
 
 
 DEFAULT_MIN_AREA_MM2 = 0.25    # the smallest region kept, until the user moves the slider
+
+_jpx_frames = {}
+_jpx_frames_lock = threading.Lock()
+
+
+def jpx_frame_boxes(path):
+    """The boxes of the frames of a JPX (read once: for a big file it takes a moment)."""
+    with _jpx_frames_lock:
+        if path not in _jpx_frames:
+            _jpx_frames[path] = [b for b in ns.read_boxes(path) if b.kind == b"jp2c"]
+        return _jpx_frames[path]
+
+
+def jpx_crop(stack, path, frame, section, target_px=256):
+    """A colour picture of one section of a JPX, cropped round its outline from the JPX's own frame (the section as NeuroInfo rendered it,
+    so no slide scan is needed): (RGB uint8 picture, the outline in it, um per picture pixel). Only the reduced picture the thumbnail needs
+    is read from the frame (a few percent of it), and the result is kept on disk, so that the next time is instant."""
+    st = os.stat(path)
+    P = section.stack_points
+    outline_hash = hashlib.sha1(np.round(P, 1).tobytes()).hexdigest()[:12]
+    key = f"jpxcrop1|{os.path.abspath(path).lower()}|{st.st_size}|{st.st_mtime_ns}|{frame}|{outline_hash}|{target_px}"
+    cache = os.path.join(sp.CACHE_DIR, "jt_" + hashlib.sha1(key.encode()).hexdigest() + ".npz")
+    if os.path.isfile(cache):
+        try:
+            with np.load(cache) as d:
+                return d["rgb"], d["poly"], float(d["um"])
+        except Exception:
+            pass                                   # (a damaged cache file: made again)
+    px = stack.pixel_um
+    poly = np.column_stack([P[:, 0] / px, -P[:, 1] / px])         # the outline in the frame's pixels (the frame is the stack's canvas)
+    lo, hi = poly.min(0), poly.max(0)
+    pad = 0.08 * float((hi - lo).max()) + 4
+    a = np.maximum(np.floor(lo - pad), 0).astype(int)
+    b = np.minimum(np.ceil(hi + pad), [stack.canvas_w, stack.canvas_h]).astype(int)
+    skip = int(max(0, min(math.floor(math.log2(max(int((b - a).max()), 1) / target_px)), 6)))
+    frame_obj = ns._Frame(source=(path, jpx_frame_boxes(path)[frame]))
+    for k in range(skip, -1, -1):                  # (as reduced as the file allows, up to what the thumbnail needs)
+        try:
+            img = imagecodecs.jpeg2k_decode(frame_obj._stream(skip=k), skipres=k)
+            break
+        except Exception:
+            if k == 0:
+                raise
+    s = 2 ** k
+    if img.ndim == 2:
+        img = img[..., None]
+    x0, y0 = int(a[0] // s), int(a[1] // s)
+    crop = img[y0:-(-int(b[1]) // s), x0:-(-int(b[0]) // s)]
+    if crop.size == 0:
+        raise ValueError("the outline is outside the frame")
+    rgbf = np.zeros(crop.shape[:2] + (3,), np.float32)
+    for c in range(crop.shape[2]):
+        v = crop[..., c].astype(np.float32)
+        nz = v[v > 0]
+        lo_v = float(np.percentile(nz, 1)) if nz.size else 0.0
+        hi_v = max(float(np.percentile(nz, 99.7)) * 1.3 if nz.size else 1.0, lo_v + 1.0)
+        color = np.array(stack.channel_info[c].color if c < len(stack.channel_info) else (255, 255, 255), np.float32) / 255
+        rgbf += np.clip((v - lo_v) / (hi_v - lo_v), 0, 1)[..., None] * color
+    rgb = (np.clip(rgbf, 0, 1) * 255).astype(np.uint8)
+    poly_c = (poly / s - np.array([x0, y0])).astype(np.float32)
+    try:
+        tmp = cache + ".partial.npz"
+        np.savez(tmp, rgb=rgb, poly=poly_c, um=px * s)
+        os.replace(tmp, cache)
+    except OSError:
+        pass
+    return rgb, poly_c, px * s
 
 
 class SectionLoader:
@@ -67,6 +141,10 @@ class SectionLoader:
             threading.Thread(target=self.ov_worker, daemon=True).start()
         self.result = None
         self.order_key = None           # project.polygons_key() when the order was last set
+        self.jpx_stack, self.jpx_stack_path = None, ""     # a JPX project: its stack once opened (for the ordering tab)
+        self.jpx_by_frame = {}                             # frame -> its section
+        self.jpx_crops, self.jpx_inflight = {}, set()      # frame -> (colour crop, outline in it, um per pixel) or False; frames being made
+        self.jpx_pool, self.jpx_tick_id = None, None
         # ---- the strip of stages
         self.strip = tk.Frame(self.root, bg="#eef1f5")
         self.strip.pack(fill=tk.X)
@@ -113,10 +191,14 @@ class SectionLoader:
         """Close the window (its timer cancelled first, so that it can't go off in the next window)."""
         self.closing = True
         self.ov_wake.set()
-        try:
-            self.root.after_cancel(self.poll_id)
-        except (tk.TclError, AttributeError):
-            pass
+        for after_id in (self.poll_id, self.jpx_tick_id):
+            try:
+                if after_id is not None:
+                    self.root.after_cancel(after_id)
+            except (tk.TclError, AttributeError):
+                pass
+        if self.jpx_pool is not None:
+            self.jpx_pool.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
 
     def quit(self):
@@ -147,7 +229,7 @@ class SectionLoader:
     def want(self, path, kind="gray", urgent=False):
         """Ask for a slide's picture to be loaded in the background: `kind` "gray" (the one outlines are found on) or "color". Urgent
         ones go to the front; the rest are taken in the order asked."""
-        if (kind == "gray" and path in self.ov) or (kind == "color" and path in self.ovc):
+        if (kind == "gray" and path in self.ov) or (kind == "color" and path in self.ovc) or sp.is_jpx(path):
             return
         key = (kind, path)
         q = self.ov_gray_q if kind == "gray" else self.ov_color_q
@@ -233,6 +315,10 @@ class SectionLoader:
                     if version == self.grid_version and self.grid_mode:
                         self.grid_rgb[i] = rgb
                         self.redraw()
+                elif kind == "call":
+                    payload()                                # (a dialog the thread needs, made here)
+                elif kind == "jpxcrop":
+                    self.on_jpx_crop(*payload)
                 elif kind == "done":
                     done, res = payload
                     self.busy -= 1
@@ -250,12 +336,15 @@ class SectionLoader:
                 lab.config(bg=ACCENT, fg="white", font=("Segoe UI", 11, "bold"))
             else:
                 lab.config(bg="#eef1f5", fg="black" if i < n else "gray55", font=("Segoe UI", 11))
+        self.strip_labels[1].config(text="2  Detect outlines" + (" (not needed)" if self.project.is_jpx else ""))
+        if self.project.is_jpx and n != 1:
+            self.strip_labels[1].config(fg="gray70")       # (a JPX comes with its outlines: step 2 is skipped)
         for f in self.frames:
             f.pack_forget()
         self.frames[n].pack(fill=tk.BOTH, expand=True)
         self.btn_back.config(state="normal" if n else "disabled")
         self.btn_next.config(text="Done: open in the alignment tool" if n == 2 else "Next")
-        self.var_help.set(("Choose the slide scans (.czi) and section images (.jp2) that hold your sections.",
+        self.var_help.set(("Choose the slide scans (.czi) and section images (.jp2) that hold your sections, or one .jpx stack on its own.",
                            "Set the threshold so that each section is tinted and debris is not, then accept the outlines.",
                            "Drag the pictures into the order of the sections along the brain.")[n])
         if n == 1:
@@ -266,6 +355,9 @@ class SectionLoader:
     def go_back(self):
         if self.stage == 1:
             self.leave_detect()
+        if self.stage == 2 and self.project.is_jpx:
+            self.show_stage(0)                     # (a JPX has no outlines tab)
+            return
         if self.stage > 0:
             self.show_stage(self.stage - 1)
 
@@ -275,6 +367,10 @@ class SectionLoader:
         if self.stage == 0:
             if not self.project.slides:
                 messagebox.showinfo("No slides", "Add at least one .czi slide scan or .jp2 section image first.", parent=self.root)
+                return
+            if self.project.is_jpx:                  # (its sections come with outlines: straight on to the order)
+                self.save_slide_list()
+                self.show_stage(2)
                 return
             unknown = [os.path.basename(s.path) for s in self.project.slides if s.path in self.infos and not self.slide_px(s)]
             if unknown:
@@ -352,7 +448,8 @@ class SectionLoader:
             info = self.infos.get(s.path)
             px = self.slide_px(s)
             self.slide_tree.insert("", tk.END, iid=str(i), values=(
-                s.path, info.scenes if info else "...", human_size(info.size_bytes) if info else "",
+                s.path, (f"{info.scenes} sections" if sp.is_jpx(s.path) else info.scenes) if info else "...",
+                human_size(info.size_bytes) if info else "",
                 (f"{px:g}" if px else "unknown") if info else ""))
 
     def read_infos(self):
@@ -402,11 +499,18 @@ class SectionLoader:
         paths mapped differently): the dialog starts there, and files from elsewhere are refused. For a new project the first image
         chosen sets the folder."""
         folder = self.project.folder()
-        paths = filedialog.askopenfilenames(parent=self.root, title="Slide scans and section images", initialdir=folder or None, filetypes=[
-            ("Slide scans and section images", "*.czi *.jp2 *.j2k *.j2c"), ("Zeiss .czi", "*.czi"), ("JPEG 2000", "*.jp2 *.j2k *.j2c"),
-            ("All files", "*.*")])
+        paths = filedialog.askopenfilenames(parent=self.root, title="Slide scans, section images and JPX stacks", initialdir=folder or None, filetypes=[
+            ("Slide scans, section images and JPX stacks", "*.czi *.jp2 *.j2k *.j2c *.jpx"), ("Zeiss .czi", "*.czi"),
+            ("JPEG 2000 section images", "*.jp2 *.j2k *.j2c"), ("JPX stack of sections", "*.jpx"), ("All files", "*.*")])
         if not paths:
             return
+        if any(sp.is_jpx(p) for p in paths) or self.project.is_jpx:
+            # a JPX is a stack of sections already, with their outlines: a project of its own, not mixed with scans or other stacks
+            if self.project.slides or len(paths) > 1:
+                messagebox.showinfo("JPX stack", "A JPX stack is a project of its own: it can't be combined with other files. Add it on its own "
+                                    "to an empty list (use \"Close project\" first), and add scans only to a project that has none.",
+                                    parent=self.root)
+                return
         same = lambda a, b: os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
         folder = folder or os.path.dirname(os.path.abspath(paths[0]))
         refused = [p for p in paths if not same(os.path.dirname(os.path.abspath(p)), folder)]
@@ -454,6 +558,7 @@ class SectionLoader:
         """Back to a new, empty project (when every image has been removed): the next image added starts a project file in its own folder."""
         self.project = sp.Project()
         self.var_numbering.set(self.project.numbering)
+        self.jpx_stack, self.jpx_stack_path, self.jpx_crops, self.jpx_inflight = None, "", {}, set()
         self.infos, self.ov, self.ovc = {}, {}, {}
         self.polys, self.undo, self.order, self.order_key = {}, {}, [], None
         self.cur, self.waiting_for, self.pending_min_mm2 = 0, None, {}
@@ -619,8 +724,8 @@ class SectionLoader:
         bar = ttk.Frame(dlg, padding=10)
         bar.pack(fill=tk.X)
         ttk.Button(bar, text="Open", command=choose).pack(side=tk.LEFT)
-        ttk.Button(bar, text="Remove from the list", command=forget).pack(side=tk.LEFT, padx=8)
-        ttk.Button(bar, text="Delete project...", command=delete).pack(side=tk.LEFT)
+        ttk.Button(bar, text="Remove project from list", command=forget).pack(side=tk.LEFT, padx=8)
+        ttk.Button(bar, text="Delete project file (raw files remain intact)", command=delete).pack(side=tk.LEFT)
         ttk.Button(bar, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT)
         dlg.bind("<Escape>", lambda e: dlg.destroy())
         dlg.grab_set()
@@ -650,6 +755,7 @@ class SectionLoader:
             return
         sp.add_recent_project(path)
         self.project = proj
+        self.jpx_stack, self.jpx_stack_path, self.jpx_crops, self.jpx_inflight = None, "", {}, set()
         self.var_shared.set(bool(proj.shared))
         self.var_numbering.set(proj.numbering)
         self.update_title()
@@ -1745,6 +1851,9 @@ class SectionLoader:
         help_label.pack(side=tk.LEFT)      # (packed last: if the window is narrow it is the help text that is cut, not the buttons)
 
         def caption(key, i):
+            if self.project.is_jpx:                  # (key: (0, frame): #, the section's place in the JPX as it was)
+                sec = self.jpx_by_frame.get(key[1])
+                return f"{i + 1}   {os.path.splitext(sec.name)[0][-9:] if sec else ''}", f"#{key[1] + 1}"
             slide = self.project.slides[key[0]]
             return f"{i + 1}   {os.path.splitext(os.path.basename(slide.path))[0][-9:]}", f"#{key[1] + 1}"   # (#: its outline's number in tab 2)
 
@@ -1773,6 +1882,9 @@ class SectionLoader:
 
     def enter_order(self):
         proj = self.project
+        if proj.is_jpx:
+            self.enter_order_jpx()
+            return
         key = proj.polygons_key()
         if proj.order and self.order_key == key and all(si < len(proj.slides) and pi < len(proj.slides[si].polygons) for si, pi in proj.order):
             self.order = list(proj.order)
@@ -1803,6 +1915,10 @@ class SectionLoader:
 
     def on_fit_thumbs(self):
         """"Scale sections to fit thumbnails" changed: the thumbnails are made again."""
+        if self.project.is_jpx:
+            self.thumbs = {}                         # (made again from the pictures already read, a few at a time, as the window asks)
+            self.draw_order()
+            return
         self.thumbs = {}
         self.build_thumbs()
         self.draw_order()
@@ -1842,12 +1958,141 @@ class SectionLoader:
             cv2.polylines(rgb, [((poly - a) * f).astype(np.int32)], True, (255, 212, 0), 1, cv2.LINE_AA)
             self.thumbs[key] = ImageTk.PhotoImage(Image.fromarray(rgb))
 
+    # ---- the ordering tab of a JPX project: the thumbnails come from the JPX's own frames, only those in view (and a few rows more), a few at a
+    # time in the background, and are kept on disk
+
+    def enter_order_jpx(self):
+        proj = self.project
+        self.thumbs = {}
+        self.var_spacing.set(f"{proj.z_spacing_um:g}" if proj.z_spacing_um > 0 else "")
+        if self.jpx_stack is not None and self.jpx_stack_path == proj.jpx_path:
+            self.jpx_ready()
+            return
+        self.order = []
+        self.draw_order()
+        self.var_status.set("Reading the NeuroInfo files...")
+        path, alignment = proj.jpx_path, proj.alignment
+
+        def ask(*args, **kwargs):
+            """A NeuroInfo file to choose (see ns.open_stack): the dialog is made, and waited for, by the window's thread."""
+            finished, answer = threading.Event(), {}
+
+            def run():
+                try:
+                    answer["value"] = neuroinfo_dialogs.locate_file(self.root, *args, **kwargs)
+                except BaseException as e:
+                    answer["error"] = e
+                finished.set()
+
+            self.msgs.put(("call", run))
+            finished.wait()
+            if "error" in answer:
+                raise answer["error"]
+            return answer["value"]
+
+        def done(res):
+            self.var_status.set("")
+            if isinstance(res, BaseException):
+                messagebox.showerror("Can't open the JPX", f"{type(res).__name__}: {res}", parent=self.root)
+                self.show_stage(0)
+                return
+            self.jpx_stack, self.jpx_stack_path = res, path
+            self.jpx_crops, self.jpx_inflight = {}, set()
+            if self.stage == 2 and self.project.is_jpx:
+                self.jpx_ready()
+
+        self.background(lambda: ns.open_stack(path, locate=ask, alignment=alignment), done)
+
+    def jpx_ready(self):
+        """The JPX's stack is open: its sections go in the grid (in the project's order, if it has one) and their pictures are asked for."""
+        proj, stack = self.project, self.jpx_stack
+        self.jpx_by_frame = {s.frame: s for s in stack.sections}
+        order = [f for f in proj.jpx_order if f in self.jpx_by_frame]
+        named = set(order)
+        order += [s.frame for s in stack.sections if s.frame not in named]
+        self.order = [(0, f) for f in order]
+        if proj.z_spacing_um <= 0 and stack.z_spacing_um > 0:
+            self.var_spacing.set(f"{stack.z_spacing_um:g}")
+        self.draw_order()
+        if self.jpx_tick_id is not None:
+            self.root.after_cancel(self.jpx_tick_id)
+        self.jpx_tick()
+
+    def jpx_tick(self):
+        """A few times a second: the thumbnails in view (and a few rows beyond) that aren't made are made, or their pictures asked for."""
+        self.jpx_tick_id = None
+        if self.closing or self.stage != 2 or not self.project.is_jpx or self.jpx_stack is None:
+            return
+        canvas = self.grid.canvas
+        cols, _cw, row_h = self.grid.cell_geometry()
+        first_row = max(int((canvas.canvasy(0) - CELL_PAD) // row_h) - 1, 0)
+        last_row = int((canvas.canvasy(max(canvas.winfo_height(), 1)) - CELL_PAD) // row_h) + 2
+        made = False
+        for key in self.grid.order[first_row * cols:(last_row + 1) * cols]:
+            if key in self.thumbs:
+                continue
+            crop = self.jpx_crops.get(key[1], 0)
+            if crop is False:
+                continue                             # (this frame couldn't be read: a blank thumbnail)
+            if crop:
+                made = self.jpx_make_thumb(key) or made
+            elif key[1] not in self.jpx_inflight and len(self.jpx_inflight) < 6:
+                self.jpx_submit(key[1])
+        if made:
+            self.draw_order()
+        self.jpx_tick_id = self.root.after(200, self.jpx_tick)
+
+    def jpx_submit(self, frame):
+        if self.jpx_pool is None:
+            self.jpx_pool = ThreadPoolExecutor(3)
+        stack, path, section = self.jpx_stack, self.jpx_stack_path, self.jpx_by_frame[frame]
+        self.jpx_inflight.add(frame)
+
+        def work():
+            ns.lower_thread_priority()
+            try:
+                data = jpx_crop(stack, path, frame, section)
+            except Exception as e:
+                data = e
+            self.msgs.put(("jpxcrop", (stack, frame, data)))
+
+        self.jpx_pool.submit(work)
+
+    def on_jpx_crop(self, stack, frame, data):
+        if stack is not self.jpx_stack:
+            return                                   # (a picture of a stack that has been closed)
+        self.jpx_inflight.discard(frame)
+        if isinstance(data, BaseException):
+            print(f"Couldn't read the picture of section {frame + 1}: {type(data).__name__}: {data}", flush=True)
+            self.jpx_crops[frame] = False
+            return
+        self.jpx_crops[frame] = data
+        if not self.var_fit_thumbs.get():
+            self.thumbs = {}                         # (to one scale for all: a new picture can change that scale, so they are all made again)
+
+    def jpx_make_thumb(self, key):
+        """The thumbnail of a section from its picture, fitted to the thumbnail (or, with "Scale sections to fit thumbnails" off, drawn to the
+        scale at which the biggest section just fits, so that sizes compare). True if it was made."""
+        crop = self.jpx_crops.get(key[1])
+        if not crop:
+            return False
+        rgb, poly, um = crop
+        h, w = rgb.shape[:2]
+        if self.var_fit_thumbs.get():
+            f = min(THUMB_W / w, THUMB_H / h)
+        else:
+            f = min((min(THUMB_W / c[0].shape[1], THUMB_H / c[0].shape[0]) / c[2] for c in self.jpx_crops.values() if c), default=1.0) * um
+        img = cv2.resize(rgb, (max(int(w * f), 1), max(int(h * f), 1)), interpolation=cv2.INTER_AREA)
+        cv2.polylines(img, [(poly * f).astype(np.int32)], True, (255, 212, 0), 1, cv2.LINE_AA)
+        self.thumbs[key] = ImageTk.PhotoImage(Image.fromarray(img))
+        return True
+
     def draw_order(self):
         self.grid.draw()
 
     def order_double(self, key, i):
         """Double-click on a thumbnail: back to the outlines tab, at that section's image with its outline selected."""
-        if self.busy:
+        if self.busy or self.project.is_jpx:         # (a JPX has no outlines tab)
             return
         si, pi = key
         self.project.order = list(self.order)         # (the order made so far is kept for when the tab is entered again)
@@ -1862,10 +2107,50 @@ class SectionLoader:
         self.grid.reverse()
 
     def reset_order(self):
-        self.order = self.project.default_order()
+        if self.project.is_jpx:
+            self.order = [(0, f) for f in sorted(self.jpx_by_frame)]       # (the JPX's own order)
+        else:
+            self.order = self.project.default_order()
         self.draw_order()
 
     # ------------------------------------------------------------------ done
+
+    def finish_jpx(self, spacing):
+        """Done, for a JPX project: the order and the spacing are saved, and the stack (as opened, in that order) goes to the alignment tool."""
+        proj, stack = self.project, self.jpx_stack
+        if stack is None:
+            return
+        proj.z_spacing_um = spacing
+        proj.jpx_order = [f for _, f in self.order]
+        proj.jpx_sections = len(proj.jpx_order)
+        try:
+            self.write_project(proj)
+        except OSError as e:
+            messagebox.showwarning("Project not saved", f"Couldn't save the project file: {e}", parent=self.root)
+        self.var_status.set("Preparing the sections...")
+
+        def work():
+            sp.apply_jpx_order(stack, proj.jpx_order)
+            stack.z_spacing_um = spacing
+            return stack
+
+        def done(res):
+            self.var_status.set("")
+            if isinstance(res, BaseException):
+                messagebox.showerror("Can't go on", f"{type(res).__name__}: {res}", parent=self.root)
+                return
+            self.result = res
+            self.close()
+            if self.on_done:
+                self.on_done(res)
+
+        self.background(work, done)
+
+    def resume(self, path, stage=2):
+        """Open a saved project and go straight to one of the tabs (the alignment tool's "Back to step 1" comes here, to the order tab)."""
+        self.open_project(path)
+        if self.project.slides:
+            self.show_stage(stage)
 
     def finish(self):
         proj = self.project
@@ -1876,6 +2161,9 @@ class SectionLoader:
         if spacing <= 0:
             messagebox.showinfo("Distance between sections", "Enter the distance between adjacent sections, in \u00b5m (the same number "
                                 "NeuroInfo asks for when it makes a reconstruction).", parent=self.root)
+            return
+        if proj.is_jpx:
+            self.finish_jpx(spacing)
             return
         proj.z_spacing_um = spacing
         proj.order = list(self.order)

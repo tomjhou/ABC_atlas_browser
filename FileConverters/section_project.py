@@ -62,6 +62,8 @@ def count_sections(path):
     try:
         with open(path, encoding="utf-8") as f:
             doc = json.load(f)
+        if len(doc["slides"]) == 1 and is_jpx(doc["slides"][0]["path"]):       # (a JPX stack: its own sections)
+            return doc.get("jpx_sections") or None
         return sum(len(s.get("polygons") or []) for s in doc["slides"])
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
@@ -108,10 +110,36 @@ class SlideInfo:
 
 
 JP2_SUFFIXES = (".jp2", ".j2k", ".j2c")    # single-image files: one section each (a .czi holds many)
+JPX_SUFFIXES = (".jpx",)                   # a stack of sections already (NeuroInfo's, or this tool's): a project of its own
 
 
 def is_jp2(path):
     return path.lower().endswith(JP2_SUFFIXES)
+
+
+def is_jpx(path):
+    return path.lower().endswith(JPX_SUFFIXES)
+
+
+def jpx_slide_info(path):
+    """What step 1 shows for a JPX stack: its sections (frames), pixel size and channels."""
+    boxes = ns.read_boxes(path)
+    frames = [b for b in boxes if b.kind == b"jp2c"]
+    if not frames:
+        raise ValueError(f"{os.path.basename(path)} has no images in it.")
+    px = 0.0
+    with open(path, "rb") as f:
+        _w, _h, nc = ns.codestream_size(f, frames[0])
+        for b in boxes:
+            if b.kind == b"uuid":
+                data = ns.read_payload(f, b)
+                if data[:16] == ns.XMP_UUID:
+                    m = re.search(r'xmp:PixelWidth="([0-9.eE+-]+)"', data[16:].decode("utf-8", "replace"))
+                    px = max(float(m.group(1)), 0.0) if m else 0.0
+                    break
+    chans = list(ns.read_xmp_channels(path)[:nc])
+    chans += [ns.ChannelInfo(f"channel {i}", DEFAULT_COLORS[min(i, 3)]) for i in range(len(chans), nc)]
+    return SlideInfo(path, len(frames), px, chans, os.path.getsize(path))
 
 
 def jp2_header(path):
@@ -153,6 +181,8 @@ def scene_boxes(path):
 def slide_info(path):
     """What step 1 needs to know about a slide (.czi) or section image (.jp2): its scenes, pixel size (um; 0 if a .jp2 does not
     say) and channels."""
+    if is_jpx(path):
+        return jpx_slide_info(path)
     if is_jp2(path):
         w, h, nc, px = jp2_header(path)
         chans = [c for c in ns.read_xmp_channels(path)[:nc]] if not path.lower().endswith((".j2k", ".j2c")) else []
@@ -493,6 +523,17 @@ class Project:
     alignment_key: str = ""                        # fingerprint() of the outlines and order that alignment was made from
     shared: dict = None                            # the settings every image shares ("same settings for all images"), or None
     numbering: str = "rows"                        # how outlines are numbered: NUMBERINGS (new projects: across, then down)
+    jpx_order: list = field(default_factory=list)  # a JPX project: the frames of its JPX in section order (empty: the JPX's own order)
+    jpx_sections: int = 0                          # a JPX project: how many sections its JPX has (for the list of recent projects)
+
+    @property
+    def is_jpx(self):
+        """A JPX project: one row, a JPX stack, no scans to find outlines on (its sections come with outlines, from NeuroInfo)."""
+        return len(self.slides) == 1 and is_jpx(self.slides[0].path)
+
+    @property
+    def jpx_path(self):
+        return self.slides[0].path if self.is_jpx else ""
 
     def polygons_key(self):
         """Something that changes when any slide's outlines do (the order is kept while this is the same)."""
@@ -500,7 +541,10 @@ class Project:
 
     def fingerprint(self):
         """A short code for the outlines and their order: the saved alignment belongs to these, and is dropped if they change."""
-        text = json.dumps([self.polygons_key(), self.order or self.default_order()])
+        if self.is_jpx:
+            text = json.dumps(["jpx", os.path.basename(self.slides[0].path), self.jpx_order])
+        else:
+            text = json.dumps([self.polygons_key(), self.order or self.default_order()])
         return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
     def default_order(self):
@@ -521,7 +565,8 @@ class Project:
                            "smooth": s.smooth, "pad": s.pad, "own": s.own, "pixel_um": s.pixel_um, "accepted": s.accepted, "polygons": [np.round(p, 2).tolist() for p in s.polygons]}
                           for s in self.slides],
                "order": [list(o) for o in self.order], "z_spacing_um": self.z_spacing_um,
-               "shared": self.shared, "numbering": self.numbering, "alignment": alignment, "alignment_key": self.alignment_key}
+               "shared": self.shared, "numbering": self.numbering, "alignment": alignment, "alignment_key": self.alignment_key,
+               "jpx_order": self.jpx_order, "jpx_sections": self.jpx_sections}
         tmp = path + ".partial"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(doc, f, separators=(",", ":"))
@@ -555,6 +600,8 @@ class Project:
         proj = Project(slides, [tuple(o) for o in doc.get("order", [])], os.path.abspath(path), float(doc.get("z_spacing_um", 0.0)),
                        doc.get("alignment"), doc.get("alignment_key", ""))
         proj.shared = doc.get("shared")
+        proj.jpx_order = [int(v) for v in doc.get("jpx_order", [])]
+        proj.jpx_sections = int(doc.get("jpx_sections", 0) or 0)
         # (a project saved before the choice existed was numbered by scene)
         proj.numbering = doc.get("numbering", "scene") if doc.get("numbering") in NUMBERINGS else "scene"
         return proj
@@ -644,6 +691,28 @@ def match_alignment(project):
                 taken.add(i)
     dropped = [i for i in range(len(olds)) if i not in taken]
     return assign, dropped, [n for n in range(len(items)) if n not in assign]
+
+
+def apply_jpx_order(stack, frames):
+    """Put the sections of a JPX project's stack in the order of `frames` (frame numbers of the JPX). A section not named keeps its
+    relative place, after the named ones."""
+    if not frames:
+        return
+    named = set(frames)
+    by_frame = {s.frame: s for s in stack.sections}
+    stack.sections[:] = [by_frame[f] for f in frames if f in by_frame] + [s for s in stack.sections if s.frame not in named]
+    for i, s in enumerate(stack.sections):
+        s.index = i
+
+
+def open_jpx_stack(project, locate=None):
+    """The Stack of a JPX project, ready for the alignment tool: its JPX opened (with the project's saved alignment, if it has one),
+    in the project's order."""
+    stack = ns.open_stack(project.jpx_path, locate=locate, alignment=project.alignment)
+    apply_jpx_order(stack, project.jpx_order)
+    if project.z_spacing_um > 0:
+        stack.z_spacing_um = project.z_spacing_um
+    return stack
 
 
 def build_stack(project, margin=0.2):
