@@ -372,7 +372,7 @@ class Aligner:
         tm = tk.Menu(menu, tearoff=0)
         tm.add_command(label="Analyze project", command=self.analyze_project)
         menu.add_cascade(label="Tools", menu=tm)
-        menu.add_command(label="\u25c4 Back to step 1: order sections", command=self.go_back_to_ordering)
+        menu.add_command(label="\u25c4 Back to step 3: order sections", command=self.go_back_to_ordering)
         self.back_menu_index = menu.index("end")
         self.menubar = menu
         root.config(menu=menu)
@@ -2923,7 +2923,7 @@ class Aligner:
         """Back to the section loader (its ordering tab) with this project: its alignment is saved first, and kept (it is of the images, so
         it holds through another order of the sections)."""
         if not self.project_path:
-            messagebox.showinfo("Back to step 1", "Only a stack that came from step 1 (a project) can go back to it.", parent=self.root)
+            messagebox.showinfo("Back to step 3", "Only a stack that came from the section loader (a project) can go back to it.", parent=self.root)
             return
         if self.busy or self.opening:
             return

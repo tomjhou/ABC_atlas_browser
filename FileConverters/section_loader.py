@@ -152,7 +152,7 @@ class SectionLoader:
         for i, name in enumerate(STAGES):
             if i:
                 tk.Label(self.strip, text="›", bg="#eef1f5", fg="gray50", font=("Segoe UI", 14)).pack(side=tk.LEFT)
-            number = str(i + 1) if i < 3 else "→"
+            number = str(i + 1)
             lab = tk.Label(self.strip, text=f"{number}  {name}", padx=14, pady=8, font=("Segoe UI", 11))
             lab.pack(side=tk.LEFT)
             self.strip_labels.append(lab)

@@ -23,12 +23,12 @@ def choose():
     outer = ttk.Frame(root, padding=28)
     outer.pack()
     ttk.Label(outer, text="Section alignment", font=("Segoe UI", 18, "bold")).pack(anchor="w")
-    ttk.Label(outer, text="Two steps, in this order. Step 2 picks up where step 1 left off.", foreground="gray30").pack(anchor="w", pady=(2, 18))
+    ttk.Label(outer, text="Steps 1-3 find and order the sections. Step 4 picks up where they leave off.", foreground="gray30").pack(anchor="w", pady=(2, 18))
 
     def card(number, title, text, key, primary):
         f = tk.Frame(outer, bd=1, relief="solid", padx=16, pady=12, bg="white")
         f.pack(fill=tk.X, pady=6)
-        tk.Label(f, text=number, font=("Segoe UI", 26, "bold"), fg="#1f5fa8", bg="white", width=2).pack(side=tk.LEFT)
+        tk.Label(f, text=number, font=("Segoe UI", 14, "bold"), fg="#1f5fa8", bg="white", width=9).pack(side=tk.LEFT)
         mid = tk.Frame(f, bg="white")
         mid.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 16))
         tk.Label(mid, text=title, font=("Segoe UI", 13, "bold"), bg="white", anchor="w").pack(fill=tk.X)
@@ -38,10 +38,10 @@ def choose():
         if primary:
             b.focus_set()
 
-    card("1", "Load / detect images",
+    card("Steps 1-3", "Load / detect / order images",
          "Choose slide scans (.czi), find the sections on them, and put the sections in order. Or open a .jpx stack to reorder its sections.", "detect", True)
-    card("2", "Align images",
-         "Line up the sections and export the stack. Opens the sections from step 1, or a JPX you already have.", "align", False)
+    card("Step 4", "Align images",
+         "Line up the sections and export the stack. Opens the sections from steps 1-3, or a JPX you already have.", "align", False)
     ttk.Separator(outer).pack(fill=tk.X, pady=(14, 8))
     ttk.Style(root).configure("Exit.TButton", font=("Segoe UI", 13))
     ttk.Button(outer, text="Exit", width=24, style="Exit.TButton", command=root.destroy).pack(side=tk.BOTTOM, ipady=6, pady=(0, 4))   # (centered)
