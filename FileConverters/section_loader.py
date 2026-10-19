@@ -7,7 +7,7 @@ Three stages in one window, shown by a strip along the top:
   3. Order sections   - thumbnails are dragged into their order along the brain.
 "Done" saves the project beside the first slide and hands the sections, in memory, to the alignment tool (no JPX is written).
 
-Run it directly (python section_loader.py [slides...]), or from the start window (workflow.py)."""
+Run it directly (python section_loader.py [slides...]), or from the start window (SerialAssembler.py)."""
 import os
 import queue
 import sys

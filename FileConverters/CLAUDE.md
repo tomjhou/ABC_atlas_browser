@@ -8,7 +8,7 @@
 - `neuroinfo_stack.py` + `jpx_aligner.py` (GUI): re-align NeuroInfo serial section assembler
   stacks (stage 1 only; stage 2 atlas registration is edited in NeuroInfo). See below.
 
-- `workflow.py` (start window) -> `section_loader.py` + `section_project.py` (step 1: find sections on .czi scans:
+- `SerialAssembler.py` (start window) -> `section_loader.py` + `section_project.py` (step 1: find sections on .czi scans:
   threshold, outlines, order; project file `*_project.json` (older `*.sections.json` still open)) -> `jpx_aligner.py` with an in-memory Stack
   (`jpx_path == ""`, `Stack.unsaved`, sections rendered from the scans with `czi_origin = (0, 0)`; first export uses
   `write_jpx_new`). `j2k_partial.py` reads only the needed packets of NeuroInfo's JPEG 2000 frames.

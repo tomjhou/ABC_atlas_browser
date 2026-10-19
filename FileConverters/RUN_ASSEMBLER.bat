@@ -19,7 +19,7 @@ if not defined PYTHON_CMD (
   exit /b 1
 )
 
-"%PYTHON_CMD%" workflow.py %*
+"%PYTHON_CMD%" SerialAssembler.py %*
 if errorlevel 1 (
   echo.
   echo The aligner stopped with an error ^(see above^).
