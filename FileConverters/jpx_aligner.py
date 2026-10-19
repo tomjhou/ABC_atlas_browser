@@ -53,6 +53,7 @@ import numpy as np  # noqa: E402
 from PIL import Image, ImageTk  # noqa: E402
 
 PREVIEW_MAX_PX = 2500   # longest side of the cached preview of each section
+THUMB_MAX_PX = 1600     # longest side of the slide thumbnail as it is built (it is scaled to the left pane's width when shown)
 CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
                          "JhouLab", "jpx_aligner_cache")
 SETTINGS_FILE = os.path.join(os.path.dirname(CACHE_DIR), "jpx_aligner_settings.json")
@@ -238,7 +239,9 @@ class Aligner:
         self.root.geometry("1500x950")
         self.stack = None
         self.previews = {}          # section index -> (img, kx, ky)
-        self.thumbs = {}            # .czi path -> (PhotoImage, (x0, y0, k)): the slide scan's thumbnail, for the picture above the list
+        self.thumbs = {}            # .czi path -> (picture as a PIL image, (x0, y0, k)): the slide scan's thumbnail, for the picture above the list
+        self.thumb_photos = {}      # (path, width) -> the PhotoImage of that picture at that width (it follows the left pane's width)
+        self.thumb_job = None
         self.frame_previews = set()  # indices of sections whose preview is the JPX's own frame (not rendered from a source image)
         self.cur = 0
         self.undo = []              # steps: each a list of (section index, Edit before the change)
@@ -266,8 +269,10 @@ class Aligner:
         self.levels_set = False
         self._busy = False
         self.calibrating = False    # the .czi sections are being located on their slide scans
+        self.locating_done = False  # that has finished (what is still not located then is shown in red)
         self.msgs = queue.Queue()
         self.stop_event = threading.Event()
+        self.stop_event_verify = threading.Event()   # (set when a stack is closed or replaced: the position check ends)
         self.photo = None
 
         self.var_ref = tk.StringVar(self.root, "previous")
@@ -280,6 +285,7 @@ class Aligner:
         self.var_rerender = tk.BooleanVar(self.root, True)   # every image is written again, so each JPX file has all of its images
         self.var_background = tk.BooleanVar(self.root, bool(load_settings().get("background_loading", True)))
         self.var_advanced = tk.BooleanVar(self.root, bool(load_settings().get("advanced_mode", False)))
+        self.var_verify = tk.BooleanVar(self.root, bool(load_settings().get("verify_positions", True)))
         self.var_crosshair = tk.BooleanVar(self.root, True)
         self.var_follow = tk.BooleanVar(self.root, False)   # an edit also moves the sections after it
         self.var_status = tk.StringVar(self.root, "Open a reconstruction.jpx to start (File > Open).")
@@ -305,6 +311,8 @@ class Aligner:
         om = tk.Menu(fm, tearoff=0)
         om.add_checkbutton(label="Load images in the background", variable=self.var_background,
                            command=self.background_option_changed)
+        om.add_checkbutton(label="Check section positions in the background", variable=self.var_verify,
+                           command=lambda: save_settings(verify_positions=bool(self.var_verify.get())))
         om.add_checkbutton(label="Advanced mode", variable=self.var_advanced, command=self.advanced_option_changed)
         fm.add_cascade(label="Options", menu=om)
         fm.add_separator()
@@ -315,6 +323,9 @@ class Aligner:
         em.add_command(label="Reset this section", command=self.reset_section)
         em.add_command(label="Reset all sections", command=self.reset_all)
         menu.add_cascade(label="Edit", menu=em)
+        tm = tk.Menu(menu, tearoff=0)
+        tm.add_command(label="Analyze project", command=self.analyze_project)
+        menu.add_cascade(label="Tools", menu=tm)
         root.config(menu=menu)
 
         main = ttk.Frame(root)
@@ -358,15 +369,23 @@ class Aligner:
             button = ttk.Button(order, text=text, command=command)
             button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
             Tooltip(button, tip)
-        self.listbox = tk.Listbox(left, width=30, height=12, exportselection=False, activestyle="none",
-                                  font=("Segoe UI", 10))
-        self.listbox.pack(fill=tk.BOTH, expand=True)
+        list_frame = ttk.Frame(left)
+        list_frame.pack(fill=tk.BOTH, expand=True)
+        self.list_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL)   # (shown only when the list is longer than its window)
+        self.list_scroll_shown = False
+        self.listbox = tk.Listbox(list_frame, width=30, height=12, exportselection=False, activestyle="none",
+                                  font=("Segoe UI", 10), yscrollcommand=self.on_list_scroll)
+        self.list_scroll.config(command=self.listbox.yview)
+        self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.listbox.bind("<<ListboxSelect>>", self.on_list_select)
 
         self.canvas = tk.Canvas(self.paned, bg="black", highlightthickness=0, cursor="fleur")
         self.paned.add(left, minsize=180, stretch="never")
         self.paned.add(self.canvas, minsize=300, stretch="always")
-        self.root.after_idle(lambda: self.paned.paneconfigure(left, width=left.winfo_reqwidth()))   # fix the pane's width
+        # fix the pane's width (at least 320 px at 96 dpi: the slide thumbnail takes the width of the pane, so it is not left tiny)
+        self.root.after_idle(lambda: self.paned.paneconfigure(
+            left, width=max(left.winfo_reqwidth(), round(320 * self.root.winfo_fpixels("1i") / 96))))
+        left.bind("<Configure>", self.on_left_resize)
         c = self.canvas
         c.bind("<Configure>", self.on_resize)
         c.bind("<ButtonPress-1>", self.on_left_press)
@@ -761,8 +780,10 @@ class Aligner:
         self.opening = True
         self.update_cursor()
         self.root.update()
+        t_open = time.time()
         try:
             stack = ns.open_stack(path, locate=self.locate_file)
+            self.open_seconds = time.time() - t_open   # (includes any dialog asking for the NeuroInfo files)
         except Exception as e:
             self.opening = False
             self.update_cursor()
@@ -772,11 +793,13 @@ class Aligner:
         self.update_cursor()
         missing = [s.name for s in stack.sections if not s.source_path]
         if missing:
-            messagebox.showwarning(
-                "Source images not found",
-                "These section images weren't found, so they can't be shown or re-rendered "
-                "(their current images in the JPX are kept as they are):\n\n" + "\n".join(missing),
-                parent=self.root)
+            if not messagebox.askokcancel(
+                    "Source images not found",
+                    "These section images weren't found, so they can't be shown or re-rendered "
+                    "(their current images in the JPX are kept as they are):\n\n" + "\n".join(missing)
+                    + "\n\nOK opens the stack anyway; Cancel doesn't open it.",
+                    icon="warning", parent=self.root):
+                return
         if stack.source_pixel_um and abs(stack.source_pixel_um / stack.pixel_um - 1) > 0.01:
             answer = messagebox.askyesnocancel(
                     "Pixel size doesn't match the source images",
@@ -820,7 +843,9 @@ class Aligner:
         self.stack = stack
         self.previews = {}
         self.frame_previews = set()
+        self.locating_done = False
         self.thumbs = {}
+        self.thumb_photos = {}
         self.draw_thumbnail()
         self.undo = []
         self.outline_undo = []
@@ -843,7 +868,11 @@ class Aligner:
         todo = list(stack.sections)
         self.progress.config(maximum=max(len(todo), 1), value=0)
         self.loading_previews = bool(todo)
+        t_start = time.time()   # (the loading proper: after the questions asked when opening)
+        open_seconds = getattr(self, "open_seconds", 0.0)
+        first = []
         self.calibrating = any(s.source_path.lower().endswith(".czi") and s.czi_origin is None for s in todo)
+        self.locating_done = not self.calibrating
         self.update_cursor()
         self.refresh_list()   # (sections not loaded yet are grey)
         self.update_sections_title()
@@ -852,7 +881,7 @@ class Aligner:
 
         czi_paths = sorted({s.source_path for s in todo if s.source_path.lower().endswith(".czi")})
         if czi_paths:
-            max_px = max(150, self.left_pane.winfo_width() - 14)   # (the width of the pane, less its padding)
+            max_px = THUMB_MAX_PX   # (large; the picture is scaled to the left pane's width as it is drawn)
 
             def thumbs():
                 ns.lower_thread_priority()
@@ -874,6 +903,8 @@ class Aligner:
                     return
                 posted.add(s.frame)
                 n = len(posted)
+                if not first:
+                    first.append(time.time() - t_start)
             self.msgs.put(("preview", (stack, s.frame, pv, n, is_frame)))
 
         def czi_picture(s):
@@ -893,17 +924,48 @@ class Aligner:
             except Exception as e:
                 self.msgs.put(("status", f"Couldn't read the scan of section {s.index + 1}: {e}"))
 
+        locate_seconds = [0.0]
+        verify_wanted = bool(self.var_verify.get())   # (read here: Tk variables are for the main thread only)
+        verify_stop = threading.Event()   # (a stack opened later ends the check of this one)
+        self.stop_event_verify.set()
+        self.stop_event_verify = verify_stop
+
+        def verify():
+            """Check, one by one, the sections that were given their scan's origin against their own frames."""
+            ns.lower_thread_priority()
+            t_v = time.time()
+            n_assumed = sum(1 for s in stack.sections if s.czi_assumed)
+            try:
+                summary = ns.verify_czi_origins(stack, progress=lambda i, n, text: self.msgs.put(("status", text)),
+                                                stop=verify_stop)
+            except BaseException as e:
+                self.msgs.put(("status", f"Couldn't check the section positions: {e}"))
+                return
+            parts = [f"{summary['checked']} checked in {time.time() - t_v:.0f} s"]
+            if summary["corrected"]:
+                parts.append(f"{len(summary['corrected'])} had a position of their own (> 3 px from the scan's) and were moved to it: "
+                             + ", ".join(f"{n} ({dx:+.1f}, {dy:+.1f} px)" for n, dx, dy in summary["corrected"][:12]))
+            if summary["unverified"]:
+                parts.append(f"{len(summary['unverified'])} could not be checked (no good match; kept the scan's position): "
+                             + ", ".join(str(n) for n in summary["unverified"][:12]))
+            print(f"Checked the section positions of {os.path.basename(stack.jpx_path)}: " + "; ".join(parts), flush=True)
+            self.msgs.put(("verified", (stack, summary)))
+
         def work():
             ns.lower_thread_priority()   # (the window stays responsive while the images load)
             frame_boxes = None
             if any(s.source_path.lower().endswith(".czi") and s.czi_origin is None for s in todo):
                 self.msgs.put(("status", "Preparing the Zeiss .czi reader (installed first if it is missing)..."))
+                t_locate = time.time()
                 try:
                     problems = ns.calibrate_stack_czi(stack, progress=lambda i, n, text: self.msgs.put(("status", text)),
                                                       on_located=located)
                 except BaseException as e:   # (a failed install of the reader library, for one)
                     problems = {"the .czi scans": str(e) or type(e).__name__}
+                locate_seconds[0] = time.time() - t_locate
                 self.msgs.put(("czi_ready", (stack, {k: v for k, v in problems.items() if v})))
+                if verify_wanted and any(s.czi_assumed for s in stack.sections):
+                    threading.Thread(target=verify, daemon=True).start()
             for s in todo:
                 if self.stack is not stack:
                     return
@@ -927,6 +989,12 @@ class Aligner:
                     self.msgs.put(("status", f"Couldn't read section {s.index + 1}: {e}"))
                     continue
                 post(s, pv, is_frame)
+            total = time.time() - t_start
+            n = max(len(posted), 1)
+            print(f"Loaded {os.path.basename(stack.jpx_path)}: {len(posted)} of {len(todo)} sections in {open_seconds + total:.1f} s "
+                  f"(reading the NeuroInfo files {open_seconds:.1f} s; the first section was ready {first[0] if first else 0:.1f} s "
+                  f"after that" + (f"; locating the sections on the slide scans {locate_seconds[0]:.1f} s" if locate_seconds[0] else "")
+                  + f"; {total / n:.2f} s per section, not counting dialogs you answered)", flush=True)
             self.msgs.put(("loaded", (stack, f"Ready. {len(posted)} of {len(todo)} sections loaded.")))
 
         threading.Thread(target=work, daemon=True).start()
@@ -951,12 +1019,20 @@ class Aligner:
                 elif kind == "thumb":
                     stack, path, img, geometry = payload
                     if stack is self.stack:
-                        self.thumbs[path] = (ImageTk.PhotoImage(Image.fromarray(img)), geometry)
+                        self.thumbs[path] = (Image.fromarray(img), geometry)
                         self.draw_thumbnail()
+                elif kind == "verified":
+                    stack, summary = payload
+                    if stack is self.stack:
+                        n_bad = len(summary["corrected"]) + len(summary["unverified"])
+                        self.var_status.set(f"Section positions checked: {summary['checked'] - n_bad} confirmed, "
+                                            f"{len(summary['corrected'])} corrected, {len(summary['unverified'])} unchecked.")
+                        self.redraw()
                 elif kind == "czi_ready":
                     stack, problems = payload
                     if stack is self.stack:
                         self.calibrating = False
+                        self.locating_done = True
                         self.refresh_list()
                         self.update_controls()
                         if problems:
@@ -1024,6 +1100,13 @@ class Aligner:
         self.listbox.selection_set(self.cur)
         self.listbox.see(self.cur)
 
+    def on_left_resize(self, event=None):
+        """The left pane was resized (its bar dragged, or the window): the slide thumbnail follows its width."""
+        if self.thumbs:
+            if self.thumb_job is not None:
+                self.root.after_cancel(self.thumb_job)
+            self.thumb_job = self.root.after(60, self.draw_thumbnail)
+
     def draw_thumbnail(self):
         """The slide scan's picture above the section list, with the outlines of the located sections (the current one bright):
         the sections can be told apart by where they lie on the slide."""
@@ -1035,7 +1118,19 @@ class Aligner:
                 c.pack_forget()
                 self.thumb_shown = False
             return
-        photo, (gx0, gy0, k) = self.thumbs[path]
+        picture, (gx0, gy0, k) = self.thumbs[path]
+        # as wide as the left pane allows (less its padding), but not so tall that the list is squeezed out, nor larger than the picture
+        pane_w = max(150, self.left_pane.winfo_width() - 14)
+        pane_h = self.left_pane.winfo_height()
+        width = min(pane_w, picture.width, int(0.5 * pane_h * picture.width / picture.height) if pane_h > 300 else pane_w)
+        width = max(width, 100)
+        photo = self.thumb_photos.get((path, width))
+        if photo is None:
+            if len(self.thumb_photos) > 12:
+                self.thumb_photos.clear()
+            small = picture.resize((width, max(1, round(picture.height * width / picture.width))), Image.LANCZOS)
+            photo = self.thumb_photos[(path, width)] = ImageTk.PhotoImage(small)
+        k = k * picture.width / width     # (source pixels per pixel of the picture as it is shown)
         if not self.thumb_shown:
             c.pack(before=self.label_sections, anchor="w", pady=(0, 6))
             self.thumb_shown = True
@@ -1065,10 +1160,23 @@ class Aligner:
         """The section's picture has been loaded."""
         return s.frame in self.previews
 
+    def on_list_scroll(self, first, last):
+        """The list's view changed: move the scroll bar, which is only there when not all of the list fits."""
+        self.list_scroll.set(first, last)
+        needed = float(first) > 0.0 or float(last) < 1.0
+        if needed != self.list_scroll_shown:
+            self.list_scroll_shown = needed
+            if needed:
+                self.list_scroll.pack(side=tk.RIGHT, fill=tk.Y, before=self.listbox)
+            else:
+                self.list_scroll.pack_forget()
+
     def style_list_item(self, s):
-        """Grey: no source image (only its frame can be shown), or its picture has not been loaded yet."""
+        """Red: a slide-scan section that could not be located on its scan (its frame is shown as it is). Grey: no source
+        image (only its frame can be shown), or its picture has not been loaded yet."""
+        failed = self.locating_done and s.source_path.lower().endswith(".czi") and s.czi_origin is None
         grey = not s.source_path or (self.loading_previews and not self.loaded(s))
-        self.listbox.itemconfig(s.index, foreground="gray60" if grey else "")
+        self.listbox.itemconfig(s.index, foreground="#c00000" if failed else "gray60" if grey else "")
 
     def refresh_list_item(self, i):
         sel = self.listbox.curselection()
@@ -2031,6 +2139,392 @@ class Aligner:
 
     # ---------------------------------------------------------------- run
 
+    # ---------------------------------------------------------------- Tools > Analyze project
+
+    ANALYSIS_COLUMNS = (
+        ("#", 45, "e"), ("Slide (source image)", 260, "w"), ("Scene", 60, "e"), ("Position", 190, "w"),
+        ("Centroid in the stack (um)", 190, "e"), ("Centroid in the stack (px)", 190, "e"),
+        ("Centroid in the section's own coordinates (um)", 290, "e"), ("Centroid on the slide (px)", 190, "e"),
+        ("Rotation (deg)", 110, "e"), ("Mirrored", 80, "w"), ("Outline points", 110, "e"))   # (widths at 96 dpi)
+
+    @staticmethod
+    def polygon_centroid(P):
+        """The centroid of the area of a closed polygon (the mean of the vertices if the area is degenerate)."""
+        P = np.asarray(P, float)
+        if len(P) < 3:
+            return P.mean(0) if len(P) else None
+        x, y = P[:, 0], P[:, 1]
+        x1, y1 = np.roll(x, -1), np.roll(y, -1)
+        cross = x * y1 - x1 * y
+        area = cross.sum() / 2
+        if abs(area) < 1e-9:
+            return P.mean(0)
+        return np.array([((x + x1) * cross).sum() / (6 * area), ((y + y1) * cross).sum() / (6 * area)])
+
+    def analysis_rows(self):
+        """One row per section: where it lies, in the stack and (for a slide scan) on the slide."""
+        st = self.stack
+        rows = []
+        for s in st.sections:
+            slide = os.path.basename(s.source_path) if s.source_path else "(source image not found)"
+            czi = s.source_path.lower().endswith(".czi")
+            scene, where, slide_xy = "", "", ""
+            if czi:
+                if s.czi_origin is None:
+                    where = "not located on the scan"
+                else:
+                    where = "origin shared with its scan" if s.czi_assumed else "located on the scan"
+                    try:
+                        scene = str(ns.czi_scene_of(s, st) + 1)
+                    except Exception:
+                        pass
+            elif s.source_path:
+                where = "own image file"
+            c_src = self.polygon_centroid(s.case_points) if len(s.case_points) else None
+            c_stack = self.polygon_centroid(s.stack_points) if len(s.case_points) else None
+            stack_um = stack_px = src_um = ""
+            if c_stack is not None:
+                stack_um = f"{c_stack[0]:.1f}, {c_stack[1]:.1f}"
+                stack_px = f"{c_stack[0] / st.pixel_um:.0f}, {-c_stack[1] / st.pixel_um:.0f}"
+                src_um = f"{c_src[0]:.1f}, {c_src[1]:.1f}"
+                if czi and s.czi_origin is not None:
+                    slide_xy = f"{c_src[0] / st.pixel_um + s.czi_origin[0]:.0f}, {-c_src[1] / st.pixel_um + s.czi_origin[1]:.0f}"
+            rows.append((s.index + 1, slide, scene, where, stack_um, stack_px, src_um, slide_xy,
+                         f"{-s.rotation_deg:+.2f}", "yes" if s.mirrored else "no", len(s.case_points)))
+        return rows
+
+    def build_outline_tab(self, parent):
+        """The second tab of the analysis window: choose a slide at the left; at the right every outline of that slide, numbered,
+        drawn at the coordinates the case file stores (no transform of any kind)."""
+        st = self.stack
+        tab = ttk.Frame(parent)
+        slides = {}
+        for s in st.sections:
+            slides.setdefault(os.path.basename(s.source_path) if s.source_path else "(source image not found)", []).append(s)
+        names = ["All sections"] + list(slides)
+        has_raw = any(s.raw_points is not None for s in st.sections)
+        left = ttk.Frame(tab, padding=6)
+        left.pack(side=tk.LEFT, fill=tk.Y)
+        ttk.Label(left, text="Slide").pack(anchor="w")
+        lb_frame = ttk.Frame(left)
+        lb_frame.pack(fill=tk.Y, expand=True)
+        lb = tk.Listbox(lb_frame, width=34, exportselection=False, activestyle="none", font=("Segoe UI", 10))
+        sb = ttk.Scrollbar(lb_frame, orient=tk.VERTICAL, command=lb.yview)
+        lb.config(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        lb.pack(side=tk.LEFT, fill=tk.Y, expand=True)
+        for n in names:
+            lb.insert(tk.END, n if n == "All sections" else f"{n}  ({len(slides[n])})")
+        right = ttk.Frame(tab, padding=6)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        top = ttk.Frame(right)
+        top.pack(fill=tk.X)
+        y_down = tk.BooleanVar(tab, False)
+        ttk.Label(top, text=(f"The outlines as {st.case_file or 'the case file'} stores them (X, Y in um), with no transform." if has_raw else
+                             "This file has no case file: the outlines as stored in it (um), with no transform.")).pack(side=tk.LEFT)
+        raw_on = tk.BooleanVar(tab, True)
+        rec_on = tk.BooleanVar(tab, True)
+        ttk.Checkbutton(top, text="y increases downward", variable=y_down).pack(side=tk.RIGHT)
+        ttk.Button(top, text="Fit", width=5, command=lambda: (state.update(zoom=None), redraw())).pack(side=tk.RIGHT, padx=8)
+        row2 = ttk.Frame(right)
+        row2.pack(fill=tk.X, pady=(4, 0))
+        ttk.Checkbutton(row2, text="Raw case-file coordinates (solid lines)", variable=raw_on).pack(side=tk.LEFT)
+        ttk.Checkbutton(row2, text="Positions found on the slide scan (dashed lines; the scan's pixel grid, as um)",
+                        variable=rec_on).pack(side=tk.LEFT, padx=16)
+        row3 = ttk.Frame(right)
+        row3.pack(fill=tk.X)
+        scene_on = tk.BooleanVar(tab, True)
+        ttk.Checkbutton(row3, text="Scenes of the scan (numbered rectangles; one slide at a time)",
+                        variable=scene_on).pack(side=tk.LEFT)
+        stage_on = tk.BooleanVar(tab, False)
+        ttk.Checkbutton(row3, text="Scenes at their stage positions (dashed rectangles, from the scan's metadata)",
+                        variable=stage_on).pack(side=tk.LEFT, padx=16)
+        row4 = ttk.Frame(right)
+        row4.pack(fill=tk.X)
+        xml_on = tk.BooleanVar(tab, False)
+        ttk.Checkbutton(row4, text="Outlines in reconstruction.xml (dash-dot lines; stack coordinates, where the sections pile up)",
+                        variable=xml_on).pack(side=tk.LEFT)
+        canvas = tk.Canvas(right, bg="white", highlightthickness=1, highlightbackground="gray70")
+        canvas.pack(fill=tk.BOTH, expand=True, pady=4)
+        readout = tk.StringVar(tab, "")
+        ttk.Label(right, textvariable=readout, foreground="gray30").pack(anchor="w")
+        palette = ("#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22")
+        state = {"items": [], "view": None, "zoom": None}
+
+        def chosen_sections():
+            sel = lb.curselection()
+            if not sel or sel[0] == 0:
+                return list(st.sections), True
+            return slides[names[sel[0]]], False
+
+        def raw(s):
+            return s.raw_points if s.raw_points is not None else s.case_points
+
+        def nice_step(span, target=8):
+            raw_step = span / target
+            mag = 10 ** np.floor(np.log10(raw_step))
+            for m in (1, 2, 5, 10):
+                if raw_step <= m * mag:
+                    return m * mag
+            return 10 * mag
+
+        DASH = (1, 2)   # the dashes of the dashed outlines (px on, px off): small, so that the line's detail shows
+        DASH_XML = (4, 2, 1, 2)   # dash-dot, for the outlines of reconstruction.xml
+
+        def in_xml(sec):
+            """The outline as reconstruction.xml has it (the stack's coordinates, um; y up from the canvas's top-left). A stack
+            without the XML (one exported by this tool) gets the same outline computed from the alignment it stores."""
+            if sec.xml_points is not None and len(sec.xml_points) >= 2:
+                return np.asarray(sec.xml_points, float)
+            if len(sec.saved_points) >= 2:
+                return (sec.R @ np.asarray(sec.saved_points, float).T).T + sec.t
+            return None
+
+        def reconstructed(sec):
+            """The outline where the search placed it on the slide scan, in the same units as the raw one (um): the scan's own
+            pixel grid times the pixel size. None if the section has no position on a scan."""
+            if sec.czi_origin is None or not len(sec.saved_points):
+                return None
+            pxs = st.source_pixel_um or st.pixel_um
+            P = np.asarray(sec.saved_points, float)
+            return np.column_stack([(P[:, 0] / st.pixel_um + sec.czi_origin[0]) * pxs, (-P[:, 1] / st.pixel_um + sec.czi_origin[1]) * pxs])
+
+        def redraw(_event=None):
+            canvas.delete("all")
+            secs, everything = chosen_sections()
+            sets = []     # (section, number in the slide, raw outline or None, reconstructed outline or None, xml outline or None)
+            for k, s in enumerate(secs, 1):
+                r = np.asarray(raw(s), float) if raw_on.get() and len(raw(s)) >= 2 else None
+                c = reconstructed(s) if rec_on.get() else None
+                x = in_xml(s) if xml_on.get() else None
+                if r is not None or c is not None or x is not None:
+                    sets.append((s, k, r, c, x))
+            state["items"] = []
+            if not sets:
+                canvas.create_text(20, 20, anchor="nw", text="Nothing to show (switch on one of the sets"
+                                   + ("; none of these sections has a position on a scan yet)." if rec_on.get() and not raw_on.get() and not xml_on.get() else ")."))
+                return
+            # the scenes of the scan (a slide is chosen): rectangles in the slide's own grid, in the color of the section they hold
+            scene_rects = []     # (scene number from 1, (x0, y0, x1, y1) in um, color, by stage position?)
+            sel = lb.curselection()
+            if (scene_on.get() or stage_on.get()) and sel and sel[0] > 0:
+                try:
+                    path = secs[0].source_path
+                    if path.lower().endswith(".czi"):
+                        pxs = st.source_pixel_um or st.pixel_um
+                        hosts = {}
+                        for k, s_ in enumerate(secs, 1):
+                            if s_.czi_origin is not None:
+                                hosts[ns.czi_scene_of(s_, st)] = k
+                        colors = lambda j: palette[(hosts[j] - 1) % len(palette)] if j in hosts else "#9a9a9a"
+                        if scene_on.get():
+                            for j, (bx, by, bw, bh) in enumerate(ns.czi_scenes(path)):
+                                scene_rects.append((j + 1, (bx * pxs, by * pxs, (bx + bw) * pxs, (by + bh) * pxs), colors(j), False))
+                        if stage_on.get():
+                            for j, (cx_, cy_, sw, sh) in enumerate(ns.czi_scene_stage(path)):
+                                scene_rects.append((j + 1, (cx_ - sw / 2, cy_ - sh / 2, cx_ + sw / 2, cy_ + sh / 2), colors(j), True))
+                except Exception:
+                    scene_rects = []
+            allp = np.vstack([p for _, _, r, c, x in sets for p in (r, c, x) if p is not None])
+            for _, (a0, b0, a1, b1), _c, _stage in scene_rects:
+                allp = np.vstack([allp, [[a0, b0], [a1, b1]]])
+            fx0, fy0, fx1, fy1 = allp[:, 0].min(), allp[:, 1].min(), allp[:, 0].max(), allp[:, 1].max()
+            if fx1 - fx0 < 1e-6: fx1 = fx0 + 1
+            if fy1 - fy0 < 1e-6: fy1 = fy0 + 1
+            pad = 0.03 * max(fx1 - fx0, fy1 - fy0)
+            x0, y0, x1, y1 = state["zoom"] or (fx0 - pad, fy0 - pad, fx1 + pad, fy1 + pad)
+            w, h = max(canvas.winfo_width(), 200), max(canvas.winfo_height(), 200)
+            ml, mr, mt, mb = 70, 20, 36, 40
+            scale = min((w - ml - mr) / (x1 - x0), (h - mt - mb) / (y1 - y0))
+            ox = ml + ((w - ml - mr) - (x1 - x0) * scale) / 2
+            oy = mt + ((h - mt - mb) - (y1 - y0) * scale) / 2
+
+            def to_canvas(x, y):
+                cy = oy + ((y - y0) * scale if y_down.get() else (y1 - y) * scale)
+                return ox + (x - x0) * scale, cy
+
+            state["view"] = (x0, y0, x1, y1, scale, ox, oy)
+            # axes: a grid with the numbers
+            sx, sy = nice_step(x1 - x0), nice_step(y1 - y0)
+            for gx in np.arange(np.ceil(x0 / sx) * sx, x1 + 1e-9, sx):
+                a_, _ = to_canvas(gx, y0)
+                if ml <= a_ <= w - mr:
+                    canvas.create_line(a_, mt, a_, h - mb, fill="#e6e6e6")
+                    canvas.create_text(a_, h - mb + 12, text=f"{gx:g}", fill="gray30", font=("Segoe UI", 8))
+            for gy in np.arange(np.ceil(y0 / sy) * sy, y1 + 1e-9, sy):
+                _, b_ = to_canvas(x0, gy)
+                if mt <= b_ <= h - mb:
+                    canvas.create_line(ml, b_, w - mr, b_, fill="#e6e6e6")
+                    canvas.create_text(ml - 6, b_, anchor="e", text=f"{gy:g}", fill="gray30", font=("Segoe UI", 8))
+            canvas.create_text(w - mr, h - 8, anchor="e", text="X (um)", fill="gray30", font=("Segoe UI", 8))
+            canvas.create_text(ml - 6, 8, anchor="ne", text="Y (um)", fill="gray30", font=("Segoe UI", 8))
+            for num, (a0, b0, a1, b1), color, by_stage in scene_rects:
+                p0, p1 = to_canvas(a0, b0), to_canvas(a1, b1)
+                lx, rx_, ty, by_ = min(p0[0], p1[0]), max(p0[0], p1[0]), min(p0[1], p1[1]), max(p0[1], p1[1])
+                if by_stage:     # (dashed, labelled at the bottom right, so that it does not run into the pixel box's label)
+                    canvas.create_rectangle(p0[0], p0[1], p1[0], p1[1], outline=color, width=1, dash=(5, 3))
+                    canvas.create_text(rx_ - 5, by_ - 3, anchor="se", text=f"scene {num} (stage)", fill=color, font=("Segoe UI", 9, "italic"))
+                else:
+                    canvas.create_rectangle(p0[0], p0[1], p1[0], p1[1], outline=color, width=1)
+                    canvas.create_text(lx + 5, ty + 3, anchor="nw", text=f"scene {num}", fill=color, font=("Segoe UI", 9, "italic"))
+            # the outlines, numbered 1, 2, ... in the order of the stack (for All sections: the stack's own numbers); the raw ones
+            # are solid, the positions found by the search dashed (finely, so that the detail of the line shows), same color
+            for s, k, r, c, x in sets:
+                color = palette[(k - 1) % len(palette)]
+                label = str(s.index + 1) if everything else str(k)
+                for p, dash, size, kind in ((r, None, 13, "raw"), (c, DASH, 11, "found on the scan"), (x, DASH_XML, 10, "reconstruction.xml")):
+                    if p is None:
+                        continue
+                    pts = [v for xy in p for v in to_canvas(*xy)]
+                    kw = {"dash": dash} if dash else {}
+                    canvas.create_polygon(*pts, outline=color, fill="", width=2 if dash is None else 1, **kw)
+                    cx, cy = self.polygon_centroid(p)
+                    canvas.create_text(*to_canvas(cx, cy), text=label, fill=color, font=("Segoe UI", size, "bold"))
+                    state["items"].append((s, k, p, kind))
+
+        def motion(event):
+            v = state["view"]
+            if not v:
+                return
+            x0, y0, x1, y1, scale, ox, oy = v
+            x = x0 + (event.x - ox) / scale
+            y = (y0 + (event.y - oy) / scale) if y_down.get() else (y1 - (event.y - oy) / scale)
+            hit = ""
+            for s, k, p, kind in state["items"]:
+                if cv2.pointPolygonTest(p.astype(np.float32).reshape(-1, 1, 2), (float(x), float(y)), False) >= 0:
+                    hit = f"   | inside the {kind} outline of section {s.index + 1} of the stack"
+                    break
+            readout.set(f"X = {x:.1f} um, Y = {y:.1f} um{hit}")
+
+        def zoom(event):
+            v = state["view"]
+            if not v:
+                return
+            x0, y0, x1, y1, scale, ox, oy = v
+            f = 1 / 1.25 if (event.delta > 0 or getattr(event, "num", 0) == 4) else 1.25
+            cx = x0 + (event.x - ox) / scale
+            cy = (y0 + (event.y - oy) / scale) if y_down.get() else (y1 - (event.y - oy) / scale)
+            state["zoom"] = (cx - (cx - x0) * f, cy - (cy - y0) * f, cx + (x1 - cx) * f, cy + (y1 - cy) * f)
+            redraw()
+
+        drag = {}
+
+        def press(event):
+            drag["at"] = (event.x, event.y, state["view"])
+
+        def move(event):
+            if "at" not in drag or not drag["at"][2]:
+                return
+            sx_, sy_, v = drag["at"]
+            x0, y0, x1, y1, scale, ox, oy = v
+            dx = (event.x - sx_) / scale
+            dy = (event.y - sy_) / scale * (1 if y_down.get() else -1)
+            state["zoom"] = (x0 - dx, y0 - dy, x1 - dx, y1 - dy)
+            redraw()
+
+        lb.bind("<<ListboxSelect>>", lambda e: (state.update(zoom=None), redraw()))
+        canvas.bind("<Configure>", redraw)
+        canvas.bind("<Motion>", motion)
+        canvas.bind("<MouseWheel>", zoom)
+        canvas.bind("<ButtonPress-1>", press)
+        canvas.bind("<B1-Motion>", move)
+        canvas.bind("<Double-Button-1>", lambda e: (state.update(zoom=None), redraw()))
+        for var in (y_down, raw_on, rec_on, scene_on, stage_on, xml_on):
+            var.trace_add("write", lambda *_: redraw())
+        lb.selection_set(1 if len(names) > 1 else 0)
+        tab.redraw = redraw
+        return tab
+
+    def analyze_project(self):
+        """A window with a table of every section (its slide, position and the coordinates of its outline's centroid)."""
+        if not self.stack:
+            messagebox.showinfo("Analyze project", "Open a reconstruction first.", parent=self.root)
+            return
+        st = self.stack
+        rows = self.analysis_rows()
+        win = tk.Toplevel(self.root)
+        win.title(f"Project analysis - {os.path.basename(st.jpx_path)}")
+        want = round(sum(c[1] for c in self.ANALYSIS_COLUMNS) * self.root.winfo_fpixels("1i") / 96) + 70   # (wide enough for every column)
+        win.geometry(f"{min(want, win.winfo_screenwidth() - 80)}x{min(700, win.winfo_screenheight() - 120)}+30+30")
+        slides = {}
+        for r in rows:
+            slides[r[1]] = slides.get(r[1], 0) + 1
+        located = sum(1 for r in rows if r[3] in ("located on the scan", "origin shared with its scan"))
+        czi_n = sum(1 for r in rows if r[3].startswith(("located", "origin", "not located")))
+        summary = (f"{len(rows)} sections | canvas {st.canvas_w} x {st.canvas_h} px at {st.pixel_um:g} um | "
+                   f"{len(slides)} slide(s) / source file(s)" + (f" | {located} of {czi_n} slide-scan sections located on their scans"
+                                                                if czi_n else ""))
+        notebook = ttk.Notebook(win)
+        notebook.pack(fill=tk.BOTH, expand=True)
+        tab1 = ttk.Frame(notebook)
+        notebook.add(tab1, text="Sections")
+        notebook.add(self.build_outline_tab(notebook), text="Outlines by slide (raw coordinates)")
+        ttk.Label(tab1, text=summary, padding=(8, 6)).pack(anchor="w")
+        frame = ttk.Frame(tab1)
+        frame.pack(fill=tk.BOTH, expand=True, padx=8)
+        cols = [c[0] for c in self.ANALYSIS_COLUMNS]
+        scale = self.root.winfo_fpixels("1i") / 96
+        ttk.Style(win).configure("Analysis.Treeview", rowheight=round(22 * scale))
+        tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="extended", style="Analysis.Treeview")
+        yscroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
+        xscroll = ttk.Scrollbar(frame, orient=tk.HORIZONTAL, command=tree.xview)
+        tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        tree.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        state = {"col": None, "reverse": False}
+
+        def sort_by(col):
+            idx = cols.index(col)
+
+            def key(item):
+                v = tree.set(item, col)
+                try:
+                    return (0, float(v.split(",")[0]), v)
+                except ValueError:
+                    return (1, 0.0, v)
+            items = list(tree.get_children(""))
+            state["reverse"] = (not state["reverse"]) if state["col"] == col else False
+            state["col"] = col
+            for i, item in enumerate(sorted(items, key=key, reverse=state["reverse"])):
+                tree.move(item, "", i)
+
+        for name, width, anchor in self.ANALYSIS_COLUMNS:
+            tree.heading(name, text=name, command=lambda n=name: sort_by(n))
+            tree.column(name, width=round(width * scale), anchor=anchor, stretch=False)
+        for r in rows:
+            tree.insert("", tk.END, values=r)
+
+        def as_text(sep):
+            lines = [sep.join(cols)] + [sep.join(str(v) for v in r) for r in rows]
+            return "\n".join(lines) + "\n"
+
+        def copy_all():
+            win.clipboard_clear()
+            win.clipboard_append(as_text("\t"))
+
+        def save_csv():
+            import csv
+            path = filedialog.asksaveasfilename(parent=win, title="Save the table", defaultextension=".csv",
+                                                initialfile="project_analysis.csv", filetypes=[("CSV files", "*.csv")])
+            if path:
+                with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                    w = csv.writer(f)
+                    w.writerow(cols)
+                    w.writerows(rows)
+
+        bar = ttk.Frame(tab1, padding=8)
+        bar.pack(fill=tk.X)
+        ttk.Button(bar, text="Copy table", command=copy_all).pack(side=tk.LEFT)
+        ttk.Button(bar, text="Save as CSV...", command=save_csv).pack(side=tk.LEFT, padx=6)
+        ttk.Label(bar, foreground="gray30",
+                  text="Click a column heading to sort. The stack's coordinates are measured from the top-left of the canvas (y up in um, "
+                       "down in px); \"on the slide\" is in the slide scan's pixels.").pack(side=tk.LEFT, padx=12)
+        ttk.Button(bar, text="Close", command=win.destroy).pack(side=tk.RIGHT)
+        win.analysis_tree = tree   # (for tests)
+
     def quit(self):
         if self.busy:
             if not messagebox.askyesno("Export in progress", "An export is running. Cancel it and quit?",
@@ -2040,6 +2534,13 @@ class Aligner:
         elif not self.confirm_discard():
             return
         self.root.destroy()
+        if not self._busy:
+            # Nothing is left to protect (settings are saved as they change, and cache files are written under a temporary name
+            # and then renamed), but background loading may still be mid-task: leave at once instead of waiting for it, so that
+            # the console closes with the window. (After an export was cancelled, the normal exit lets it clean up.)
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
 
     def run(self):
         self.root.mainloop()
