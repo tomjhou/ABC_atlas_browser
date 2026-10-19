@@ -1,4 +1,4 @@
-"""Step 1 of the workflow: find the sections on Zeiss .czi slide scans.
+"""Step 1 of the workflow: find the sections on Zeiss .czi slide scans (several sections each) and .jp2 section images (one each).
 
 Three stages in one window, shown by a strip along the top:
   1. Load slides      - choose the .czi files (or open a saved project);
@@ -13,7 +13,7 @@ import queue
 import sys
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import cv2
 import numpy as np
@@ -136,7 +136,7 @@ class SectionLoader:
         self.frames[n].pack(fill=tk.BOTH, expand=True)
         self.btn_back.config(state="normal" if n else "disabled")
         self.btn_next.config(text="Done: open in the alignment tool" if n == 2 else "Next")
-        self.var_help.set(("Choose the slide scans (.czi) that hold your sections.",
+        self.var_help.set(("Choose the slide scans (.czi) and section images (.jp2) that hold your sections.",
                            "Set the threshold so that each section is tinted and debris is not, then accept the outlines.",
                            "Drag the pictures into the order of the sections along the brain.")[n])
         if n == 1:
@@ -155,7 +155,12 @@ class SectionLoader:
             return
         if self.stage == 0:
             if not self.project.slides:
-                messagebox.showinfo("No slides", "Add at least one .czi slide scan first.", parent=self.root)
+                messagebox.showinfo("No slides", "Add at least one .czi slide scan or .jp2 section image first.", parent=self.root)
+                return
+            unknown = [os.path.basename(s.path) for s in self.project.slides if s.path in self.infos and not self.slide_px(s)]
+            if unknown:
+                messagebox.showinfo("Pixel size needed", "These files don't say what their pixel size is. Select them and use "
+                                    "\"Set pixel size...\":\n\n" + "\n".join(unknown[:8]), parent=self.root)
                 return
             self.show_stage(1)
         elif self.stage == 1:
@@ -178,8 +183,9 @@ class SectionLoader:
 
     def build_load(self):
         f = ttk.Frame(self.body, padding=20)
-        ttk.Label(f, text="Slide scans (.czi)", font=("Segoe UI", 12, "bold")).pack(anchor="w")
-        ttk.Label(f, text="Add every scan whose sections you want to align. They are taken in the order listed.",
+        ttk.Label(f, text="Slide scans (.czi) and section images (.jp2)", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        ttk.Label(f, text="Add every file whose sections you want to align: a slide scan holds several, a .jp2 holds one. "
+                          "They are taken in the order listed.",
                   foreground="gray30").pack(anchor="w", pady=(0, 8))
         mid = ttk.Frame(f)
         mid.pack(fill=tk.BOTH, expand=True)
@@ -198,6 +204,7 @@ class SectionLoader:
         ttk.Button(side, text="Remove", command=self.remove_slides).pack(fill=tk.X, pady=6)
         ttk.Button(side, text="Move up", command=lambda: self.move_slide(-1)).pack(fill=tk.X)
         ttk.Button(side, text="Move down", command=lambda: self.move_slide(1)).pack(fill=tk.X, pady=6)
+        ttk.Button(side, text="Set pixel size...", command=self.set_pixel_size).pack(fill=tk.X)
         ttk.Separator(side).pack(fill=tk.X, pady=10)
         ttk.Button(side, text="Open a saved project...", command=self.open_project).pack(fill=tk.X)
         return f
@@ -206,9 +213,10 @@ class SectionLoader:
         self.slide_tree.delete(*self.slide_tree.get_children())
         for i, s in enumerate(self.project.slides):
             info = self.infos.get(s.path)
+            px = self.slide_px(s)
             self.slide_tree.insert("", tk.END, iid=str(i), values=(
                 s.path, info.scenes if info else "...", human_gb(info.size_bytes) if info else "",
-                f"{info.pixel_um:g}" if info else ""))
+                (f"{px:g}" if px else "unknown") if info else ""))
 
     def read_infos(self):
         todo = [s.path for s in self.project.slides if s.path not in self.infos]
@@ -231,8 +239,29 @@ class SectionLoader:
 
         self.background(work, done)
 
+    def slide_px(self, slide):
+        """The pixel size (um) of a slide: the one set by the user, else the file's (0 if it doesn't say)."""
+        info = self.infos.get(slide.path)
+        return slide.pixel_um or (info.pixel_um if info else 0.0)
+
+    def set_pixel_size(self):
+        """Give the pixel size of the selected files (a .jp2 may not say; the sections of a stack must all have the same)."""
+        sel = [int(i) for i in self.slide_tree.selection()]
+        if not sel:
+            messagebox.showinfo("Pixel size", "Select the files first.", parent=self.root)
+            return
+        cur = self.slide_px(self.project.slides[sel[0]])
+        value = simpledialog.askfloat("Pixel size", "Pixel size of the selected file(s), in um per pixel:", parent=self.root,
+                                      initialvalue=cur or 0.65, minvalue=0.001, maxvalue=1000)
+        if value:
+            for i in sel:
+                self.project.slides[i].pixel_um = float(value)
+            self.refresh_slide_list()
+
     def add_slides(self):
-        paths = filedialog.askopenfilenames(parent=self.root, title="Slide scans", filetypes=[("Zeiss .czi", "*.czi"), ("All files", "*.*")])
+        paths = filedialog.askopenfilenames(parent=self.root, title="Slide scans and section images", filetypes=[
+            ("Slide scans and section images", "*.czi *.jp2 *.j2k *.j2c"), ("Zeiss .czi", "*.czi"), ("JPEG 2000", "*.jp2 *.j2k *.j2c"),
+            ("All files", "*.*")])
         known = {s.path for s in self.project.slides}
         for p in paths:
             p = os.path.normpath(p)
@@ -309,8 +338,8 @@ class SectionLoader:
         self.btn_fwd = ttk.Button(nav, text="▶", width=3, command=lambda: self.goto_slide(self.cur + 1))
         self.btn_fwd.pack(side=tk.LEFT)
         ttk.Button(nav, text="Fit", width=5, command=self.fit_view).pack(side=tk.RIGHT)
-        self.var_color = tk.BooleanVar(f, True)
-        ttk.Checkbutton(nav, text="Show in color", variable=self.var_color, command=self.on_color).pack(side=tk.RIGHT, padx=14)
+        self.var_color = tk.BooleanVar(f, False)
+        ttk.Checkbutton(nav, text="Show sections in color", variable=self.var_color, command=self.on_color).pack(side=tk.RIGHT, padx=14)
         ttk.Label(nav, text="Wheel: zoom   Right button: pan", foreground="gray40").pack(side=tk.RIGHT, padx=10)
         self.canvas = tk.Canvas(left, bg="#202020", highlightthickness=0, cursor="arrow")
         self.canvas.pack(fill=tk.BOTH, expand=True)
@@ -485,9 +514,8 @@ class SectionLoader:
 
     def px_mm2(self):
         """Area of an overview pixel in mm^2 for the current slide."""
-        info = self.infos.get(self.slide().path)
         k = self.ov[self.slide().path][1][2]
-        side = k * (info.pixel_um if info else 0.65) / 1000
+        side = k * (self.slide_px(self.slide()) or 0.65) / 1000
         return side * side
 
     def min_area_mm2(self):
@@ -497,7 +525,7 @@ class SectionLoader:
         s = self.slide()
         self.var_thr_text.set(f"Brightness threshold: {s.threshold}")
         self.var_min_text.set(f"Ignore regions smaller than {self.min_area_mm2():.2f} mm²")
-        um = s.smooth * self.ov[s.path][1][2] * (self.infos[s.path].pixel_um if s.path in self.infos else 0.65)
+        um = s.smooth * self.ov[s.path][1][2] * (self.slide_px(s) or 0.65)
         self.var_smooth_text.set("Smoothing: none" if not s.smooth else f"Smoothing: {s.smooth} px ({um:.0f} µm), outward")
 
     def on_threshold(self, v):
@@ -553,7 +581,7 @@ class SectionLoader:
 
     def sorted_polys(self, polys):
         """The outlines in the order of the scenes of the current slide's .czi (see sp.sort_by_scene)."""
-        boxes = ns.czi_scenes(self.slide().path)
+        boxes = sp.scene_boxes(self.slide().path)
         return sp.sort_by_scene(polys, boxes, self.to_slide)[0]
 
     def back_to_threshold(self):
@@ -695,7 +723,7 @@ class SectionLoader:
         self.photo = ImageTk.PhotoImage(Image.fromarray(out))
         c.create_image(0, 0, image=self.photo, anchor="nw")
         if self.mode != "threshold":
-            boxes = ns.czi_scenes(self.slide().path)
+            boxes = sp.scene_boxes(self.slide().path)
             for i, p in enumerate(self.polys.get(self.cur, [])):
                 pts = self.to_canvas(p)
                 sel = i in self.selected
@@ -782,6 +810,9 @@ class SectionLoader:
         self.var_order_text = tk.StringVar(f, "")
         ttk.Label(top, textvariable=self.var_order_text, foreground="gray30").pack(side=tk.LEFT)
         ttk.Button(top, text="Reverse order", command=self.reverse_order).pack(side=tk.RIGHT)
+        self.var_spacing = tk.StringVar(f, "")
+        ttk.Entry(top, textvariable=self.var_spacing, width=7).pack(side=tk.RIGHT, padx=(4, 18))
+        ttk.Label(top, text="Distance between adjacent sections (\u00b5m):").pack(side=tk.RIGHT)
         ttk.Button(top, text="Slide by slide", command=self.reset_order).pack(side=tk.RIGHT, padx=8)
         wrap = ttk.Frame(f)
         wrap.pack(fill=tk.BOTH, expand=True)
@@ -806,6 +837,7 @@ class SectionLoader:
             self.order = proj.default_order()
             self.order_key = key
         self.thumbs = {}
+        self.var_spacing.set(f"{proj.z_spacing_um:g}" if proj.z_spacing_um > 0 else "")
         self.make_thumbs()
         self.draw_order()
 
@@ -948,6 +980,15 @@ class SectionLoader:
 
     def finish(self):
         proj = self.project
+        try:
+            spacing = float(self.var_spacing.get())
+        except ValueError:
+            spacing = 0.0
+        if spacing <= 0:
+            messagebox.showinfo("Distance between sections", "Enter the distance between adjacent sections, in \u00b5m (the same number "
+                                "NeuroInfo asks for when it makes a reconstruction).", parent=self.root)
+            return
+        proj.z_spacing_um = spacing
         proj.order = list(self.order)
         self.order_key = proj.polygons_key()
         try:
@@ -971,7 +1012,7 @@ class SectionLoader:
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    loader = SectionLoader(slides=[os.path.normpath(a) for a in argv if a.lower().endswith(".czi")])
+    loader = SectionLoader(slides=[os.path.normpath(a) for a in argv if a.lower().endswith((".czi",) + sp.JP2_SUFFIXES)])
     return loader.run()
 
 

@@ -283,6 +283,7 @@ class Aligner:
         self.var_dx = tk.StringVar(self.root, "0")
         self.var_dy = tk.StringVar(self.root, "0")
         self.var_quality = tk.StringVar(self.root, f"{ns.DEFAULT_QUALITY_DB:g}")
+        self.var_spacing = tk.StringVar(self.root, "")        # distance between adjacent sections (um), written into the JPX
         self.var_rerender = tk.BooleanVar(self.root, True)   # every image is written again, so each JPX file has all of its images
         self.var_background = tk.BooleanVar(self.root, bool(load_settings().get("background_loading", True)))
         self.var_advanced = tk.BooleanVar(self.root, bool(load_settings().get("advanced_mode", False)))
@@ -495,7 +496,9 @@ class Aligner:
         self.export_advanced[0].grid(row=0, column=0, sticky="e")
         self.export_advanced[1].grid(row=0, column=1, sticky="w", padx=4)
         self.export_advanced[2].grid(row=1, column=0, columnspan=2, sticky="w")
-        ttk.Button(f, text="Export JPX...", command=self.export_dialog).grid(row=2, column=0, columnspan=2,
+        ttk.Label(f, text="Distance between sections (\u00b5m)").grid(row=2, column=0, sticky="e", pady=(4, 0))
+        ttk.Entry(f, textvariable=self.var_spacing, width=6).grid(row=2, column=1, sticky="w", padx=4, pady=(4, 0))
+        ttk.Button(f, text="Export JPX...", command=self.export_dialog).grid(row=3, column=0, columnspan=2,
                                                                               pady=(6, 0), sticky="ew")
 
         self.apply_advanced_mode()   # (all the widgets it shows or hides exist now)
@@ -885,6 +888,7 @@ class Aligner:
         self.levels = [[0.0, 65535.0] for _ in range(stack.channels)]
         self.levels_set = False
         self.build_channel_controls()
+        self.var_spacing.set(f"{stack.z_spacing_um:g}" if stack.z_spacing_um > 0 else "")
         if stack.jpx_path:
             self.root.title(f"JPX aligner - {os.path.basename(path or stack.jpx_path)}")
         else:
@@ -2085,6 +2089,16 @@ class Aligner:
         except ValueError:
             messagebox.showerror("Quality", "Quality must be a number of dB, e.g. 60.", parent=self.root)
             return
+        try:
+            spacing = float(self.var_spacing.get())
+        except ValueError:
+            spacing = 0.0
+        if spacing <= 0 and not st.z_spacing_um:
+            messagebox.showerror("Distance between sections", "Enter the distance between adjacent sections, in \u00b5m (as NeuroInfo asks "
+                                 "for when it makes a reconstruction).", parent=self.root)
+            return
+        if spacing > 0:
+            st.z_spacing_um = spacing
         rerender_all = self.var_rerender.get() or not st.jpx_path   # (a stack made from slide scans has no frames to copy)
         todo = [s for s in st.sections if s.renderable and (rerender_all or s.dirty)]   # (others: frames copied as they are)
         if not st.changed:   # (also when "re-render unchanged sections too" would still write every image)

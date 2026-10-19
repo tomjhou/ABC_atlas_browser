@@ -340,6 +340,7 @@ class Stack:
     pixel_corrected: bool = False    # pixel_um was changed here: the next export writes it into the JPX's own metadata
     deleted: int = 0                 # how many sections were deleted since opening
     case_file: str = ""              # the NeuroInfo case file (.h5) the alignment was recovered from, when it was
+    z_spacing_um: float = 0.0        # distance between adjacent sections (um): NeuroInfo's xmp:SizeZ in the JPX; 0 if not known
     unsaved: bool = False            # made in memory from slide scans (no JPX behind it yet): everything is still to be exported
 
     def apply_pixel_size(self, new_um):
@@ -466,6 +467,19 @@ def read_xmp_channels(jpx_path):
     return [ChannelInfo(names[i] if i < len(names) else f"channel {i}",
                         colors[i] if i < len(colors) else (255, 255, 255))
             for i in range(n)]
+
+
+def read_xmp_spacing(jpx_path):
+    """The distance between adjacent sections (um) NeuroInfo recorded in the JPX's XMP (xmp:SizeZ of its images); 0 if there is none.
+    (reconstruction.xml has it too, as the step in the z of the outlines' points, but NeuroInfo reads only the JPX.)"""
+    with open(jpx_path, "rb") as f:
+        for b in read_boxes(jpx_path):
+            if b.kind == b"uuid":
+                data = read_payload(f, b)
+                if data[:16] == XMP_UUID:
+                    m = re.search(r'xmp:SizeZ="([0-9.eE+-]+)"', data[16:].decode("utf-8", "replace"))
+                    return max(float(m.group(1)), 0.0) if m else 0.0
+    return 0.0
 
 
 def find_aligner_json(jpx_path):
@@ -640,6 +654,7 @@ def open_stack(path, locate=None):
     doc = find_aligner_json(path)
     stack = _load_aligner(path, doc) if doc else _load_neuroinfo(path, locate)
     # The XMP repeats channel names once per image; the first `channels` apply
+    stack.z_spacing_um = read_xmp_spacing(path)
     info = read_xmp_channels(path)[:stack.channels]
     stack.channel_info = info + [ChannelInfo(f"channel {i}", (255, 255, 255))
                                  for i in range(len(info), stack.channels)]
@@ -676,7 +691,7 @@ def stack_json(stack, out_path):
     return {
         "format": JSON_FORMAT, "version": 2 if needs_v2 else 1,
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
-        "origin": stack.origin, "pixel_um": stack.pixel_um,
+        "origin": stack.origin, "pixel_um": stack.pixel_um, "z_spacing_um": stack.z_spacing_um,
         "source_pixel_um": stack.source_pixel_um,
         "canvas": [stack.canvas_w, stack.canvas_h], "channels": stack.channels,
         "sections": secs,
@@ -1597,7 +1612,15 @@ def patch_xmp_pixel_size(payload, pixel_um):
     return payload[:16] + text.encode("utf-8")
 
 
-def write_jpx_like(template_path, codestreams, out_path, extra_payloads=(), pixel_um=None):
+def patch_xmp_spacing(payload, spacing_um):
+    """The MBF XMP with its images' SizeZ (the distance between adjacent sections) set to `spacing_um`."""
+    text = payload[16:].decode("utf-8", "replace")
+    value = f"{spacing_um:.6f}"
+    text = re.sub(r'(\sxmp:SizeZ=")[^"]*(")', lambda m: m.group(1) + value + m.group(2), text)
+    return payload[:16] + text.encode("utf-8")
+
+
+def write_jpx_like(template_path, codestreams, out_path, extra_payloads=(), pixel_um=None, z_spacing_um=None):
     """Copy template_path's boxes verbatim, replacing its jp2c codestreams in
     order with `codestreams` (bytes, or callables returning bytes), dropping
     any old aligner box and appending `extra_payloads` as uuid boxes. With fewer
@@ -1621,8 +1644,13 @@ def write_jpx_like(template_path, codestreams, out_path, extra_payloads=(), pixe
                     continue
                 if b.kind == b"uuid" and read_payload(src, b, 16) == ALIGNER_UUID:
                     continue
-                if pixel_um is not None and b.kind == b"uuid" and read_payload(src, b, 16) == XMP_UUID:
-                    dst.write(box_bytes(b"uuid", patch_xmp_pixel_size(read_payload(src, b), pixel_um)))   # corrected pixel size
+                if (pixel_um is not None or z_spacing_um) and b.kind == b"uuid" and read_payload(src, b, 16) == XMP_UUID:
+                    xmp = read_payload(src, b)
+                    if pixel_um is not None:
+                        xmp = patch_xmp_pixel_size(xmp, pixel_um)              # corrected pixel size
+                    if z_spacing_um:
+                        xmp = patch_xmp_spacing(xmp, z_spacing_um)             # the distance between sections
+                    dst.write(box_bytes(b"uuid", xmp))
                     continue
                 src.seek(b.offset)
                 dst.write(src.read(b.length))
@@ -1641,7 +1669,7 @@ def write_jpx_like(template_path, codestreams, out_path, extra_payloads=(), pixe
 JPX_PREAMBLE = bytes.fromhex("0000000c6a5020200d0a870a0000001c667479706a707820000000006a7078206a7032206a707862000000457272657103ffc000003ff0000a0005800000002d40000000022000000012100000001308000000010400000008020000000c010000001f00800000140040000000")
 
 
-def make_xmp(n_frames, channel_info, pixel_um):
+def make_xmp(n_frames, channel_info, pixel_um, z_spacing_um=240.0):
     """The XMP packet NeuroInfo keeps in its JPX files: the channels' colors, and for every frame its pixel size and channels."""
     def rgb(c):
         return f'xmp:Red="{c[0]}" xmp:Green="{c[1]}" xmp:Blue="{c[2]}"'
@@ -1659,7 +1687,7 @@ def make_xmp(n_frames, channel_info, pixel_um):
     t.append(' </rdf:Bag> </xmp:ColorMaps> <xmp:Images> <rdf:Bag>')
     for f in range(n_frames):
         t.append(f' <rdf:li> <rdf:Description xmp:Image="{f}" xmp:Rotation="0.000000" xmp:TranslationX="0.000000" '
-                 f'xmp:TranslationY="0.000000" xmp:PixelWidth="{px}" xmp:PixelHeight="{px}" xmp:SizeZ="240.000000" '
+                 f'xmp:TranslationY="0.000000" xmp:PixelWidth="{px}" xmp:PixelHeight="{px}" xmp:SizeZ="{z_spacing_um:.6f}" '
                  'xmp:OrigPixelWidth="-1.000000" xmp:OrigPixelHeight="-1.000000" xmp:OrigSizeZ="-1.000000" xmp:OriginX="0.000000" '
                  'xmp:OriginY="0.000000" xmp:OriginZ="0.000000" xmp:CombinationMethod="0"> <xmp:Channels> <rdf:Bag>')
         for i, ch in enumerate(channel_info):
@@ -1673,7 +1701,7 @@ def make_xmp(n_frames, channel_info, pixel_um):
     return "".join(t).encode("utf-8")
 
 
-def write_jpx_new(codestreams, out_path, canvas_w, canvas_h, channel_info, pixel_um, extra_payloads=()):
+def write_jpx_new(codestreams, out_path, canvas_w, canvas_h, channel_info, pixel_um, extra_payloads=(), z_spacing_um=240.0):
     """A multi-frame JPX of the codestreams (bytes, or callables returning bytes), laid out like NeuroInfo's, written from
     scratch (write_jpx_like needs an existing JPX to copy from)."""
     n = len(codestreams)
@@ -1690,7 +1718,7 @@ def write_jpx_new(codestreams, out_path, canvas_w, canvas_h, channel_info, pixel
                 dst.write(box_bytes(b"jpch", b""))
                 dst.write(box_bytes(b"jplh", b""))
                 if i == 0:
-                    dst.write(box_bytes(b"uuid", XMP_UUID + make_xmp(n, channel_info, pixel_um)))
+                    dst.write(box_bytes(b"uuid", XMP_UUID + make_xmp(n, channel_info, pixel_um, z_spacing_um)))
                 dst.write(box_bytes(b"jp2c", cs() if callable(cs) else cs))
             for payload in extra_payloads:
                 dst.write(box_bytes(b"uuid", payload))
@@ -1776,10 +1804,11 @@ def export_stack(stack, out_path, quality_db=DEFAULT_QUALITY_DB, rerender_all=Fa
     doc = stack_json(stack, out_path)
     extra = [ALIGNER_UUID + json.dumps(doc, separators=(",", ":")).encode("utf-8")]
     if fresh:
-        write_jpx_new(codestreams, out_path, stack.canvas_w, stack.canvas_h, stack.channel_info, stack.pixel_um, extra_payloads=extra)
+        write_jpx_new(codestreams, out_path, stack.canvas_w, stack.canvas_h, stack.channel_info, stack.pixel_um, extra_payloads=extra,
+                      z_spacing_um=stack.z_spacing_um or 240.0)
     else:
         write_jpx_like(stack.jpx_path, codestreams, out_path, extra_payloads=extra,
-                       pixel_um=stack.pixel_um if stack.pixel_corrected else None)
+                       pixel_um=stack.pixel_um if stack.pixel_corrected else None, z_spacing_um=stack.z_spacing_um or None)
     elapsed = time.time() - t_export
     log(f"Wrote {out_path} ({os.path.getsize(out_path) / 1e6:.0f} MB; {n_render} re-rendered, "
         f"{len(stack.sections) - n_render} copied)")
