@@ -57,6 +57,16 @@ def _save_recent_projects(paths):
         pass            # (the list is only a convenience)
 
 
+def count_sections(path):
+    """How many sections (outlines) a project file holds, or None if it can't be read."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+        return sum(len(s.get("polygons") or []) for s in doc["slides"])
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
 def add_recent_project(path):
     """Put a project file first in the recent list (once, whatever the letter case)."""
     key = os.path.normcase(os.path.abspath(path))
@@ -401,6 +411,15 @@ def merge_group(polys):
     return merged
 
 
+def scene_groups(polys, boxes):
+    """The scenes that hold more than one of the outlines: [(scene index, [positions in `polys`]), ...] in scene order."""
+    by_scene = {}
+    for i, q in enumerate(polys):
+        c = polygon_centroid(q)
+        by_scene.setdefault(scene_of(boxes, c[0], c[1]), []).append(i)
+    return [(scene, idx) for scene, idx in sorted(by_scene.items()) if len(idx) > 1]
+
+
 def merge_within_scenes(polys, boxes, mode="scene"):
     """The outlines (in slide pixels) with all those in one scene merged into one: (the new list in scene order, the number of scenes
     where that was done)."""
@@ -473,7 +492,7 @@ class Project:
     alignment: dict = None                         # the aligner's state (stack_json): its edits, outline changes, order, canvas
     alignment_key: str = ""                        # fingerprint() of the outlines and order that alignment was made from
     shared: dict = None                            # the settings every image shares ("same settings for all images"), or None
-    numbering: str = "scene"                       # how outlines are numbered: NUMBERINGS
+    numbering: str = "rows"                        # how outlines are numbered: NUMBERINGS (new projects: across, then down)
 
     def polygons_key(self):
         """Something that changes when any slide's outlines do (the order is kept while this is the same)."""
@@ -536,6 +555,7 @@ class Project:
         proj = Project(slides, [tuple(o) for o in doc.get("order", [])], os.path.abspath(path), float(doc.get("z_spacing_um", 0.0)),
                        doc.get("alignment"), doc.get("alignment_key", ""))
         proj.shared = doc.get("shared")
+        # (a project saved before the choice existed was numbered by scene)
         proj.numbering = doc.get("numbering", "scene") if doc.get("numbering") in NUMBERINGS else "scene"
         return proj
 

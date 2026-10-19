@@ -337,7 +337,7 @@ class SectionLoader:
         ttk.Separator(side).pack(fill=tk.X, pady=10)
         ttk.Button(side, text="Open a saved project...", command=self.open_project).pack(fill=tk.X)
         ttk.Button(side, text="Open recent projects...", command=self.open_recent_project).pack(fill=tk.X, pady=(6, 0))
-        ttk.Button(side, text="Clear project", command=self.clear_project).pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(side, text="Close project", command=self.close_project).pack(fill=tk.X, pady=(6, 0))
         return f
 
     def refresh_slide_list(self):
@@ -431,23 +431,23 @@ class SectionLoader:
         except OSError as e:
             self.var_status.set(f"Couldn't save the project: {e}")
 
-    def clear_project(self):
-        """Remove every image and start over: the project is new again, and gets its file (in the folder of the next image added) when
-        the first tab is left. The project file already saved, if any, is not touched."""
+    def close_project(self):
+        """Close the project and reset the interface: the list of images is emptied and the next image added starts a new project, whose
+        file (in the folder of that image) is made when the first tab is left. The project file already saved, if any, is not touched."""
         if not self.project.slides:
             return
         saved = f"\n\nThe project file {os.path.basename(self.project.path)} is kept as it is." if self.project.path else ""
-        if not messagebox.askyesno("Clear project", f"Remove all {len(self.project.slides)} image(s) from this project and start a new one?{saved}",
-                                   parent=self.root):
+        if not messagebox.askyesno("Close project", f"Close project and reset interface?{saved}", parent=self.root):
             return
         self.sync_project(save=False)
         self.reset_project()
         self.refresh_slide_list()
-        self.var_status.set("Cleared: add images to start a new project.")
+        self.var_status.set("Project closed: add images to start a new one.")
 
     def reset_project(self):
         """Back to a new, empty project (when every image has been removed): the next image added starts a project file in its own folder."""
         self.project = sp.Project()
+        self.var_numbering.set(self.project.numbering)
         self.infos, self.ov, self.ovc = {}, {}, {}
         self.polys, self.undo, self.order, self.order_key = {}, {}, [], None
         self.cur, self.waiting_for, self.pending_min_mm2 = 0, None, {}
@@ -560,9 +560,9 @@ class SectionLoader:
         dlg.transient(self.root)
         dlg.geometry(f"+{self.root.winfo_rootx() + 120}+{self.root.winfo_rooty() + 100}")
         ttk.Label(dlg, text="Choose a project (double-click opens it):", padding=(10, 10, 10, 4)).pack(anchor="w")
-        cols = ("name", "folder", "when")
+        cols = ("name", "sections", "folder", "when")
         tree = ttk.Treeview(dlg, columns=cols, show="headings", selectmode="browse", height=min(max(len(paths), 4), 12))
-        for c, t, w, a in (("name", "Project", 280, "w"), ("folder", "Folder", 420, "w"), ("when", "Last saved", 190, "w")):
+        for c, t, w, a in (("name", "Project", 280, "w"), ("sections", "Sections", 70, "e"), ("folder", "Folder", 400, "w"), ("when", "Last saved", 190, "w")):
             tree.heading(c, text=t)
             tree.column(c, width=w, anchor=a)
         for i, p in enumerate(paths):
@@ -571,7 +571,8 @@ class SectionLoader:
                 name = os.path.basename(p)
             except OSError:
                 when, name = "(missing)", os.path.basename(p)
-            tree.insert("", tk.END, iid=str(i), values=(name, os.path.dirname(p), when))
+            n = sp.count_sections(p)
+            tree.insert("", tk.END, iid=str(i), values=(name, "" if n is None else n, os.path.dirname(p), when))
         tree.pack(fill=tk.BOTH, expand=True, padx=10)
         if paths:
             tree.selection_set("0")
@@ -590,12 +591,30 @@ class SectionLoader:
                 sp.remove_recent_project(paths[int(sel[0])])
                 tree.delete(sel[0])
 
+        def delete():
+            sel = tree.selection()
+            if not sel:
+                return
+            p = paths[int(sel[0])]
+            if not messagebox.askyesno("Delete project", f"Delete the project file\n\n{p}\n\nfrom the disk? Only this file goes: the "
+                                       "images are not touched. This can't be undone.", icon="warning", default="no", parent=dlg):
+                return
+            try:
+                if os.path.isfile(p):
+                    os.remove(p)
+            except OSError as e:
+                messagebox.showerror("Can't delete", str(e), parent=dlg)
+                return
+            sp.remove_recent_project(p)
+            tree.delete(sel[0])
+
         tree.bind("<Double-1>", choose)
         tree.bind("<Return>", choose)
         bar = ttk.Frame(dlg, padding=10)
         bar.pack(fill=tk.X)
         ttk.Button(bar, text="Open", command=choose).pack(side=tk.LEFT)
         ttk.Button(bar, text="Remove from the list", command=forget).pack(side=tk.LEFT, padx=8)
+        ttk.Button(bar, text="Delete project...", command=delete).pack(side=tk.LEFT)
         ttk.Button(bar, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT)
         dlg.bind("<Escape>", lambda e: dlg.destroy())
         dlg.grab_set()
@@ -706,7 +725,7 @@ class SectionLoader:
         # how the outlines are numbered (for all the images): by scene number, across then down, or down then across
         number_box = ttk.LabelFrame(right, text="Number the outlines", padding=(8, 2, 8, 4))
         number_box.pack(fill=tk.X, pady=(0, 10))
-        self.var_numbering = tk.StringVar(f, "scene")
+        self.var_numbering = tk.StringVar(f, "rows")
         for value, text in (("rows", "Order by rows"), ("columns", "Order by columns"), ("scene", "Order by scene number")):
             ttk.Radiobutton(number_box, text=text, value=value, variable=self.var_numbering, command=self.on_numbering).pack(anchor="w")
         self.panel_threshold = ttk.Frame(right)
@@ -791,6 +810,18 @@ class SectionLoader:
         if i >= 0 and i != self.cur:
             self.goto_slide(i)
 
+    def update_nav_buttons(self):
+        """Previous / next image (the arrows above the picture, and the buttons in the panel): none at the first or last image, and none
+        while all the images are shown on the grid (there is no one image to move from)."""
+        last = len(self.project.slides) - 1
+        can_prev = not self.grid_mode and self.cur > 0
+        can_next = not self.grid_mode and self.cur < last
+        self.btn_prev.config(state="normal" if can_prev else "disabled")
+        self.btn_fwd.config(state="normal" if can_next else "disabled")
+        for prev, nxt in self.panel_nav:
+            prev.config(state="normal" if can_prev else "disabled")
+            nxt.config(state="normal" if can_next else "disabled")
+
     def refresh_image_menu(self):
         n = len(self.project.slides)
         names = [f"Image {i + 1} of {n}:  {os.path.basename(s.path)}" for i, s in enumerate(self.project.slides)]
@@ -837,12 +868,7 @@ class SectionLoader:
         self.selected, self.draw_pts = set(), []
         if self.grid_mode:
             self.set_grid_mode(False)
-        last = len(self.project.slides) - 1
-        self.btn_prev.config(state="normal" if i else "disabled")
-        self.btn_fwd.config(state="normal" if i < last else "disabled")
-        for prev, nxt in self.panel_nav:
-            prev.config(state="normal" if i else "disabled")
-            nxt.config(state="normal" if i < last else "disabled")
+        self.update_nav_buttons()
         self.refresh_image_menu()
         self.var_slide.set(f"Image {i + 1} of {len(self.project.slides)}:  {os.path.basename(s.path)}")
         if s.path in self.ov:
@@ -1263,25 +1289,35 @@ class SectionLoader:
             s = slides[i]
             if not s.accepted or len(s.polygons) < 2 or sp.is_jp2(s.path):      # (only a .czi has scenes)
                 continue
-            merged, n = sp.merge_within_scenes(s.polygons, sp.scene_boxes(s.path), self.project.numbering)
+            boxes = sp.scene_boxes(s.path)
+            groups = sp.scene_groups(s.polygons, boxes)          # (the scenes with more than one outline, and which outlines)
+            merged, n = sp.merge_within_scenes(s.polygons, boxes, self.project.numbering)
             if n:
-                plan.append((i, merged, n, len(s.polygons) - len(merged)))
+                plan.append((i, merged, n, len(s.polygons) - len(merged), groups))
         if not plan:
             messagebox.showinfo("Merge contours within scenes", "No scene of " + ("any image shown" if self.grid_mode else "this image")
                                 + " has more than one outline.", parent=self.root)
             return
-        total_scenes = sum(n for _, _, n, _ in plan)
-        total_outlines = sum(d for _, _, _, d in plan)
+        total_scenes = sum(n for _, _, n, _, _ in plan)
+        total_outlines = sum(d for _, _, _, d, _ in plan)
+        # which outlines are involved: "scene 4: outlines 4 and 5", under the image's name when several images are
+        numbers = lambda idx: ", ".join(str(k + 1) for k in idx[:-1]) + (" and " if len(idx) > 1 else "") + str(idx[-1] + 1)
+        lines = []
+        for i, _, _, _, groups in plan:
+            if self.grid_mode:
+                lines.append(f"{os.path.basename(slides[i].path)}:")
+            lines += [("   " if self.grid_mode else "") + f"scene {sc + 1}: outlines {numbers(idx)}" for sc, idx in groups]
+        listing = "\n".join(lines[:16]) + (f"\n... and {len(lines) - 16} more line(s)" if len(lines) > 16 else "")
         where = f"In {len(plan)} image(s)," if self.grid_mode else "In this image,"
         undo_note = "Only the image on the panel can be undone afterwards. " if self.grid_mode else "Undo goes back. "
         if not messagebox.askyesno(
                 "Merge contours within scenes",
                 f"{where} {total_scenes} scene(s) have more than one outline. Merging each scene's outlines into one "
-                f"takes away {total_outlines} outline(s).\n\nFragments are joined along their closest points, so a small piece far "
+                f"takes away {total_outlines} outline(s):\n\n{listing}\n\nFragments are joined along their closest points, so a small piece far "
                 "from the section would be joined to it by a thin bridge: delete stray pieces first. " + undo_note + "Go on?",
                 parent=self.root):
             return
-        for i, merged, n, d in plan:
+        for i, merged, n, d, _ in plan:
             s = slides[i]
             if i == self.cur and i in self.polys:
                 self.push_undo()                       # (the image on show can be undone)
@@ -1413,6 +1449,7 @@ class SectionLoader:
                 self.want(s.path)
             self.canvas.config(cursor="arrow")
         self.update_slider_states()
+        self.update_nav_buttons()
         self.update_edit_help()                   # (the merge-within-scenes button follows what is shown)
         if on:
             self.start_grid()
@@ -1690,20 +1727,19 @@ class SectionLoader:
         self.order = []                    # [(slide index, polygon index)]
         self.thumbs = {}                   # (slide index, polygon index) -> PhotoImage
         self.drag = None
-        top0 = ttk.Frame(f, padding=(12, 8, 12, 0))
-        top0.pack(fill=tk.X)
-        self.var_fit_thumbs = tk.BooleanVar(f, True)
-        ttk.Checkbutton(top0, text="Scale sections to fit thumbnails", variable=self.var_fit_thumbs,
-                        command=self.on_fit_thumbs).pack(side=tk.LEFT)
         top = ttk.Frame(f, padding=(12, 8))
         top.pack(fill=tk.X)
         self.var_order_text = tk.StringVar(f, "")
-        ttk.Label(top, textvariable=self.var_order_text, foreground="gray30").pack(side=tk.LEFT)
+        help_label = ttk.Label(top, textvariable=self.var_order_text, foreground="gray30")
         ttk.Button(top, text="Reverse order", command=self.reverse_order).pack(side=tk.RIGHT)
         self.var_spacing = tk.StringVar(f, "")
         ttk.Entry(top, textvariable=self.var_spacing, width=7).pack(side=tk.RIGHT, padx=(4, 18))
         ttk.Label(top, text="Distance between adjacent sections (\u00b5m):").pack(side=tk.RIGHT)
         ttk.Button(top, text="Reset order", command=self.reset_order).pack(side=tk.RIGHT, padx=8)
+        self.var_fit_thumbs = tk.BooleanVar(f, True)
+        ttk.Checkbutton(top, text="Scale sections to fit thumbnails", variable=self.var_fit_thumbs,
+                        command=self.on_fit_thumbs).pack(side=tk.RIGHT, padx=8)
+        help_label.pack(side=tk.LEFT)      # (packed last: if the window is narrow it is the help text that is cut, not the buttons)
         wrap = ttk.Frame(f)
         wrap.pack(fill=tk.BOTH, expand=True)
         self.ocanvas = tk.Canvas(wrap, bg="white", highlightthickness=0)
@@ -1716,6 +1752,7 @@ class SectionLoader:
         self.ocanvas.bind("<ButtonPress-1>", self.o_press)
         self.ocanvas.bind("<B1-Motion>", self.o_move)
         self.ocanvas.bind("<ButtonRelease-1>", self.o_release)
+        self.ocanvas.bind("<Double-Button-1>", self.o_double)
         return f
 
     def enter_order(self):
@@ -1807,7 +1844,7 @@ class SectionLoader:
         cols, cw, chh = self.cell_geometry()
         rows = (len(self.order) + cols - 1) // cols
         c.config(scrollregion=(0, 0, 10, CELL_PAD + rows * chh))
-        self.var_order_text.set(f"{len(self.order)} section(s). Drag a picture to where it belongs; the number is its place.")
+        self.var_order_text.set(f"{len(self.order)} section(s). Drag a picture to reorder.")
         for i, key in enumerate(self.order):
             if self.drag and self.drag["moved"] and i == self.drag["index"]:
                 continue
@@ -1870,6 +1907,26 @@ class SectionLoader:
             slot = d["slot"] - (1 if d["slot"] > d["index"] else 0)
             self.order.insert(slot, item)
         self.draw_order()
+
+    def o_double(self, e):
+        """Double-click on a thumbnail: back to the outlines tab, at that section's image with its outline selected."""
+        if self.busy:
+            return
+        y = self.ocanvas.canvasy(e.y)
+        cols, cw, chh = self.cell_geometry()
+        col, row = (e.x - CELL_PAD) // cw, (y - CELL_PAD) // chh
+        i = int(row * cols + col)
+        if not (0 <= col < cols and 0 <= i < len(self.order)):
+            return
+        self.drag = None
+        si, pi = self.order[i]
+        self.project.order = list(self.order)         # (the order made so far is kept for when the tab is entered again)
+        self.cur = si
+        self.show_stage(1)
+        if self.slide().path in self.ov and pi < len(self.polys.get(si, [])):
+            self.selected = {pi}
+            self.update_edit_help()
+            self.redraw()
 
     def reverse_order(self):
         self.order.reverse()
