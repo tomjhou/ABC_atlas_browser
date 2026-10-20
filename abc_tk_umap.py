@@ -33,6 +33,8 @@ MAX_COLORED_CATEGORIES = 400
 LEVEL_NAMES = {"class": "Class", "subclass": "Subclass", "supertype": "Supertype", "cluster": "Cluster", "leiden": "Leiden"}
 TILE_PX = 230
 MIN_TILE_PX = 120
+DOT_MM = 0.1                       # a cell's dot in the section panels: 100 um across on the tissue
+SCALEBAR_UM = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000)
 HOVER_RADIUS_PX = 9
 SCALE_UNITS = {("standard", "log"): "log1p(expr)", ("standard", "linear"): "expr (raw counts)",
                ("imputed", "log"): "log2 (imputed)", ("imputed", "linear"): "linear (imputed)"}
@@ -74,6 +76,7 @@ class PointCanvas:
         self.markers = {}                           # name -> [item, x, y] (x None: hidden)
         self.rects = []                             # [item, x0, y0, x1, y1]
         self.labels = []                            # [item, x, y]
+        self.scalebar = None                        # (line item, text item) once enabled: data units are mm
         self.on_motion = None                       # fn(cx, cy) ; fn(None, None) on leave
         self.on_view = None                         # fn() after a redraw
         self.on_change = None                       # fn(zoom, dx, dy) after the user zoomed or panned (the view, relative to the whole view)
@@ -204,7 +207,10 @@ class PointCanvas:
         img = np.full((h, w, 3), 255, np.uint8)
         hw, hh = w / (2 * self.scale), h / (2 * self.scale)
         for lay in self.layers:
-            d = int(min(max(round(lay["size"] * zoom ** 0.7), 1), 40))          # (the dots grow as the view is zoomed in)
+            if "size_mm" in lay:                                              # (a size on the tissue: the same at any window size)
+                d = int(min(max(round(lay["size_mm"] * self.scale), 1), 40))
+            else:
+                d = int(min(max(round(lay["size"] * zoom ** 0.7), 1), 40))          # (the dots grow as the view is zoomed in)
             x, y = lay["x"], lay["y"]
             pm = d / self.scale
             m = (x >= self.cx - hw - pm) & (x <= self.cx + hw + pm) & (y >= self.cy - hh - pm) & (y <= self.cy + hh + pm)
@@ -254,16 +260,34 @@ class PointCanvas:
         item = self.canvas.create_rectangle(0, 0, 0, 0, outline="#ff8c00", width=2, dash=(6, 3))
         self.rects.append([item, x0, y0, x1, y1])
 
+    def enable_scalebar(self):
+        self.scalebar = (self.canvas.create_line(0, 0, 0, 0, fill="black", width=3), self.canvas.create_text(0, 0, anchor="s", font=("Segoe UI", 9, "bold"), fill="black"))
+
+    def place_scalebar(self):
+        w, h = self.size()
+        view_mm = w / self.scale
+        cands = [u for u in SCALEBAR_UM if u <= view_mm * 1000 * 0.22]
+        um = cands[-1] if cands else SCALEBAR_UM[0]
+        x0, y = w * 0.06, h * 0.94
+        x1 = x0 + um / 1000 * self.scale
+        self.canvas.coords(self.scalebar[0], x0, y, x1, y)
+        self.canvas.coords(self.scalebar[1], (x0 + x1) / 2, y - 4)
+        self.canvas.itemconfig(self.scalebar[1], text=f"{um:g} µm" if um < 1000 else f"{um / 1000:g} mm")
+        self.canvas.tag_raise(self.scalebar[0])
+        self.canvas.tag_raise(self.scalebar[1])
+
     def clear_labels(self):
         for it in self.labels:
             self.canvas.delete(it[0])
         self.labels = []
 
-    def add_label(self, text, x, y):
-        item = self.canvas.create_text(0, 0, text=text, font=("Segoe UI", 8, "bold"), fill="black")
+    def add_label(self, text, x, y, color="black"):
+        item = self.canvas.create_text(0, 0, text=text, font=("Segoe UI", 8, "bold"), fill=color)
         self.labels.append([item, x, y])
 
     def reposition(self):
+        if self.scalebar:
+            self.place_scalebar()
         for m in self.markers.values():
             self.place_marker(m)
         for it, x0, y0, x1, y1 in self.rects:
@@ -524,6 +548,8 @@ class UmapWindow:
             pc = PointCanvas(fr, (mx - span_x / 2, mx + span_x / 2, my - span_y / 2, my + span_y / 2), flip_y=False, width=TILE_PX, height=int(TILE_PX / self.tile_aspect))
             pc.canvas.pack()
             pc.add_marker("hover", 7)
+            if not self.tiles:
+                pc.enable_scalebar()                       # (the first section's panel carries the scale bar)
             tile = {"label": s, "frame": fr, "pc": pc, "title": title, "token": token, "tree": None}
             pc.on_motion = lambda px, py, t=tile: self.tile_motion(t, px, py)
             pc.on_change = lambda zoom, dx, dy, t=tile: self.link_tiles(t, zoom, dx, dy)
@@ -612,8 +638,8 @@ class UmapWindow:
         o = order_run
         self.umap.set_layers([{"x": self.coords[o, 0], "y": self.coords[o, 1], "rgb": rgb_run[o], "size": 4}])
         self.umap.clear_labels()
-        for text, x, y in labels or []:
-            self.umap.add_label(text, x, y)
+        for text, x, y, color in labels or []:
+            self.umap.add_label(text, x, y, color)
         self.umap.reposition()
         self.tile_queue = list(self.tiles)
         self.tile_fn = bg_rgb_fn
@@ -632,12 +658,12 @@ class UmapWindow:
             layers = []
             bgl = self.tile_fn(t["label"])
             if bgl is not None:
-                layers.append({"x": bgl[0], "y": bgl[1], "rgb": bgl[2], "size": 2})
+                layers.append({"x": bgl[0], "y": bgl[1], "rgb": bgl[2], "size_mm": DOT_MM})
             key = self.rgb_run
             # the run's own cells of this section, in drawing order (lowest first)
             rank = self.rank_run
             sel = idx[np.argsort(rank[idx], kind="stable")]
-            layers.append({"x": self.cx[sel], "y": self.cy[sel], "rgb": key[sel], "size": 2})
+            layers.append({"x": self.cx[sel], "y": self.cy[sel], "rgb": key[sel], "size_mm": DOT_MM})
             t["pc"].set_layers(layers)
         if self.tile_queue:
             self.tile_job = self.root.after(1, self.tile_step)
@@ -673,7 +699,8 @@ class UmapWindow:
         labels = []
         for g, row in cent.iterrows():
             m = re.match(r"^\s*(\d+)", str(uniques[g]))
-            labels.append((m.group(1) if m else str(uniques[g]), row["x"], row["y"]))
+            dark = (lut[g].astype(float) * 0.55).astype(int)               # (the group's own color, darker)
+            labels.append((m.group(1) if m else str(uniques[g]), row["x"], row["y"], "#%02x%02x%02x" % tuple(dark)))
         self.apply(rgb, np.arange(self.n), bg_fn, labels)
         self.umap.current = f"all_{level}"
         n_cat = int((counts > 0).sum())
