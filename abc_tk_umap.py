@@ -74,6 +74,7 @@ class PointCanvas:
         self.labels = []                            # [item, x, y]
         self.on_motion = None                       # fn(cx, cy) ; fn(None, None) on leave
         self.on_view = None                         # fn() after a redraw
+        self.on_change = None                       # fn(zoom, dx, dy) after the user zoomed or panned (the view, relative to the whole view)
         self.pan_from = None
         c = self.canvas
         c.bind("<Configure>", lambda e: self.on_resize())
@@ -87,7 +88,7 @@ class PointCanvas:
             c.bind(release, self.pan_end)
         c.bind("<Motion>", lambda e: self.on_motion and self.on_motion(e.x, e.y), add="+")
         c.bind("<Leave>", lambda e: self.on_motion and self.on_motion(None, None))
-        c.bind("<Double-Button-1>", lambda e: self.fit())
+        c.bind("<Double-Button-1>", lambda e: (self.fit(), self.announce()))
 
     # ---- geometry
 
@@ -98,6 +99,19 @@ class PointCanvas:
         w, h = self.size()
         x0, x1, y0, y1 = self.home
         return min(w / max(x1 - x0, 1e-9), h / max(y1 - y0, 1e-9))
+
+    def announce(self):
+        if self.on_change:
+            self.on_change(self.scale / self.fit_scale(), self.cx - (self.home[0] + self.home[1]) / 2, self.cy - (self.home[2] + self.home[3]) / 2)
+
+    def follow(self, zoom, dx, dy):
+        """Take the same view (zoom, and offset from the whole view's center) as the panel that was moved."""
+        self.scale = self.fit_scale() * zoom
+        self.cx = (self.home[0] + self.home[1]) / 2 + dx
+        self.cy = (self.home[2] + self.home[3]) / 2 + dy
+        self.at_fit = zoom <= 1.0000001
+        self.clamp()
+        self.request_draw()
 
     def fit(self):
         self.at_fit = True
@@ -146,6 +160,7 @@ class PointCanvas:
         self.cy = y + dy if self.flip_y else y - dy
         self.clamp()
         self.request_draw()
+        self.announce()
 
     def pan_start(self, e):
         self.pan_from = (e.x, e.y, self.cx, self.cy)
@@ -160,6 +175,7 @@ class PointCanvas:
         self.at_fit = False
         self.clamp()
         self.request_draw()
+        self.announce()
 
     def pan_end(self, e):
         self.pan_from = None
@@ -494,11 +510,12 @@ class UmapWindow:
             pc.add_marker("hover", 7)
             tile = {"label": s, "frame": fr, "pc": pc, "title": title, "token": token, "tree": None}
             pc.on_motion = lambda px, py, t=tile: self.tile_motion(t, px, py)
+            pc.on_change = lambda zoom, dx, dy, t=tile: self.link_tiles(t, zoom, dx, dy)
             for r in self.rois:
                 if r[0] == str(s) or core.sanitize_section_token(r[0]) == token:
                     pc.add_rect(r[1], r[3], r[2], r[4])
             self.tiles.append(tile)
-        self.tile_cols = 0
+        self.tile_cols = self.tile_px = 0
         self.layout_tiles()
 
     def layout_tiles(self):
@@ -506,11 +523,19 @@ class UmapWindow:
             return
         w = max(self.tile_scroll.winfo_width(), TILE_PX)
         cols = max(1, w // (TILE_PX + 10))
-        if cols == self.tile_cols:
+        px = max((w - 8) // cols - 8, 60)               # (the panels fill the pane's width)
+        if cols == self.tile_cols and px == self.tile_px:
             return
-        self.tile_cols = cols
+        self.tile_cols, self.tile_px = cols, px
         for k, t in enumerate(self.tiles):
+            t["pc"].canvas.config(width=px, height=px)
             t["frame"].grid(row=k // cols, column=k % cols, padx=4, pady=3, sticky="nw")
+
+    def link_tiles(self, source, zoom, dx, dy):
+        """Zooming or panning one section does the same to all the others."""
+        for t in self.tiles:
+            if t is not source:
+                t["pc"].follow(zoom, dx, dy)
 
     def section_tile(self, label):
         for t in self.tiles:
