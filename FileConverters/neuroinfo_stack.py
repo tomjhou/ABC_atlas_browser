@@ -656,7 +656,7 @@ def stack_from_json(doc, folder, jpx_path=""):
             pivot_src=d["pivot_src"] if d.get("pivot_src") is not None else (    # (no pivot recorded: the first versions' default)
                 np.array(d["case_points"], float).reshape(-1, 2).mean(0) if len(d["case_points"]) else None),
             czi_origin=tuple(d["czi_origin"]) if d.get("czi_origin") else None, origin_key=d.get("origin_key", ""),
-            frame=d.get("frame", -1)))
+            frame=d.get("frame", -1), czi_assumed=bool(d.get("czi_assumed", False))))
     return stack
 
 
@@ -719,6 +719,8 @@ def stack_json(stack, out_path):
         })
         if s.czi_origin is not None:
             secs[-1]["czi_origin"] = [round(float(v), 4) for v in s.czi_origin]
+        if s.czi_assumed:
+            secs[-1]["czi_assumed"] = True        # (its position is the scan's shared one, not yet checked against the section's own frame)
     # Version 2 only when needed (an outline was edited or removed, so the pivot is no longer the outline's centroid);
     # otherwise the file stays readable by the first version of this tool.
     needs_v2 = any(not len(s.case_points) or not np.allclose(s.pivot_src, s.case_points.mean(0), atol=1e-4)

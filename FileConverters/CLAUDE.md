@@ -16,8 +16,13 @@
   A `.jpx` can be added in step 1 on its own: a single-row "JPX project" (`Project.is_jpx`; `jpx_order` = frames in section order,
   `jpx_sections`), outlines tab skipped, order-tab thumbnails read from the JPX's own frames (`jpx_crop`, lazily, cached as `jt_*.npz`),
   Done -> `ns.open_stack(..., alignment=project.alignment)` + `sp.apply_jpx_order`. `stack_json` records each section's `frame`. The
-  aligner's menu "Back to step 1" (`go_back_to_ordering`) saves the project and `SerialAssembler.detect_and_align` reopens the loader at
-  the order tab (`SectionLoader.resume`); the alignment is kept. `neuroinfo_dialogs.py` holds the "which NeuroInfo file?" dialog.
+  aligner's menu "Back to step 3" (`go_back_to_ordering`) saves the project and HIDES the aligner window (it keeps its pictures, edits, view,
+  and keeps loading); `SerialAssembler.detect_and_align` shows the loader at the order tab (`SectionLoader.resume`), and its Next brings the
+  same window back (`Aligner.show_again`, order from `sp.reuse_order`) unless the outlines/JPX/pixel size changed (then `shutdown()` + a new one).
+  Images are created with `master=self.root` (two Tk roots live at once).
+  A .czi section whose position on its scan is only the scan's shared origin has `czi_assumed`; that flag is saved in the alignment
+  (`stack_json`), restored on load, the check (`ns.verify_czi_origins`) runs whenever any section still has it, and `export_dialog`
+  refuses to export until none do (it asks "Export anyway?" only if the check can't run). `neuroinfo_dialogs.py` holds the "which NeuroInfo file?" dialog.
 
 # jpx_aligner / neuroinfo_stack
 

@@ -715,6 +715,49 @@ def open_jpx_stack(project, locate=None):
     return stack
 
 
+def reuse_info(project, stack):
+    """What the alignment window made for `project` (its `stack`) keeps, to tell later whether it can still stand for the project: see
+    reuse_order."""
+    if project.is_jpx:
+        return {"jpx": os.path.abspath(project.jpx_path)}
+    polys = [np.asarray(p, float).copy() for _, p, _ in _order_items(project)]
+    return {"snap": polys, "keys": [outline_key(p) for p in polys], "pixel_um": stack.pixel_um}
+
+
+def reuse_order(info, project, live_stack, new_stack):
+    """The sections of the live alignment window's stack, in the order the project asks for now, if that stack still stands for the
+    project (so the window can be kept as it is, with its pictures, edits, deleted sections and view); None if the project has changed in a
+    way that needs the stack made anew: another JPX, outlines redrawn (compared on their points, to within the rounding of the project
+    file), another pixel size. `new_stack` is the stack the loader just made from the project (its pixel size is compared)."""
+    if project.is_jpx:
+        if info.get("jpx") != os.path.abspath(project.jpx_path):
+            return None
+        by_frame = {s.frame: s for s in live_stack.sections}
+        return [by_frame[f] for f in project.jpx_order if f in by_frame] or list(live_stack.sections)
+    if "snap" not in info or abs(new_stack.pixel_um - info["pixel_um"]) > 1e-9:
+        return None
+    snap, keys = info["snap"], info["keys"]
+    items = _order_items(project)
+    if len(items) != len(snap):
+        return None
+    cents = np.array([p.mean(0) for p in snap]) if snap else np.zeros((0, 2))
+    taken, chosen = set(), []
+    for _, poly, _ in items:
+        poly = np.asarray(poly, float)
+        match = None
+        for j in np.flatnonzero(np.abs(cents - poly.mean(0)).max(axis=1) < 1.0):
+            if int(j) not in taken and snap[j].shape == poly.shape and np.allclose(snap[j], poly, atol=0.02):
+                match = int(j)
+                break
+        if match is None:
+            return None
+        taken.add(match)
+        chosen.append(match)
+    by_key = {s.origin_key: s for s in live_stack.sections if s.origin_key}
+    ordered = [by_key[keys[j]] for j in chosen if keys[j] in by_key]
+    return ordered or None
+
+
 def build_stack(project, margin=0.2):
     """The in-memory Stack of a project, ready for the alignment tool: one section per outline, in order, each rendered from its
     slide scan (so no JPX is needed) and placed unrotated at the middle of a canvas big enough for the largest of them. If the project

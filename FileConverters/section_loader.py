@@ -191,6 +191,10 @@ class SectionLoader:
         """Close the window (its timer cancelled first, so that it can't go off in the next window)."""
         self.closing = True
         self.ov_wake.set()
+        try:
+            self.root.quit()       # (the loop ends even if another window, the hidden alignment tool, is still alive)
+        except tk.TclError:
+            pass
         for after_id in (self.poll_id, self.jpx_tick_id):
             try:
                 if after_id is not None:
@@ -1669,7 +1673,7 @@ class SectionLoader:
             x0, y0 = col * (cw / cols) + 5, row * (ch / rows) + 5
             rgb = self.grid_rgb.get(i)
             if rgb is not None:
-                ph = ImageTk.PhotoImage(Image.fromarray(rgb))
+                ph = ImageTk.PhotoImage(Image.fromarray(rgb), master=self.root)
                 self.grid_photos.append(ph)
                 ix, iy = x0 + (w - rgb.shape[1]) / 2, y0 + (h - rgb.shape[0]) / 2
                 c.create_image(ix, iy, image=ph, anchor="nw")
@@ -1736,7 +1740,7 @@ class SectionLoader:
             img = tinted.astype(np.uint8)
         M = np.array([[s, 0, ox], [0, s, oy]], np.float32)
         out = cv2.warpAffine(img, M, (cw, ch), flags=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
-        self.photo = ImageTk.PhotoImage(Image.fromarray(out))
+        self.photo = ImageTk.PhotoImage(Image.fromarray(out), master=self.root)
         c.create_image(0, 0, image=self.photo, anchor="nw")
         c.create_text(8, ch - 6, anchor="sw", fill="#a0a0a0", font=("Segoe UI", 9), text="Wheel: zoom    Right button: pan")
         if self.var_scenes.get() and not sp.is_jp2(self.slide().path):
@@ -1956,7 +1960,7 @@ class SectionLoader:
             crop3 = color[a[1]:b[1], a[0]:b[0]] if self.var_color.get() and color is not None else np.repeat(crop[:, :, None], 3, axis=2)
             rgb = cv2.resize(crop3, (max(int(crop.shape[1] * f), 1), max(int(crop.shape[0] * f), 1)), interpolation=cv2.INTER_AREA)
             cv2.polylines(rgb, [((poly - a) * f).astype(np.int32)], True, (255, 212, 0), 1, cv2.LINE_AA)
-            self.thumbs[key] = ImageTk.PhotoImage(Image.fromarray(rgb))
+            self.thumbs[key] = ImageTk.PhotoImage(Image.fromarray(rgb), master=self.root)
 
     # ---- the ordering tab of a JPX project: the thumbnails come from the JPX's own frames, only those in view (and a few rows more), a few at a
     # time in the background, and are kept on disk
@@ -2084,7 +2088,7 @@ class SectionLoader:
             f = min((min(THUMB_W / c[0].shape[1], THUMB_H / c[0].shape[0]) / c[2] for c in self.jpx_crops.values() if c), default=1.0) * um
         img = cv2.resize(rgb, (max(int(w * f), 1), max(int(h * f), 1)), interpolation=cv2.INTER_AREA)
         cv2.polylines(img, [(poly * f).astype(np.int32)], True, (255, 212, 0), 1, cv2.LINE_AA)
-        self.thumbs[key] = ImageTk.PhotoImage(Image.fromarray(img))
+        self.thumbs[key] = ImageTk.PhotoImage(Image.fromarray(img), master=self.root)
         return True
 
     def draw_order(self):

@@ -63,20 +63,40 @@ def run_aligner(stack=None, path=None, open_dialog=False, back_to_start=False):
 
 
 def detect_and_align():
-    """Step 1, then the alignment tool. The alignment tool's "Back to step 1" returns to step 1's ordering tab with the same project (its
-    alignment is kept), as often as wanted."""
+    """Steps 1-3 (the loader), then step 4 (the alignment tool). The alignment tool's "Back to step 3" hides its window and shows the loader
+    at the ordering tab with the same project; the loader's Next then brings the same alignment window back, as it was (zoom, brightness,
+    the pictures loaded, loading carrying on meanwhile), with the sections in the new order. Only if the project changed in a way that
+    needs it (outlines redrawn, another JPX) is a new alignment window made, from the project (its saved alignment is kept)."""
+    import jpx_aligner
     import section_loader
-    resume = None
+    import section_project as sp
+    aligner, resume = None, None
     while True:
         loader = section_loader.SectionLoader()
         if resume:
             loader.resume(resume, 2)
         stack = loader.run()
-        if stack is None:
+        if stack is None:                        # (the loader was closed: the hidden alignment window goes too)
+            if aligner is not None:
+                aligner.shutdown()
             return
-        if not run_aligner(stack=stack, path=loader.project.path, back_to_start=True):
+        project = loader.project
+        ordered = None
+        if aligner is not None and aligner.reuse_info is not None:
+            ordered = sp.reuse_order(aligner.reuse_info, project, aligner.stack, stack)
+        if ordered is not None:
+            aligner.show_again(ordered, project.z_spacing_um)
+        else:
+            if aligner is not None:
+                aligner.shutdown()
+            aligner = jpx_aligner.Aligner(None)
+            aligner.return_to_launcher = True
+            aligner.show_stack(stack, project.path)
+            aligner.reuse_info = sp.reuse_info(project, stack)
+        aligner.run()
+        if not aligner.back_to_ordering:         # (the alignment window was closed: back to the start window)
             return
-        resume = loader.project.path
+        resume = project.path
 
 
 def main(argv=None):

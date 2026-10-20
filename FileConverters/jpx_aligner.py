@@ -318,7 +318,12 @@ class Aligner:
         self.var_dy = tk.StringVar(self.root, "0")
         self.var_quality = tk.StringVar(self.root, f"{ns.DEFAULT_QUALITY_DB:g}")
         self.return_to_launcher = False   # set by the start window: closing this window goes back to it, instead of ending the program
-        self.back_to_ordering = False     # closed with "Back to step 1": the start window reopens the project at the ordering tab
+        self.back_to_ordering = False     # hidden with "Back to step 3": the start window shows the loader at the ordering tab meanwhile
+        self.hidden = False               # (while hidden nothing is written to the project file: the loader owns it then)
+        self.verifying = False            # the check of the sections' assumed positions is running
+        self.start_verify = lambda: False # (set while a stack loads: starts that check)
+        self.check_incomplete = False     # the check ended with some positions still unchecked (it could not run): export asks instead of waiting
+        self.reuse_info = None            # what section_project.reuse_order needs to tell whether this window can stand for the project again
         self.timer_ids = {}         # the repeating timers (poll, autosave), to cancel when the window closes
         self.project_path = ""      # the section project the stack came from (its edits are saved into it as you work), if it did
         self.project_obj = None
@@ -765,7 +770,7 @@ class Aligner:
         if st is None:
             return None
         return (len(st.sections), st.z_spacing_um, tuple(
-            (s.frame, s.name, s.source_path, tuple(asdict(s.edit).values()), len(s.case_points), round(float(s.case_points.sum()), 3),
+            (s.frame, s.czi_assumed, s.czi_origin, s.name, s.source_path, tuple(asdict(s.edit).values()), len(s.case_points), round(float(s.case_points.sum()), 3),
              round(float(s.pivot_src.sum()), 3), round(float(s.t.sum()), 3)) for s in st.sections))
 
     def save_project_state(self, force=False):
@@ -791,7 +796,7 @@ class Aligner:
             return False
 
     def autosave_tick(self):
-        if not self.busy and not self.opening:
+        if not self.busy and not self.opening and not self.hidden:
             self.save_project_state()
         self.timer("autosave", 2000, self.autosave_tick)
 
@@ -1091,8 +1096,12 @@ class Aligner:
                 summary = ns.verify_czi_origins(stack, progress=lambda i, n, text: self.msgs.put(("status", text)),
                                                 stop=verify_stop)
             except BaseException as e:
+                self.check_incomplete = True
+                self.verifying = False
                 self.msgs.put(("status", f"Couldn't check the section positions: {e}"))
                 return
+            self.check_incomplete = any(s.czi_assumed for s in stack.sections)    # (e.g. no rasterio: nothing could be checked)
+            self.verifying = False
             parts = [f"{summary['checked']} checked in {time.time() - t_v:.0f} s"]
             if summary["corrected"]:
                 parts.append(f"{len(summary['corrected'])} had a position of their own (> 3 px from the scan's) and were moved to it: "
@@ -1102,6 +1111,18 @@ class Aligner:
                              + ", ".join(str(n) for n in summary["unverified"][:12]))
             print(f"Checked the section positions of {os.path.basename(stack.jpx_path)}: " + "; ".join(parts), flush=True)
             self.msgs.put(("verified", (stack, summary)))
+
+        def start_verify():
+            """Start the check of the unchecked positions (once, and only if there are any); True if one is running."""
+            if self.verifying:
+                return True
+            if self.stack is not stack or not any(s.czi_assumed for s in stack.sections):
+                return False
+            self.verifying = True
+            threading.Thread(target=verify, daemon=True).start()
+            return True
+
+        self.start_verify = start_verify
 
         def work():
             ns.lower_thread_priority()   # (the window stays responsive while the images load)
@@ -1116,8 +1137,8 @@ class Aligner:
                     problems = {"the .czi scans": str(e) or type(e).__name__}
                 locate_seconds[0] = time.time() - t_locate
                 self.msgs.put(("czi_ready", (stack, {k: v for k, v in problems.items() if v})))
-                if verify_wanted and any(s.czi_assumed for s in stack.sections):
-                    threading.Thread(target=verify, daemon=True).start()
+            if verify_wanted:         # (also for a stack made from a saved alignment: a position still unchecked there is checked now)
+                start_verify()
             for s in todo:
                 if self.stack is not stack:
                     return
@@ -1345,7 +1366,7 @@ class Aligner:
             if len(self.thumb_photos) > 12:
                 self.thumb_photos.clear()
             small = picture.resize((width, max(1, round(picture.height * width / picture.width))), Image.LANCZOS)
-            photo = self.thumb_photos[(path, width)] = ImageTk.PhotoImage(small)
+            photo = self.thumb_photos[(path, width)] = ImageTk.PhotoImage(small, master=self.root)
         k = k * picture.width / width     # (source pixels per pixel of the picture as it is shown)
         if not self.thumb_shown:
             c.pack(before=self.label_sections, anchor="w", pady=(0, 6))
@@ -1704,7 +1725,7 @@ class Aligner:
                 return None
             rgb = (np.clip(self.colorize(img), 0, 1) * 255).astype(np.uint8)
             cv2.polylines(rgb, [np.column_stack([ox + X * sc, oy + Y * sc]).astype(np.int32)], True, (255, 212, 0), 1, cv2.LINE_AA)
-            return ImageTk.PhotoImage(Image.fromarray(rgb))
+            return ImageTk.PhotoImage(Image.fromarray(rgb), master=self.root)
 
         skip = set()      # (sections with nothing to show)
 
@@ -2050,7 +2071,7 @@ class Aligner:
         rgb = (np.clip(out, 0, 1) * 255).astype(np.uint8)
         if self.var_crosshair.get():
             self.draw_crosshair(rgb)
-        self.photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+        self.photo = ImageTk.PhotoImage(Image.fromarray(rgb), master=self.root)
         c.create_image(0, 0, image=self.photo, anchor="nw")
 
         self.last_ref, self.last_alpha = ref, alpha
@@ -2415,6 +2436,24 @@ class Aligner:
     def export_dialog(self):
         if not self.stack or self.busy:
             return
+        unchecked = [s for s in self.stack.sections if s.czi_assumed]
+        if unchecked:
+            # A section's position on its scan can be one that was only assumed (the scan's shared origin): the picture exported is rendered
+            # from the scan at that position, so an unchecked one could be a few pixels off. The export waits until they are checked.
+            running = False if self.check_incomplete else self.start_verify()
+            if running:
+                messagebox.showinfo(
+                    "Section positions are being checked",
+                    f"The positions of {len(unchecked)} section(s) on their slide scans haven't been checked against their own frames yet: "
+                    "they are only assumed, and an exported picture would be rendered at that position.\n\nThe check is running (see the "
+                    "status line); export when it has finished.", parent=self.root)
+                return
+            if not messagebox.askyesno(
+                    "Section positions not checked",
+                    f"The positions of {len(unchecked)} section(s) on their slide scans haven't been checked, and can't be checked "
+                    "now (the check is off in File > Options, or it couldn't run). An exported picture is rendered from the scan at the "
+                    "assumed position, so it could be a few pixels off.\n\nExport anyway?", icon="warning", parent=self.root):
+                return
         print("Preparing for JPX export", flush=True)   # (the checks and questions below can take a few seconds to appear)
         st = self.stack
         try:
@@ -2930,11 +2969,45 @@ class Aligner:
         if not self.save_project_state(force=True):
             return
         self.back_to_ordering = True
-        self.return_to_launcher = True
-        self.quit()
-        if self.stack is not None:               # (quit was declined: stay)
-            self.back_to_ordering = False
-            self.return_to_launcher = False
+        self.hidden = True
+        self.root.withdraw()       # (the window is only hidden, with its pictures, edits and view; what is still loading carries on)
+        self.root.quit()           # (this ends the window's loop: the start window shows the loader, and Next brings this one back)
+
+    def show_again(self, sections, spacing=0.0):
+        """Brought back by the loader's Next: the sections in the order it gave (those still here), its distance between sections, and the
+        window as it was left (zoom, brightness, the pictures already loaded)."""
+        self.hidden = False
+        self.back_to_ordering = False
+        self.project_obj = None                  # (the loader has written the project file since: it is read afresh when saving)
+        keep = self.stack.sections[self.cur] if self.stack.sections else None
+        named = {id(s) for s in sections}
+        self.stack.sections[:] = list(sections) + [s for s in self.stack.sections if id(s) not in named]
+        self.renumber()
+        if spacing > 0:
+            self.stack.z_spacing_um = spacing
+            self.var_spacing.set(f"{spacing:g}")
+        self.cur = keep.index if keep is not None else 0
+        self.refresh_list()
+        self.update_sections_title()
+        self.select(self.cur)
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def shutdown(self):
+        """Close the hidden window for good (the loader's window was closed, or the project changed so that a new one is made)."""
+        try:
+            self.save_project_state(force=True)
+        except Exception:
+            pass
+        self.stop_event_verify.set()
+        for after_id in self.timer_ids.values():
+            try:
+                self.root.after_cancel(after_id)
+            except tk.TclError:
+                pass
+        self.stack = None
+        self.root.destroy()
 
     def quit(self):
         self.save_project_state()
