@@ -606,7 +606,7 @@ def show_coordinate_settings_dialog(abc_cache):
         anchor="w", pady=(6, 0))
     ttk.Separator(frame).pack(fill=tk.X, pady=(14, 8))
     tk_var = tk.BooleanVar(dlg, bool(COORD_SETTINGS['tk_section_window']))
-    ttk.Checkbutton(frame, text="Use the new Tk windows (this launch screen, the section picker and the section windows)", variable=tk_var).pack(anchor="w")
+    ttk.Checkbutton(frame, text="Use the new Tk windows (this launch screen, the section picker, the section windows and the UMAP viewer)", variable=tk_var).pack(anchor="w")
     ttk.Label(frame, foreground="gray35", justify=tk.LEFT, wraplength=460, text=(
         "Smoother zoom, pan and ROI editing, with the Groups, Gene, Imputed Gene and Find group views. Untick to use the older "
         "matplotlib windows. Takes effect the next time each window is opened (this launch screen: the next time the app starts).")).pack(
@@ -11181,6 +11181,32 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
 
     if 'X_umap' not in adata.obsm:
         print("No UMAP embedding available; skipping the interactive UMAP viewer.")
+        return
+
+    if COORD_SETTINGS.get('tk_section_window', True):
+        # The Tk viewer (abc_tk_umap.py). It opens on the UMAP parameters the run was last viewed with, like the matplotlib one below.
+        tk_params = dict(UMAP_PARAM_DEFAULTS)
+        if run_folder is not None:
+            last_params = read_last_umap_params(run_folder)
+            if not umap_params_are_default(last_params):
+                try:
+                    variant_coords, variant_leiden = load_umap_variant(umap_variant_csv_path(run_folder, last_params), adata.obs_names)
+                    adata.obsm['X_umap'] = variant_coords
+                    if variant_leiden is not None:
+                        adata.obs[LEIDEN_KEY] = pd.Categorical(variant_leiden)
+                    else:
+                        adata.obs.drop(columns=[LEIDEN_KEY], inplace=True, errors='ignore')
+                    tk_params = last_params
+                except Exception as e:
+                    log_status(f"Step 9: Could not reopen the saved UMAP variant ({e}); using the default embedding.")
+        tk_title = "Interactive UMAP viewer"
+        if not umap_params_are_default(tk_params):
+            tk_title = f"{tk_title} ({umap_params_label(tk_params)})"
+        if run_folder is not None:
+            tk_title = f"{Path(run_folder).name} — {tk_title}"
+        from abc_tk_umap import show_umap_window_tk
+        show_umap_window_tk(adata, abc_cache, imputed_state=imputed_state, adata_backed=adata_backed, rois=rois,
+                        run_folder=run_folder, ensure_imputed=ensure_imputed_gene_dataset_loaded, title=tk_title)
         return
 
     # This window builds one Axes (plus its own scatter/text/spine
