@@ -361,6 +361,7 @@ class UmapWindow:
         self.levels = [k for k in LEVEL_NAMES if self.info[k] is not None]
         # the section panels' background: every cell of each section (from the unfiltered data), when given
         self.bg = None
+        self.adata_backed = adata_backed
         if ok and adata_backed is not None:
             try:
                 bsec = core.get_section_labels(adata_backed, self.abc_cache)
@@ -370,7 +371,7 @@ class UmapWindow:
                     order = np.argsort(codes, kind="stable")
                     starts = np.searchsorted(codes[order], np.arange(len(uniques) + 1))
                     where = {u: order[starts[i]:starts[i + 1]] for i, u in enumerate(uniques)}
-                    self.bg = {"x": pd.to_numeric(bsp["x"], errors="coerce").to_numpy(), "y": pd.to_numeric(bsp["y"], errors="coerce").to_numpy(),
+                    self.bg = {"ids": adata_backed.obs_names, "x": pd.to_numeric(bsp["x"], errors="coerce").to_numpy(), "y": pd.to_numeric(bsp["y"], errors="coerce").to_numpy(),
                                "where": where, "levels": {k: (bsp[k].astype(str).to_numpy() if k in bsp.columns else None) for k in LEVEL_NAMES}}
             except Exception as e:
                 print(f"Could not load the all-cell background for the section panels: {e}", flush=True)
@@ -837,8 +838,33 @@ class UmapWindow:
         self.var_gene.set(gene)
         scale = self.var_scale.get()
         adata = self.adata
+        backed = self.adata_backed if self.bg else None
+        bg_ids = self.bg["ids"] if self.bg else None
 
         def work():
+            return read_values(), read_background()
+
+        def read_background():
+            """The gene's value in every cell of the sections (the whole unfiltered dataset), or None if it can't be had."""
+            if backed is None:
+                return None
+            try:
+                if imputed:
+                    full = core._get_full_gene_column(source, core.find_gene_index(source, gene))
+                    pos = source.obs_names.get_indexer(bg_ids)
+                    out = np.full(len(bg_ids), np.nan)
+                    out[pos >= 0] = full[pos[pos >= 0]]
+                    return np.exp2(out) - 1.0 if scale == "linear" else out
+                bcol = core.find_gene_index(backed, gene)
+                if bcol is None:
+                    return None
+                out = core._get_full_gene_column(backed, bcol)
+                return np.log1p(out) if scale == "log" else out
+            except Exception as e:
+                print(f"Could not read {gene} for the cells outside the selection: {e}", flush=True)
+                return None
+
+        def read_values():
             col = core.find_gene_index(source, gene)
             if imputed:
                 full = core._get_full_gene_column(source, col)
@@ -860,7 +886,7 @@ class UmapWindow:
             if isinstance(res, BaseException):
                 self.var_status.set(f"Could not read {gene}: {res}")
                 return
-            self.show_values(gene, "imputed" if imputed else "standard", scale, res)
+            self.show_values(gene, "imputed" if imputed else "standard", scale, res[0], res[1])
 
         self.job(f"Reading {gene}...", work, done)
 
@@ -870,7 +896,7 @@ class UmapWindow:
         self.color_all()
         self.mode = mode
 
-    def show_values(self, gene, dataset, scale, vals):
+    def show_values(self, gene, dataset, scale, vals, bg_vals=None):
         if (self.mode == "imputed") != (dataset == "imputed") or self.mode not in ("gene", "imputed"):
             return
         fin = np.isfinite(vals)
@@ -887,12 +913,20 @@ class UmapWindow:
             w = self.bg["where"].get(label)
             if w is None:
                 return None
-            return self.bg["x"][w], self.bg["y"][w], np.tile(LIGHT_GREY, (len(w), 1))
+            if bg_vals is None:
+                return self.bg["x"][w], self.bg["y"][w], np.tile(LIGHT_GREY, (len(w), 1))
+            v = bg_vals[w]
+            ok = np.isfinite(v)
+            tt = np.clip((v - vmin) / (vmax - vmin), 0, 1) if vmax > vmin else np.zeros_like(v)
+            col = viridis_rgb(np.where(ok, tt, 0))
+            col[~ok] = LIGHT_GREY
+            o = np.argsort(np.where(ok, v, -np.inf), kind="stable")           # (highest on top)
+            return self.bg["x"][w][o], self.bg["y"][w][o], col[o]
 
         self.apply(rgb, order, bg_fn)
         self.values = (gene, dataset, scale, vals)
         self.draw_colorbar(vmin, vmax, scale, dataset)
-        self.var_status.set(f"Showing {gene}{' [imputed]' if dataset == 'imputed' else ''} (cells outside this run's selection are gray).")
+        self.var_status.set(f"Showing {gene}{' [imputed]' if dataset == 'imputed' else ''} (every cell of the sections, colored on the selection's scale)." if bg_vals is not None else "(cells outside this run's selection are gray).")
 
     def draw_colorbar(self, vmin, vmax, scale, dataset):
         c = self.cbar
