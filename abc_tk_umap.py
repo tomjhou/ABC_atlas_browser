@@ -493,6 +493,9 @@ class UmapWindow:
         for s in self.sections:
             idx = self.run_idx[s]
             xs, ys = self.cx[idx], self.cy[idx]
+            if self.bg is not None and s in self.bg["where"]:          # (the whole section, not only the run's cells in it)
+                w = self.bg["where"][s]
+                xs, ys = self.bg["x"][w], self.bg["y"][w]
             ok = np.isfinite(xs) & np.isfinite(ys)
             if ok.any():
                 boxes[s] = (xs[ok].min(), xs[ok].max(), ys[ok].min(), ys[ok].max())
