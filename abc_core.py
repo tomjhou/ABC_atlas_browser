@@ -1574,4 +1574,9 @@ def load_valid_section_roi_cache(section_label):
     return layout
 
 
+def section_coordinates_ready():
+    """True once the table has been read (or reading it failed, so nothing more will come)."""
+    return section_coords_state['table'] is not None or section_coords_state['error'] is not None
+
+
 CACHE_DIR.mkdir(parents=True, exist_ok=True)

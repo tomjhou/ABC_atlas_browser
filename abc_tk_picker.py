@@ -37,9 +37,10 @@ class ZoomView:
 
     MAX_SCREEN_PX_PER_PX = 40.0        # most zoomed in: one picture pixel is this many screen pixels
 
-    def __init__(self, parent):
-        self.canvas = tk.Canvas(parent, bg="black", highlightthickness=0, cursor="crosshair")
+    def __init__(self, parent, bg="black"):
+        self.canvas = tk.Canvas(parent, bg=bg, highlightthickness=0, cursor="crosshair")
         self.src = None                # H x W x 3 uint8
+        self.levels = []               # the picture and, for a big one, halved copies of it (zoomed out, a smaller one is resized: faster)
         self.scale, self.ox, self.oy = 1.0, 0.0, 0.0     # screen px per picture px; where picture pixel (0, 0) is on the canvas
         self.at_fit = True             # still the starting view: it follows the window's size
         self.photo = None
@@ -68,6 +69,10 @@ class ZoomView:
         rgb = np.ascontiguousarray(rgb[..., :3])
         same = self.src is not None and self.src.shape == rgb.shape
         self.src = rgb
+        self.levels = [rgb]
+        while self.levels[-1].shape[0] * self.levels[-1].shape[1] > 4_000_000 and min(self.levels[-1].shape[:2]) > 800:
+            last = self.levels[-1]
+            self.levels.append(cv2.resize(last, (last.shape[1] // 2, last.shape[0] // 2), interpolation=cv2.INTER_AREA))
         if not (same and keep_view):
             self.fit()
         else:
@@ -169,22 +174,31 @@ class ZoomView:
         if self.src is None:
             return
         t0 = time.perf_counter()
-        h, w = self.src.shape[:2]
         cw, ch = self.canvas_size()
         s = self.scale
-        x0, y0 = max(int(math.floor(-self.ox / s)), 0), max(int(math.floor(-self.oy / s)), 0)
-        x1, y1 = min(int(math.ceil((cw - self.ox) / s)), w), min(int(math.ceil((ch - self.oy) / s)), h)
+        # zoomed out far, a halved copy of the picture (a quarter, an eighth...) is resized instead of the whole: the cost stays small
+        k = 0 if s >= 1 else min(int(math.floor(math.log2(1.0 / s))), len(self.levels) - 1)
+        f = 2 ** k                                    # picture pixels per pixel of this level
+        lv = self.levels[k]
+        hk, wk = lv.shape[:2]
+        sk = s * f                                    # screen pixels per pixel of this level
+        x0, y0 = max(int(math.floor(-self.ox / sk)), 0), max(int(math.floor(-self.oy / sk)), 0)
+        x1, y1 = min(int(math.ceil((cw - self.ox) / sk)), wk), min(int(math.ceil((ch - self.oy) / sk)), hk)
         if x1 <= x0 or y1 <= y0:
             return
-        crop = self.src[y0:y1, x0:x1]
-        size = (max(int(round((x1 - x0) * s)), 1), max(int(round((y1 - y0) * s)), 1))
+        crop = lv[y0:y1, x0:x1]
+        size = (max(int(round((x1 - x0) * sk)), 1), max(int(round((y1 - y0) * sk)), 1))
         # zoomed out: area averaging (smooth, no shimmer); zoomed in: nearest, so each cell stays a crisp block of its own color
-        out = cv2.resize(crop, size, interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_NEAREST)
+        if k > 0:
+            interp = cv2.INTER_LINEAR if sk >= 1 else cv2.INTER_AREA
+        else:
+            interp = cv2.INTER_AREA if s < 1 else cv2.INTER_NEAREST
+        out = cv2.resize(crop, size, interpolation=interp)
         if self.post_draw is not None:
-            out = self.post_draw(out, x0, y0, s)
+            out = self.post_draw(out, x0 * f, y0 * f, s)
         self.photo = ImageTk.PhotoImage(Image.fromarray(out), master=self.canvas)
         self.canvas.itemconfig(self.item, image=self.photo)
-        self.canvas.coords(self.item, round(self.ox + x0 * s), round(self.oy + y0 * s))
+        self.canvas.coords(self.item, round(self.ox + x0 * sk), round(self.oy + y0 * sk))
         self.canvas.tag_raise("overlay")
         self.last_draw_ms = (time.perf_counter() - t0) * 1000
         for fn in self.listeners:
@@ -455,6 +469,7 @@ class SectionWindow:
         self.ensure_imputed = ensure_imputed
         self.color_scale = session_color_scale if session_color_scale is not None else {"mode": "log"}
         self.cell_type_selection = cell_type_selection
+        self.own_root = root is None
         self.root = tk.Tk() if root is None else tk.Toplevel(root)
         self.root.title(f"Section {core.sanitize_section_token(data.label)}")
         self.root.geometry("1500x950")
@@ -1104,23 +1119,29 @@ class SectionWindow:
             self.root.after_cancel(self.poll_id)
         except Exception:
             pass
-        try:
-            self.root.quit()            # (the loop ends even while other windows, matplotlib's, are alive in the same process)
-        except tk.TclError:
-            pass
+        if self.own_root:
+            try:
+                self.root.quit()        # (the loop ends even while other windows, matplotlib's, are alive in the same process)
+            except tk.TclError:
+                pass
         self.root.destroy()
         if self.on_close:
             self.on_close()
 
     def run(self):
-        self.root.mainloop()
+        if self.own_root:
+            self.root.mainloop()
+        else:
+            self.root.grab_set()
+            self.root.wait_window(self.root)         # (a child window: this returns when it is closed, the parent's loop goes on)
 
 
 # ---------------------------------------------------------------------------------------------------------------------- the browser's call
 
 def prompt_subregion_selection_tk(adata, abc_cache, section_series, section_label, existing_rois=None, on_ready=None, spatial=None,
                                   initial_view=None, cell_type_selection="All", precomputed_gene_open=None, session_color_scale=None,
-                                  shared_spatial_cache=None, imputed_state=None, session_view_settings=None, ensure_imputed=None):
+                                  shared_spatial_cache=None, imputed_state=None, session_view_settings=None, ensure_imputed=None,
+                                  parent=None):
     """The same call, and the same result, as ABC_atlas_browser.prompt_subregion_selection (the matplotlib window): the single-section ROI
     picker. Returns a list of {'action': 'add'|'edit'|'delete', ...} (empty if cancelled). The section's picture must already be cached
     (the caller makes it first, as for the matplotlib window). `ensure_imputed(imputed_state, abc_cache)`, if given, loads the imputed gene
@@ -1128,7 +1149,7 @@ def prompt_subregion_selection_tk(adata, abc_cache, section_series, section_labe
     if spatial is None:
         spatial = core.load_section_spatial_coords(adata, abc_cache)
     data = SectionData.load(adata, abc_cache, section_series, spatial, section_label)
-    win = SectionWindow(data, abc_cache, spatial=spatial, section_series=section_series, adata=adata, existing_rois=existing_rois or (),
+    win = SectionWindow(data, abc_cache, spatial=spatial, section_series=section_series, adata=adata, root=parent, existing_rois=existing_rois or (),
                         imputed_state=imputed_state, ensure_imputed=ensure_imputed, session_color_scale=session_color_scale,
                         cell_type_selection=cell_type_selection)
     try:

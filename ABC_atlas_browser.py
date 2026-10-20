@@ -405,8 +405,8 @@ from abc_core import (
     load_valid_section_roi_cache, map_data_to_pixel, map_pixel_to_data, metadata_file_status, multi_gene_rgb, parse_gene_names,
     rank_gene_suggestions, render_gene_expression_array, render_group_highlight_array, render_multi_gene_expression_array,
     render_section_level_array, resolve_gene_names, sanitize_section_token, save_coordinate_settings, scatter_gray_then_colored,
-    section_coords_lock, section_coords_state, section_level_image_cache_path, section_roi_cache_paths, section_sort_key,
-    section_z_text, sorted_sections_descending, start_section_coordinate_load,
+    section_coordinates_ready, section_coords_lock, section_coords_state, section_level_image_cache_path, section_roi_cache_paths,
+    section_sort_key, section_z_text, sorted_sections_descending, start_section_coordinate_load,
 )
 
 
@@ -544,9 +544,6 @@ load_coordinate_settings()
 
 
 
-def section_coordinates_ready():
-    """True once the table has been read (or reading it failed, so nothing more will come)."""
-    return section_coords_state['table'] is not None or section_coords_state['error'] is not None
 
 
 
@@ -609,10 +606,10 @@ def show_coordinate_settings_dialog(abc_cache):
         anchor="w", pady=(6, 0))
     ttk.Separator(frame).pack(fill=tk.X, pady=(14, 8))
     tk_var = tk.BooleanVar(dlg, bool(COORD_SETTINGS['tk_section_window']))
-    ttk.Checkbutton(frame, text="Open the single-section window as the new Tk version (experimental)", variable=tk_var).pack(anchor="w")
+    ttk.Checkbutton(frame, text="Use the new Tk section picker and section windows (experimental)", variable=tk_var).pack(anchor="w")
     ttk.Label(frame, foreground="gray35", justify=tk.LEFT, wraplength=460, text=(
-        "Smoother zoom, pan and ROI editing, with the Groups, Gene, Imputed Gene and Find group views. Takes effect the next time a "
-        "section is opened.")).pack(anchor="w", pady=(2, 0))
+        "The grid of sections and each section's ROI window: smoother zoom, pan and ROI editing, with the Groups, Gene, Imputed Gene and "
+        "Find group views. Takes effect the next time the section picker is opened.")).pack(anchor="w", pady=(2, 0))
     result = {'ok': False}
 
     def ok():
@@ -6451,6 +6448,29 @@ def prompt_section_selection_gui(adata, abc_cache, section_series, out_folder=No
     only threaded through to each single-section window's gene view, where
     it controls which type (if any) gets greyed out rather than colored by
     expression — see render_gene_expression_array's own docstring."""
+    if COORD_SETTINGS.get('tk_section_window'):
+        # the Tk version of this picker and of the single-section window (see the launcher's Settings)
+        try:
+            from abc_tk_grid import prompt_section_selection_tk
+        except Exception as e:
+            print(f"Could not load the Tk section picker ({e}); using the matplotlib one.")
+        else:
+            if imputed_state is None:
+                imputed_state = {'adata': None, 'load_thread': None, 'load_error': None}
+            outcome = prompt_section_selection_tk(adata, abc_cache, section_series, out_folder, cell_type_selection, imputed_state,
+                                                  ensure_imputed=ensure_imputed_gene_dataset_loaded)
+            if outcome[0] == 'cancelled':
+                raise UserCancelledSelection("Section picker cancelled.")
+            if outcome[0] != 'confirmed':
+                raise RuntimeError("section picker window was closed without confirming a selection")
+            _status, chosen, chosen_rois, n_sections = outcome
+            if not chosen and not chosen_rois and not confirm_whole_brain():
+                raise UserCancelledSelection("Whole-brain run not confirmed.")
+            if not chosen or len(chosen) == n_sections:
+                return None, 'allsections', chosen_rois, imputed_state['adata']
+            tokens = '-'.join(sanitize_section_token(s) for s in chosen)
+            return chosen, f'sections-{tokens}', chosen_rois, imputed_state['adata']
+
     backend = matplotlib.get_backend().lower()
     if backend in ('agg', 'pdf', 'svg', 'ps', 'template', 'cairo'):
         raise RuntimeError(f"non-interactive matplotlib backend '{backend}'")
