@@ -33,6 +33,8 @@ MAX_COLORED_CATEGORIES = 400
 LEVEL_NAMES = {"class": "Class", "subclass": "Subclass", "supertype": "Supertype", "cluster": "Cluster", "leiden": "Leiden"}
 TILE_PX = 230
 MIN_TILE_PX = 120
+HOVER_HOLD_MS = 250                # the pointer must rest this long before the plots dim
+GROUP_HOLD_MS = 500                # ...and this long before the cell's group is marked
 DOT_MM = 0.05                      # a cell's dot in the section panels: 50 um across on the tissue
 SCALEBAR_UM = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000)
 HOVER_RADIUS_PX = 9
@@ -53,6 +55,17 @@ def viridis_rgb(t):
 
 
 # ---------------------------------------------------------------------------------------------------------------------- the point canvas
+
+def stamp_plus(img, px, py, rgb, arm):
+    """A '+' (two pixels thick, `arm` pixels each way) at each point, in place. `rgb`: one color (3,) or one per point (n, 3)."""
+    h, w = img.shape[:2]
+    per_point = np.ndim(rgb) == 2
+    for k in range(-arm, arm + 1):
+        for dx, dy in ((k, 0), (k, 1), (0, k), (1, k)):
+            xx, yy = px + dx, py + dy
+            ok = (xx >= 0) & (xx < w) & (yy >= 0) & (yy < h)
+            img[yy[ok], xx[ok]] = rgb[ok] if per_point else rgb
+
 
 class PointCanvas:
     """Points drawn straight onto a Tk canvas: wheel zoom about the pointer, left- or right-drag pan, never out past the whole (`home`)
@@ -81,6 +94,13 @@ class PointCanvas:
         self.on_view = None                         # fn() after a redraw
         self.on_change = None                       # fn(zoom, dx, dy) after the user zoomed or panned (the view, relative to the whole view)
         self.pan_from = None
+        self.visible_fn = None                      # fn() -> whether this canvas is on screen; one that is not is only drawn once it is
+        self.stale = False                          # needs drawing (it was not on screen when asked)
+        self.base = None                            # the last picture of the points (H x W x 3)
+        self.dim = False                            # a veil over the points (while a cell is highlighted)
+        self.plus_arm = 3                           # the '+' marks' arm length (pixels) at the whole view
+        self.pluses = None                          # (x, y) of the red '+' marks of the highlighted group
+        self.compose_pending = None
         c = self.canvas
         c.bind("<Configure>", lambda e: self.on_resize())
         c.bind("<MouseWheel>", lambda e: self.zoom_at(e.x, e.y, 1.25 if e.delta > 0 else 0.8))
@@ -200,6 +220,10 @@ class PointCanvas:
         w, h = self.size()
         if w <= 2 or h <= 2:
             return
+        if self.visible_fn is not None and not self.visible_fn():
+            self.stale = True
+            return
+        self.stale = False
         if self.at_fit:
             self.scale = self.fit_scale()
             self.cx, self.cy = (self.home[0] + self.home[1]) / 2, (self.home[2] + self.home[3]) / 2
@@ -217,10 +241,14 @@ class PointCanvas:
             idx = np.flatnonzero(m)
             if not len(idx):
                 continue
-            px = ((x[idx] - self.cx) * self.scale + w / 2).astype(np.int32) + d
+            px = ((x[idx] - self.cx) * self.scale + w / 2).astype(np.int32)
             dy = (y[idx] - self.cy) * self.scale
-            py = ((-dy if self.flip_y else dy) + h / 2).astype(np.int32) + d
+            py = ((-dy if self.flip_y else dy) + h / 2).astype(np.int32)
             rgb = lay["rgb"][idx]
+            if lay.get("shape") == "plus":
+                stamp_plus(img, px, py, rgb, d)
+                continue
+            px, py = px + d, py + d
             # each point writes its number (later = on top) at its pixel; a bigger dot is that number grown by a maximum filter
             lab = np.zeros((h + 2 * d, w + 2 * d), np.float32)
             lab[py, px] = np.arange(1, len(idx) + 1, dtype=np.float32)
@@ -229,11 +257,55 @@ class PointCanvas:
             lab = lab[d:d + h, d:d + w]
             hit = lab > 0
             img[hit] = rgb[lab[hit].astype(np.int64) - 1]
-        self.photo = ImageTk.PhotoImage(Image.fromarray(img), master=self.canvas)
-        self.canvas.itemconfig(self.item, image=self.photo)
+        self.base = img
+        self.compose()
         self.reposition()
         if self.on_view:
             self.on_view()
+
+    def compose(self):
+        """The picture shown: the points, veiled and with the highlighted group's '+' marks when those are on."""
+        self.compose_pending = None
+        if self.base is None:
+            return
+        if self.visible_fn is not None and not self.visible_fn():
+            self.stale = True
+            return
+        img = self.base
+        if self.dim:
+            img = (img >> 1) + 127
+        elif self.pluses is not None:
+            img = img.copy()
+        if self.pluses is not None and len(self.pluses[0]):
+            h, w = img.shape[:2]
+            x, y = self.pluses
+            px = ((x - self.cx) * self.scale + w / 2).astype(np.int32)
+            dy = (y - self.cy) * self.scale
+            py = ((-dy if self.flip_y else dy) + h / 2).astype(np.int32)
+            zoom = self.scale / self.fit_scale()
+            stamp_plus(img, px, py, np.array([255, 0, 0], np.uint8), int(min(self.plus_arm + zoom ** 0.4, 14)))
+        self.photo = ImageTk.PhotoImage(Image.fromarray(np.ascontiguousarray(img)), master=self.canvas)
+        self.canvas.itemconfig(self.item, image=self.photo)
+
+    def request_compose(self):
+        if self.pending is None and self.compose_pending is None:
+            self.compose_pending = self.canvas.after_idle(self.compose)
+
+    def set_dim(self, on):
+        if on != self.dim:
+            self.dim = on
+            self.request_compose()
+
+    def set_pluses(self, xy):
+        if xy is None and self.pluses is None:
+            return
+        self.pluses = xy
+        self.request_compose()
+
+    def refresh(self):
+        """Called when this canvas may have come on screen: draw it if it was waiting."""
+        if self.stale and self.pending is None:
+            self.request_draw()
 
     # ---- items in data coordinates
 
@@ -241,9 +313,13 @@ class PointCanvas:
         item = self.canvas.create_oval(0, 0, 0, 0, outline=RING, width=2, state="hidden")
         self.markers[name] = [item, None, None, radius]
 
-    def set_marker(self, name, x, y):
+    MARKER_STYLES = {"ring": ("", "#e00000"), "mirror": ("white", "black")}      # (fill, outline): the cell under the pointer; the same cell in the other plot
+
+    def set_marker(self, name, x, y, style="ring"):
         m = self.markers[name]
         m[1], m[2] = x, y
+        fill, outline = self.MARKER_STYLES[style]
+        self.canvas.itemconfig(m[0], fill=fill, outline=outline)
         self.place_marker(m)
 
     def place_marker(self, m):
@@ -334,7 +410,8 @@ class UmapWindow:
         self.shown_dataset = "standard"
         self.values = None                 # the shown gene's value for each cell (as coloured), or None
         self.tree = None
-        self.hover_job = None
+        self.hover_job = self.group_job = None
+        self.hover_key = None
         self.load_data(adata_backed, rois)
         loading.destroy()
         self.build()
@@ -391,6 +468,7 @@ class UmapWindow:
             if all(np.isfinite(vals)):
                 self.rois.append((str(r["section"]), *vals))
         self.cache = {}
+        self.run_index = pd.Index(a.obs_names)
 
     def category_codes(self, level):
         """(codes of each run cell, uniques) of a level; and for the all-cell background (codes, uniques) over the same uniques."""
@@ -420,7 +498,7 @@ class UmapWindow:
         left = ttk.Frame(pw)
         self.tile_scroll = tk.Canvas(left, highlightthickness=0, bg="#f4f4f4")
         sb = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.tile_scroll.yview)
-        self.tile_scroll.configure(yscrollcommand=sb.set)
+        self.tile_scroll.configure(yscrollcommand=lambda a, b: (sb.set(a, b), self.root.after_idle(self.refresh_visible)))
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.tile_scroll.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.tile_frame = tk.Frame(self.tile_scroll, bg="#f4f4f4")
@@ -549,6 +627,8 @@ class UmapWindow:
             pc = PointCanvas(fr, (mx - span_x / 2, mx + span_x / 2, my - span_y / 2, my + span_y / 2), flip_y=False, width=TILE_PX, height=int(TILE_PX / self.tile_aspect))
             pc.canvas.pack()
             pc.add_marker("hover", 7)
+            pc.plus_arm = 2
+            pc.visible_fn = lambda fr=fr: self.frame_visible(fr)
             if not self.tiles:
                 pc.enable_scalebar()                       # (the first section's panel carries the scale bar)
             tile = {"label": s, "frame": fr, "pc": pc, "title": title, "token": token, "tree": None}
@@ -644,30 +724,44 @@ class UmapWindow:
         self.umap.reposition()
         self.tile_queue = list(self.tiles)
         self.tile_fn = bg_rgb_fn
-        self.tile_o = o
         if not getattr(self, "tile_job", None):
             self.tile_job = self.root.after(1, self.tile_step)
 
+    def frame_visible(self, fr):
+        """Whether a section panel is (at least partly) in the scrolled pane."""
+        top, h = fr.winfo_y(), fr.winfo_height()
+        vt, vh = self.tile_scroll.canvasy(0), self.tile_scroll.winfo_height()
+        return top + h > vt and top < vt + vh
+
+    def refresh_visible(self):
+        """Panels that were off screen when they were recolored or moved are made now that they are on screen."""
+        for t in self.tiles:
+            if t.get("dirty") and self.frame_visible(t["frame"]):
+                self.build_tile(t)
+            t["pc"].refresh()
+
     def tile_step(self):
         self.tile_job = None
-        if not self.tile_queue:
-            return
         t0 = time.perf_counter()
         while self.tile_queue and time.perf_counter() - t0 < 0.03:
             t = self.tile_queue.pop(0)
-            idx = self.run_idx[t["label"]]
-            layers = []
-            bgl = self.tile_fn(t["label"])
-            if bgl is not None:
-                layers.append({"x": bgl[0], "y": bgl[1], "rgb": bgl[2], "size_mm": DOT_MM})
-            key = self.rgb_run
-            # the run's own cells of this section, in drawing order (lowest first)
-            rank = self.rank_run
-            sel = idx[np.argsort(rank[idx], kind="stable")]
-            layers.append({"x": self.cx[sel], "y": self.cy[sel], "rgb": key[sel], "size_mm": DOT_MM})
-            t["pc"].set_layers(layers)
+            t["dirty"] = True
+            if self.frame_visible(t["frame"]):
+                self.build_tile(t)
         if self.tile_queue:
             self.tile_job = self.root.after(1, self.tile_step)
+
+    def build_tile(self, t):
+        t["dirty"] = False
+        idx = self.run_idx[t["label"]]
+        layers = []
+        bgl = self.tile_fn(t["label"])
+        if bgl is not None:
+            layers.append({"x": bgl[0], "y": bgl[1], "rgb": bgl[2], "size_mm": DOT_MM})
+        # the run's own cells of this section, in drawing order (lowest first)
+        sel = idx[np.argsort(self.rank_run[idx], kind="stable")]
+        layers.append({"x": self.cx[sel], "y": self.cy[sel], "rgb": self.rgb_run[sel], "size_mm": DOT_MM})
+        t["pc"].set_layers(layers)
 
     def color_all(self):
         level = self.level
@@ -977,49 +1071,143 @@ class UmapWindow:
 
     # ---- hover and the link between the UMAP and the section panels
 
-    def describe(self, i):
+    def level_text(self, info):
+        """The lines describing the cell under the pointer."""
         lines = []
-        if self.section_of is not None:
-            lines.append(f"Section {core.sanitize_section_token(self.section_of[i])}")
-        for k in self.levels:
-            lines.append(f"{LEVEL_NAMES[k]}: {self.info[k][i]}")
-        if self.values is not None:
+        sec = info["sec"]
+        if sec is not None:
+            lines.append(f"Section {core.sanitize_section_token(sec)}")
+        i = info["umap_idx"]
+        for k in LEVEL_NAMES:
+            if i is not None:
+                v = self.info[k][i] if self.info.get(k) is not None else None
+            else:
+                arr = self.bg["levels"].get(k) if self.bg else None
+                v = arr[info["bg_idx"]] if arr is not None else None
+            if v is not None and str(v) != "nan":
+                lines.append(f"{LEVEL_NAMES[k]}: {v}")
+        z = core.section_z_text(sec, self.abc_cache, wait=False) if sec is not None else ""
+        if z:
+            lines.append(z)
+        if i is not None and self.values is not None:
             gene, dataset, scale, vals = self.values
             lines.append(f"{gene} = {vals[i]:.3g}" if np.isfinite(vals[i]) else f"{gene} = n/a")
+        elif i is None:
+            lines.append("(not in the UMAP)")
         return "\n".join(lines)
 
-    def show_cell(self, i):
-        """Ring the cell in the UMAP and in its section panel (only that one), and describe it."""
-        if i is None:
+    def cell_info(self, i, source):
+        return {"key": ("run", i), "umap_idx": i, "bg_idx": None, "sec": self.section_of[i] if self.section_of is not None else None,
+                "x": self.cx[i] if self.cx is not None else np.nan, "y": self.cy[i] if self.cy is not None else np.nan, "source": source}
+
+    def bg_cell_info(self, sec, g):
+        """A cell of the section that is not in the run (so not in the UMAP)."""
+        return {"key": ("bg", g), "umap_idx": None, "bg_idx": g, "sec": sec, "x": self.bg["x"][g], "y": self.bg["y"][g], "source": "section"}
+
+    def show_info(self, info):
+        """Ring the cell where the pointer is, mirror it in the other plot, and describe it."""
+        if info is None:
             self.umap.set_marker("hover", None, None)
             for t in self.tiles:
                 t["pc"].set_marker("hover", None, None)
             self.var_cell.set("Hover over a cell in the UMAP or a section.")
             return
-        self.umap.set_marker("hover", *self.coords[i])
-        sec = self.section_of[i] if self.section_of is not None else None
+        src = info["source"]
+        i = info["umap_idx"]
+        if i is None:
+            self.umap.set_marker("hover", None, None)
+        else:
+            self.umap.set_marker("hover", *self.coords[i], style="ring" if src == "umap" else "mirror")
+        finite = info["x"] is not None and np.isfinite(info["x"]) and np.isfinite(info["y"])
         for t in self.tiles:
-            if t["label"] == sec and np.isfinite(self.cx[i]):
-                t["pc"].set_marker("hover", self.cx[i], self.cy[i])
+            if t["label"] == info["sec"] and finite:
+                t["pc"].set_marker("hover", info["x"], info["y"], style="ring" if src == "section" else "mirror")
             else:
                 t["pc"].set_marker("hover", None, None)
-        self.var_cell.set(self.describe(i))
+        self.var_cell.set(self.level_text(info))
 
-    def umap_motion(self, px, py):
-        if self.hover_job is not None:
-            self.root.after_cancel(self.hover_job)
-            self.hover_job = None
-        if px is None:
-            self.show_cell(None)
+    def hover(self, info):
+        """The pointer is on a cell (info) or on none (None). The ring and description are immediate; once it rests, the plots dim and, a
+        little later, the cell's group is marked with red '+' signs."""
+        if info is None:
+            self.cancel_hover_jobs()
+            self.hover_key = None
+            self.show_info(None)
+            self.clear_highlights()
             return
-        i = self.umap.nearest(self.umap_tree, px, py)
-        self.show_cell(i)
-        if i is not None and self.section_of is not None:
-            self.hover_job = self.root.after(250, lambda: self.reveal_tile(self.section_of[i]))
+        self.show_info(info)
+        if info["key"] == self.hover_key:
+            return
+        self.cancel_hover_jobs()
+        self.clear_highlights(keep_dim=True)
+        self.hover_key = info["key"]
+        self.hover_job = self.root.after(HOVER_HOLD_MS, lambda: self.hover_settled(info))
+        self.group_job = self.root.after(GROUP_HOLD_MS, lambda: self.show_group(info))
+
+    def cancel_hover_jobs(self):
+        for name in ("hover_job", "group_job"):
+            j = getattr(self, name, None)
+            if j is not None:
+                self.root.after_cancel(j)
+                setattr(self, name, None)
+
+    def hover_settled(self, info):
+        self.hover_job = None
+        self.set_dim(True)
+        if info["source"] == "umap" and info["sec"] is not None:
+            self.reveal_tile(info["sec"])
+
+    def set_dim(self, on):
+        self.umap.set_dim(on)
+        for t in self.tiles:
+            t["pc"].set_dim(on)
+
+    def clear_highlights(self, keep_dim=False):
+        if not keep_dim:
+            self.set_dim(False)
+        self.umap.set_pluses(None)
+        for t in self.tiles:
+            t["pc"].set_pluses(None)
+
+    def show_group(self, info):
+        """Red '+' signs on every cell of the hovered cell's group (at the Group level), in the UMAP and in every section."""
+        self.group_job = None
+        level = self.level
+        if self.info.get(level) is None:
+            return
+        i = info["umap_idx"]
+        if i is not None:
+            label = self.info[level][i]
+        else:
+            arr = self.bg["levels"].get(level) if self.bg else None
+            if arr is None:
+                return
+            label = arr[info["bg_idx"]]
+        if label is None or str(label) == "nan":
+            return
+        run_mask = self.info[level] == label
+        if not run_mask.any():
+            return                                   # (a group none of the run's cells is in: nothing in the UMAP to relate to)
+        if i is not None:
+            run_mask[i] = False                      # (the hovered cell keeps its own ring)
+        self.umap.set_pluses((self.coords[run_mask, 0], self.coords[run_mask, 1]))
+        barr = self.bg["levels"].get(level) if self.bg else None
+        for t in self.tiles:
+            if not self.frame_visible(t["frame"]):
+                t["pc"].pluses = None
+                continue
+            if barr is not None:
+                w = self.bg["where"][t["label"]]
+                m = barr[w] == label
+                xy = (self.bg["x"][w][m], self.bg["y"][w][m])
+            else:
+                idx = self.run_idx[t["label"]]
+                m = self.info[level][idx] == label
+                xy = (self.cx[idx][m], self.cy[idx][m])
+            t["pc"].set_pluses(xy if len(xy[0]) else None)
 
     def reveal_tile(self, label):
         """Scroll the section panels so this section's is in view."""
-        self.hover_job = None
         t = self.section_tile(label)
         if t is None:
             return
@@ -1032,19 +1220,41 @@ class UmapWindow:
         if top < view_top or top + h > view_top + view_h:
             self.tile_scroll.yview_moveto(max(0.0, (top - 10) / total))
 
+    def umap_motion(self, px, py):
+        if px is None:
+            self.hover(None)
+            return
+        i = self.umap.nearest(self.umap_tree, px, py)
+        self.hover(None if i is None else self.cell_info(i, "umap"))
+
     def tile_motion(self, tile, px, py):
         if px is None:
-            self.show_cell(None)
+            self.hover(None)
             return
-        idx = self.run_idx[tile["label"]]
         if tile["tree"] is None:
-            good = np.flatnonzero(np.isfinite(self.cx[idx]) & np.isfinite(self.cy[idx]))
-            tile["good"] = idx[good]
-            tile["tree"] = cKDTree(np.column_stack([self.cx[idx][good], self.cy[idx][good]])) if len(good) else False
+            sec = tile["label"]
+            if self.bg is not None and sec in self.bg["where"]:         # (any cell of the section, in the run or not)
+                w = self.bg["where"][sec]
+                x, y = self.bg["x"][w], self.bg["y"][w]
+                good = np.flatnonzero(np.isfinite(x) & np.isfinite(y))
+                tile["good"] = w[good]
+                tile["umap_of"] = self.run_index.get_indexer(self.bg["ids"][tile["good"]])
+                pts = np.column_stack([x[good], y[good]])
+            else:
+                idx = self.run_idx[sec]
+                good = np.flatnonzero(np.isfinite(self.cx[idx]) & np.isfinite(self.cy[idx]))
+                tile["good"] = idx[good]
+                tile["umap_of"] = tile["good"]
+                pts = np.column_stack([self.cx[idx][good], self.cy[idx][good]])
+            tile["tree"] = cKDTree(pts) if len(good) else False
         if tile["tree"] is False:
             return
         k = tile["pc"].nearest(tile["tree"], px, py)
-        self.show_cell(None if k is None else int(tile["good"][k]))
+        if k is None:
+            self.hover(None)
+            return
+        u = int(tile["umap_of"][k])
+        self.hover(self.cell_info(u, "section") if u >= 0 else self.bg_cell_info(tile["label"], int(tile["good"][k])))
 
     # ---- closing
 
