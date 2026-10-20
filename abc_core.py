@@ -63,7 +63,7 @@ DEFAULT_BREGMA_CCF_AP_MM = 5.40
 
 # (these settings are always kept in viewer_settings.json, whether or not the viewer's own settings persist; 'tk_section_window':
 # open the single-section window as the Tk version, abc_tk_picker.py, instead of the matplotlib one)
-COORD_SETTINGS = {'z_mode': 'section', 'bregma_ap_mm': DEFAULT_BREGMA_CCF_AP_MM, 'tk_section_window': False}
+COORD_SETTINGS = {'z_mode': 'section', 'bregma_ap_mm': DEFAULT_BREGMA_CCF_AP_MM, 'tk_section_window': True}
 
 
 def load_coordinate_settings():
@@ -75,7 +75,7 @@ def load_coordinate_settings():
             return
         if on_disk.get('z_mode') in dict(Z_MODE_OPTIONS):
             COORD_SETTINGS['z_mode'] = on_disk['z_mode']
-        COORD_SETTINGS['tk_section_window'] = bool(on_disk.get('tk_section_window', False))
+        COORD_SETTINGS['tk_section_window'] = bool(on_disk.get('tk_section_window', True))
         bregma = float(on_disk.get('bregma_ap_mm'))
         if 0.0 < bregma < 13.5:
             COORD_SETTINGS['bregma_ap_mm'] = bregma

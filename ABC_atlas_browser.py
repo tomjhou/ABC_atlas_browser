@@ -606,10 +606,11 @@ def show_coordinate_settings_dialog(abc_cache):
         anchor="w", pady=(6, 0))
     ttk.Separator(frame).pack(fill=tk.X, pady=(14, 8))
     tk_var = tk.BooleanVar(dlg, bool(COORD_SETTINGS['tk_section_window']))
-    ttk.Checkbutton(frame, text="Use the new Tk section picker and section windows (experimental)", variable=tk_var).pack(anchor="w")
+    ttk.Checkbutton(frame, text="Use the new Tk windows (this launch screen, the section picker and the section windows)", variable=tk_var).pack(anchor="w")
     ttk.Label(frame, foreground="gray35", justify=tk.LEFT, wraplength=460, text=(
-        "The grid of sections and each section's ROI window: smoother zoom, pan and ROI editing, with the Groups, Gene, Imputed Gene and "
-        "Find group views. Takes effect the next time the section picker is opened.")).pack(anchor="w", pady=(2, 0))
+        "Smoother zoom, pan and ROI editing, with the Groups, Gene, Imputed Gene and Find group views. Untick to use the older "
+        "matplotlib windows. Takes effect the next time each window is opened (this launch screen: the next time the app starts).")).pack(
+        anchor="w", pady=(2, 0))
     result = {'ok': False}
 
     def ok():
@@ -6112,8 +6113,26 @@ def prompt_startup_panel(out_folder):
     resolve_out_folder's own "cancelled -> exit" behavior for this same
     startup phase, rather than falling through into a pipeline with no
     selection made)."""
-    RADIO_OPTIONS = ('Neurons', 'NonNeurons', 'All')
     start_section_coordinate_load(abc_cache)   # (the table of sections' z values, read in the background for the windows to come)
+    if COORD_SETTINGS.get('tk_section_window'):
+        # the Tk version of this screen (see Settings); the functions it needs from this file are handed to it
+        try:
+            from abc_tk_launcher import prompt_startup_panel_tk
+        except Exception as e:
+            print(f"Could not load the Tk launch screen ({e}); using the matplotlib one.")
+        else:
+            outcome = prompt_startup_panel_tk(out_folder, abc_cache, {
+                'load_recent_output_folders': load_recent_output_folders,
+                'remember_recent_output_folder': remember_recent_output_folder,
+                'required_cached_run_files': required_cached_run_files,
+                'open_3d_viewer': open_3d_viewer_launcher,
+                'settings_dialog': show_coordinate_settings_dialog,
+            })
+            if outcome is None:
+                print("No selection made; exiting.")
+                sys.exit(0)
+            return outcome
+    RADIO_OPTIONS = ('Neurons', 'NonNeurons', 'All')
 
     fig = plt.figure(figsize=compute_figsize_for_screen_height(1.55, height_frac=0.5, default=(10, 6)))
     normalize_tk_scaling(fig)
