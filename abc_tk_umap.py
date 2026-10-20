@@ -27,6 +27,10 @@ from scipy.spatial import cKDTree
 import abc_core as core
 
 GREY = np.array([205, 205, 205], np.uint8)
+MULTI_BG = (26, 26, 26)           # the plots' background in the multi-gene view (a zero-expression cell is black, so it must not melt into it)
+MAX_GENES = 6                      # the first three are red / green / blue circles; the next three the same colors as small dots on top
+CHANNEL_HEX = ("#e53935", "#43a047", "#4a6cff", "#e53935", "#43a047", "#4a6cff")
+CHANNEL_NAMES = ("red", "green", "blue", "red", "green", "blue")
 LIGHT_GREY = np.array([222, 222, 222], np.uint8)
 RING = "#ff1493"
 MAX_COLORED_CATEGORIES = 400
@@ -98,6 +102,7 @@ class PointCanvas:
         self.stale = False                          # needs drawing (it was not on screen when asked)
         self.base = None                            # the last picture of the points (H x W x 3)
         self.dim = False                            # a veil over the points (while a cell is highlighted)
+        self.bgcolor = (255, 255, 255)
         self.plus_arm = 3                           # the '+' marks' arm length (pixels) at the whole view
         self.pluses = None                          # (x, y) of the red '+' marks of the highlighted group
         self.compose_pending = None
@@ -228,7 +233,8 @@ class PointCanvas:
             self.scale = self.fit_scale()
             self.cx, self.cy = (self.home[0] + self.home[1]) / 2, (self.home[2] + self.home[3]) / 2
         zoom = self.scale / self.fit_scale()
-        img = np.full((h, w, 3), 255, np.uint8)
+        img = np.empty((h, w, 3), np.uint8)
+        img[:] = self.bgcolor
         hw, hh = w / (2 * self.scale), h / (2 * self.scale)
         for lay in self.layers:
             if "size_mm" in lay:                                              # (a size on the tissue: the same at any window size)
@@ -273,7 +279,7 @@ class PointCanvas:
             return
         img = self.base
         if self.dim:
-            img = (img >> 1) + 127
+            img = (img >> 1) + (np.array(self.bgcolor, np.uint8) >> 1)
         elif self.pluses is not None:
             img = img.copy()
         if self.pluses is not None and len(self.pluses[0]):
@@ -290,6 +296,15 @@ class PointCanvas:
     def request_compose(self):
         if self.pending is None and self.compose_pending is None:
             self.compose_pending = self.canvas.after_idle(self.compose)
+
+    def set_background(self, rgb):
+        if tuple(rgb) != tuple(self.bgcolor):
+            self.bgcolor = tuple(rgb)
+            self.canvas.config(bg="#%02x%02x%02x" % self.bgcolor)
+            if self.scalebar:                                   # (white on a dark background)
+                ink = "white" if sum(self.bgcolor) < 300 else "black"
+                self.canvas.itemconfig(self.scalebar[0], fill=ink)
+                self.canvas.itemconfig(self.scalebar[1], fill=ink)
 
     def set_dim(self, on):
         if on != self.dim:
@@ -411,6 +426,9 @@ class UmapWindow:
         self.values = None                 # the shown gene's value for each cell (as coloured), or None
         self.tree = None
         self.hover_job = self.group_job = None
+        self.gene_cache = None             # ((genes, imputed, scale), values read) of the genes shown, so a legend click re-uses them
+        self.hidden = set()                # the genes switched off by a legend click
+        self.multi_rows = None
         self.hover_key = None
         self.load_data(adata_backed, rois)
         loading.destroy()
@@ -556,7 +574,8 @@ class UmapWindow:
         e.bind("<Return>", lambda ev: self.recolor())
         self.id_entry = e
         # the gene box
-        self.gene_frame = ttk.LabelFrame(self.box, text="Gene", padding=6)
+        self.gene_frame = ttk.LabelFrame(self.box, text="Gene(s)", padding=6)
+        ttk.Label(self.gene_frame, text="Up to six, separated by commas: the first three red / green / blue circles, the next three the same as small dots:", foreground="gray30", wraplength=300).pack(anchor="w")
         self.var_gene = tk.StringVar(f, "")
         self.gene_entry = ttk.Entry(self.gene_frame, textvariable=self.var_gene)
         self.gene_entry.pack(fill=tk.X)
@@ -575,6 +594,7 @@ class UmapWindow:
         self.cbar = tk.Canvas(self.gene_frame, width=300, height=70, highlightthickness=0)
         self.cbar.pack(fill=tk.X, pady=(6, 0))
         self.cbar_photo = None
+        self.cbar.bind("<Button-1>", self.on_legend_click)
         # the legend for Single group(s)
         self.legend = tk.Canvas(f, width=300, height=10, highlightthickness=0)
         hov = ttk.LabelFrame(f, text="Under the pointer", padding=6)
@@ -712,12 +732,16 @@ class UmapWindow:
         else:
             self.color_gene()
 
-    def apply(self, rgb_run, order_run, bg_rgb_fn, labels=None):
+    def apply(self, rgb_run, order_run, bg_rgb_fn, labels=None, extra_umap_layers=(), dark=False):
         """Show the colouring. `rgb_run`: (n, 3) colour of each run cell; `order_run`: the order to draw them in (lowest first);
         `bg_rgb_fn(section label)` -> (x, y, rgb) of the section panel's background cells, or None."""
         self.rgb_run = rgb_run
         o = order_run
-        self.umap.set_layers([{"x": self.coords[o, 0], "y": self.coords[o, 1], "rgb": rgb_run[o], "size": 4}])
+        bgc = MULTI_BG if dark else (255, 255, 255)
+        self.umap.set_background(bgc)
+        for t in self.tiles:
+            t["pc"].set_background(bgc)
+        self.umap.set_layers([{"x": self.coords[o, 0], "y": self.coords[o, 1], "rgb": rgb_run[o], "size": 4}] + list(extra_umap_layers))
         self.umap.clear_labels()
         for text, x, y, color in labels or []:
             self.umap.add_label(text, x, y, color)
@@ -883,7 +907,7 @@ class UmapWindow:
         self.gene_entry.config(foreground="")
         if e.keysym in ("Return", "Up", "Down", "Escape", "Tab"):
             return
-        token = self.var_gene.get().strip()
+        token = self.var_gene.get().rsplit(",", 1)[-1].strip()
         matches = core.rank_gene_suggestions(self.symbols(), token, 6) if token else []
         self.sugg.delete(0, tk.END)
         for m in matches:
@@ -905,40 +929,65 @@ class UmapWindow:
         sel = self.sugg.curselection()
         if not sel:
             return
-        self.var_gene.set(self.sugg.get(sel[0]))
+        text = self.var_gene.get()
+        prefix = text.rsplit(",", 1)[0].strip() + ", " if "," in text else ""
+        self.var_gene.set(prefix + self.sugg.get(sel[0]))
         self.sugg.pack_forget()
         self.gene_entry.focus_set()
         self.recolor()
 
     def color_gene(self):
         self.sugg.pack_forget()
-        name = self.var_gene.get().strip()
-        if not name:
+        text = self.var_gene.get().strip()
+        names = core.parse_gene_names(text)
+        if not names:
             self.cbar.delete("all")
             self.var_status.set("Enter a gene name.")
             self.color_all_quiet()
+            return
+        if len(names) > MAX_GENES:
+            self.var_status.set(f"Enter at most {MAX_GENES} gene names, separated by commas.")
             return
         imputed = self.mode == "imputed"
         if not imputed and not self.has_counts:
             self.var_status.set("No raw counts on this dataset (layers['counts'] missing).")
             return
         source = self.imputed_state["adata"] if imputed else self.adata
-        _cols, resolved, missing = core.resolve_gene_names(source, [name])
+        _cols, resolved, missing = core.resolve_gene_names(source, names)
         if missing:
             self.gene_entry.config(foreground="red")
-            self.var_status.set(f"'{name}' not found in the {'imputed' if imputed else 'standard'} dataset.")
+            self.var_status.set(f"Not found in the {'imputed' if imputed else 'standard'} dataset: {', '.join(missing)}.")
             return
-        gene = resolved[0]
-        self.var_gene.set(gene)
+        self.gene_entry.config(foreground="")
+        self.var_gene.set(", ".join(resolved))
         scale = self.var_scale.get()
+        key = (tuple(resolved), imputed, scale)
+        if self.gene_cache is not None and self.gene_cache[0] == key:                   # (a legend click, or the same genes again)
+            self.show_genes(resolved, imputed, scale, self.gene_cache[1])
+            return
         adata = self.adata
         backed = self.adata_backed if self.bg else None
         bg_ids = self.bg["ids"] if self.bg else None
 
-        def work():
-            return read_values(), read_background()
+        def read_values(gene):
+            col = core.find_gene_index(source, gene)
+            if imputed:
+                full = core._get_full_gene_column(source, col)
+                pos = source.obs_names.get_indexer(adata.obs_names)
+                vals = np.full(adata.n_obs, np.nan)
+                found = pos >= 0
+                vals[found] = full[pos[found]]
+                if scale == "linear":
+                    vals = np.exp2(vals) - 1.0
+            else:
+                expr = adata.layers["counts"][:, col]
+                expr = expr.toarray() if hasattr(expr, "toarray") else expr
+                vals = np.asarray(expr).ravel().astype(float)
+                if scale == "log":
+                    vals = np.log1p(vals)
+            return vals
 
-        def read_background():
+        def read_background(gene):
             """The gene's value in every cell of the sections (the whole unfiltered dataset), or None if it can't be had."""
             if backed is None:
                 return None
@@ -958,31 +1007,18 @@ class UmapWindow:
                 print(f"Could not read {gene} for the cells outside the selection: {e}", flush=True)
                 return None
 
-        def read_values():
-            col = core.find_gene_index(source, gene)
-            if imputed:
-                full = core._get_full_gene_column(source, col)
-                pos = source.obs_names.get_indexer(adata.obs_names)
-                vals = np.full(adata.n_obs, np.nan)
-                found = pos >= 0
-                vals[found] = full[pos[found]]
-                if scale == "linear":
-                    vals = np.exp2(vals) - 1.0
-            else:
-                expr = adata.layers["counts"][:, col]
-                expr = expr.toarray() if hasattr(expr, "toarray") else expr
-                vals = np.asarray(expr).ravel().astype(float)
-                if scale == "log":
-                    vals = np.log1p(vals)
-            return vals
+        def work():
+            return [(read_values(g), read_background(g)) for g in resolved]
 
         def done(res):
             if isinstance(res, BaseException):
-                self.var_status.set(f"Could not read {gene}: {res}")
+                self.var_status.set(f"Could not read {', '.join(resolved)}: {res}")
                 return
-            self.show_values(gene, "imputed" if imputed else "standard", scale, res[0], res[1])
+            self.gene_cache = (key, res)
+            self.hidden = set()                    # (a different query: every gene shown again)
+            self.show_genes(resolved, imputed, scale, res)
 
-        self.job(f"Reading {gene}...", work, done)
+        self.job(f"Reading {', '.join(resolved)}...", work, done)
 
     def color_all_quiet(self):
         mode = self.mode
@@ -990,9 +1026,17 @@ class UmapWindow:
         self.color_all()
         self.mode = mode
 
-    def show_values(self, gene, dataset, scale, vals, bg_vals=None):
-        if (self.mode == "imputed") != (dataset == "imputed") or self.mode not in ("gene", "imputed"):
+    def show_genes(self, genes, imputed, scale, per_gene):
+        dataset = "imputed" if imputed else "standard"
+        if self.mode not in ("gene", "imputed") or (self.mode == "imputed") != imputed:
             return
+        self.values = [(g, pv[0]) for g, pv in zip(genes, per_gene)]
+        if len(genes) == 1:
+            self.show_single(genes[0], dataset, scale, per_gene[0][0], per_gene[0][1])
+        else:
+            self.show_multi(genes, dataset, scale, per_gene)
+
+    def show_single(self, gene, dataset, scale, vals, bg_vals):
         fin = np.isfinite(vals)
         vmin, vmax = (float(np.nanmin(vals)), float(np.nanmax(vals))) if fin.any() else (0.0, 1.0)
         t = (vals - vmin) / (vmax - vmin) if vmax > vmin else np.zeros_like(vals)
@@ -1018,9 +1062,93 @@ class UmapWindow:
             return self.bg["x"][w][o], self.bg["y"][w][o], col[o]
 
         self.apply(rgb, order, bg_fn)
-        self.values = (gene, dataset, scale, vals)
         self.draw_colorbar(vmin, vmax, scale, dataset)
-        self.var_status.set(f"Showing {gene}{' [imputed]' if dataset == 'imputed' else ''} (every cell of the sections, colored on the selection's scale)." if bg_vals is not None else "(cells outside this run's selection are gray).")
+        self.var_status.set(f"Showing {gene}{' [imputed]' if dataset == 'imputed' else ''} (every cell of the sections, colored on the selection's scale)."
+                            if bg_vals is not None else "(cells outside this run's selection are gray).")
+
+    # ---- several genes: red / green / blue circles for the first three, the same three colors as small dots on top for the next three
+
+    def show_multi(self, genes, dataset, scale, per_gene):
+        n = len(genes)
+        norm = []
+        for vals, _bg in per_gene:
+            fin = np.isfinite(vals)
+            lo, hi = (float(np.nanmin(vals)), float(np.nanmax(vals))) if fin.any() else (0.0, 1.0)
+            norm.append((np.clip((vals - lo) / (hi - lo), 0, 1) if hi > lo else np.zeros_like(vals), lo, hi))
+        hidden = self.hidden
+        zero = np.zeros(self.n)
+        runn = [zero if i in hidden else norm[i][0] for i in range(n)]
+        intensity = lambda arrs: np.maximum.reduce([np.nan_to_num(a, nan=0.0) for a in arrs])
+        circ = runn[:3]
+        rgb = (core.multi_gene_rgb(circ, (0.0, 0.0, 0.0)) * 255).astype(np.uint8)
+        order = np.argsort(intensity(circ), kind="stable")                      # (the most expressing on top)
+        self.rank_run = np.argsort(order, kind="stable").astype(np.int64)
+        extra = []
+        if n > 3:
+            dots = runn[3:6]
+            inten = intensity(dots)
+            vis = np.flatnonzero(inten > 0)
+            vis = vis[np.argsort(inten[vis], kind="stable")]
+            drgb = (core.multi_gene_rgb([d[vis] for d in dots], (0.0, 0.0, 0.0)) * 255).astype(np.uint8)
+            extra = [{"x": self.coords[vis, 0], "y": self.coords[vis, 1], "rgb": drgb, "size": 2}]
+
+        def bg_fn(label):
+            if not self.bg:
+                return None
+            w = self.bg["where"].get(label)
+            if w is None:
+                return None
+            chans = []
+            for i in range(min(n, 3)):
+                bgv = per_gene[i][1]
+                if i in hidden or bgv is None:
+                    chans.append(np.zeros(len(w)))
+                    continue
+                lo, hi = norm[i][1], norm[i][2]
+                v = bgv[w]
+                chans.append(np.clip((np.nan_to_num(v, nan=lo) - lo) / (hi - lo), 0, 1) if hi > lo else np.zeros(len(w)))
+            col = (core.multi_gene_rgb(chans, (0.0, 0.0, 0.0)) * 255).astype(np.uint8)
+            o = np.argsort(intensity(chans), kind="stable")
+            return self.bg["x"][w][o], self.bg["y"][w][o], col[o]
+
+        self.apply(rgb, order, bg_fn, extra_umap_layers=extra, dark=True)
+        to_log2 = 1.0 if dataset == "imputed" or scale == "linear" else float(np.log2(np.e))
+        self.draw_multi_legend(genes, [(v[1] * to_log2, v[2] * to_log2) for v in norm], scale)
+        parts = " and ".join(f"'{g}' ({CHANNEL_NAMES[i]})" for i, g in enumerate(genes))
+        self.var_status.set(f"Showing {parts}{' [imputed]' if dataset == 'imputed' else ''}."
+                            + (f" Hidden: {', '.join(genes[i] for i in sorted(hidden))}." if hidden else ""))
+
+    def draw_multi_legend(self, genes, ranges, scale):
+        c = self.cbar
+        c.delete("all")
+        self.cbar_photo = None
+        row = 44
+        c.config(height=8 + row * len(genes) + 22)
+        for i, (g, (lo, hi)) in enumerate(zip(genes, ranges)):
+            y = 8 + row * i
+            off = i in self.hidden
+            color = "#999999" if off else CHANNEL_HEX[i]
+            r = 6 if i < 3 else 3                                  # (genes 4-6 are the small dots)
+            if off:
+                c.create_oval(18 - r, y + 11 - r, 18 + r, y + 11 + r, outline="#999999")
+            else:
+                c.create_oval(18 - r, y + 11 - r, 18 + r, y + 11 + r, fill=color, outline="")
+            c.create_text(34, y + 2, anchor="nw", text=g, fill=color, font=("Segoe UI", 10, "bold"), tags=f"row{i}")
+            c.create_text(34, y + 22, anchor="nw", text="hidden" if off else f"{'' if scale == 'linear' else 'log2: '}{lo:.1f}–{hi:.1f}",
+                          fill="#666666", font=("Segoe UI", 8))
+        c.create_text(150, 8 + row * len(genes) + 2, anchor="n", text="click a gene to hide / show it", fill="#888888", font=("Segoe UI", 8, "italic"))
+        self.multi_rows = (8, row, len(genes))
+
+    def on_legend_click(self, e):
+        if self.mode not in ("gene", "imputed") or self.multi_rows is None or self.gene_cache is None:
+            return
+        top, row, n = self.multi_rows
+        i = int((e.y - top) // row)
+        if not 0 <= i < n or len(self.gene_cache[0][0]) < 2 or self.busy:
+            return
+        self.hidden.symmetric_difference_update({i})
+        key = self.gene_cache[0]
+        self.show_genes(list(key[0]), key[1], key[2], self.gene_cache[1])
 
     def draw_colorbar(self, vmin, vmax, scale, dataset):
         c = self.cbar
@@ -1090,8 +1218,8 @@ class UmapWindow:
         if z:
             lines.append(z)
         if i is not None and self.values is not None:
-            gene, dataset, scale, vals = self.values
-            lines.append(f"{gene} = {vals[i]:.3g}" if np.isfinite(vals[i]) else f"{gene} = n/a")
+            for gene, vals in self.values:
+                lines.append(f"{gene} = {vals[i]:.3g}" if np.isfinite(vals[i]) else f"{gene} = n/a")
         elif i is None:
             lines.append("(not in the UMAP)")
         return "\n".join(lines)
