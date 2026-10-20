@@ -61,7 +61,9 @@ Z_MODE_OPTIONS = (
 DEFAULT_BREGMA_CCF_AP_MM = 5.40
 
 
-COORD_SETTINGS = {'z_mode': 'section', 'bregma_ap_mm': DEFAULT_BREGMA_CCF_AP_MM}
+# (these settings are always kept in viewer_settings.json, whether or not the viewer's own settings persist; 'tk_section_window':
+# open the single-section window as the Tk version, abc_tk_picker.py, instead of the matplotlib one)
+COORD_SETTINGS = {'z_mode': 'section', 'bregma_ap_mm': DEFAULT_BREGMA_CCF_AP_MM, 'tk_section_window': False}
 
 
 def load_coordinate_settings():
@@ -73,6 +75,7 @@ def load_coordinate_settings():
             return
         if on_disk.get('z_mode') in dict(Z_MODE_OPTIONS):
             COORD_SETTINGS['z_mode'] = on_disk['z_mode']
+        COORD_SETTINGS['tk_section_window'] = bool(on_disk.get('tk_section_window', False))
         bregma = float(on_disk.get('bregma_ap_mm'))
         if 0.0 < bregma < 13.5:
             COORD_SETTINGS['bregma_ap_mm'] = bregma
@@ -92,6 +95,7 @@ def save_coordinate_settings():
         pass
     on_disk['z_mode'] = COORD_SETTINGS['z_mode']
     on_disk['bregma_ap_mm'] = COORD_SETTINGS['bregma_ap_mm']
+    on_disk['tk_section_window'] = bool(COORD_SETTINGS['tk_section_window'])
     try:
         SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:

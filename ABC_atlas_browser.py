@@ -517,7 +517,8 @@ def save_viewer_settings(settings):
     swallowed rather than surfaced — failing to persist a preference isn't
     worth interrupting the session over."""
     to_write = {'persist_settings': bool(settings.get('persist_settings', False)),
-                'z_mode': COORD_SETTINGS['z_mode'], 'bregma_ap_mm': COORD_SETTINGS['bregma_ap_mm']}   # (always kept: see COORD_SETTINGS)
+                'z_mode': COORD_SETTINGS['z_mode'], 'bregma_ap_mm': COORD_SETTINGS['bregma_ap_mm'],
+                'tk_section_window': bool(COORD_SETTINGS['tk_section_window'])}   # (always kept: see COORD_SETTINGS)
     if to_write['persist_settings']:
         to_write['hover_enabled'] = bool(settings.get('hover_enabled', True))
         to_write['gene456_shape'] = settings.get('gene456_shape', GENE456_SHAPE_DEFAULT)
@@ -606,6 +607,12 @@ def show_coordinate_settings_dialog(abc_cache):
         "position of the registration you rely on (for example Chon et al. 2019). The CCF options need the CCF coordinate files "
         "(a one-time download).")).pack(
         anchor="w", pady=(6, 0))
+    ttk.Separator(frame).pack(fill=tk.X, pady=(14, 8))
+    tk_var = tk.BooleanVar(dlg, bool(COORD_SETTINGS['tk_section_window']))
+    ttk.Checkbutton(frame, text="Open the single-section window as the new Tk version (experimental)", variable=tk_var).pack(anchor="w")
+    ttk.Label(frame, foreground="gray35", justify=tk.LEFT, wraplength=460, text=(
+        "Smoother zoom, pan and ROI editing, with the Groups, Gene, Imputed Gene and Find group views. Takes effect the next time a "
+        "section is opened.")).pack(anchor="w", pady=(2, 0))
     result = {'ok': False}
 
     def ok():
@@ -636,6 +643,7 @@ def show_coordinate_settings_dialog(abc_cache):
                 mode = 'section'
             COORD_SETTINGS['z_mode'] = mode
             COORD_SETTINGS['bregma_ap_mm'] = result['bregma']
+            COORD_SETTINGS['tk_section_window'] = bool(tk_var.get())
             save_coordinate_settings()
             start_section_coordinate_load(abc_cache)
     finally:
@@ -6897,8 +6905,16 @@ def prompt_section_selection_gui(adata, abc_cache, section_series, out_folder=No
             (i, (roi['x_min'], roi['x_max'], roi['y_min'], roi['y_max']))
             for i, roi in enumerate(rois) if roi['section'] == section
         ]
+        picker, picker_extra = prompt_subregion_selection, {}
+        if COORD_SETTINGS.get('tk_section_window'):
+            # the Tk version (see the launcher's Settings); the imputed dataset is loaded by this file's own loader
+            try:
+                from abc_tk_picker import prompt_subregion_selection_tk as picker
+                picker_extra = {'ensure_imputed': ensure_imputed_gene_dataset_loaded}
+            except Exception as e:
+                print(f"Could not load the Tk section window ({e}); using the matplotlib one.")
         try:
-            actions = prompt_subregion_selection(
+            actions = picker(
                 adata, abc_cache, section_series, section,
                 existing_rois=existing_rois,
                 on_ready=close_processing_dialog,
@@ -6919,6 +6935,7 @@ def prompt_section_selection_gui(adata, abc_cache, section_series, out_folder=No
                 # radio can load it on demand and switch independently of
                 # whatever's currently selected back on the grid.
                 imputed_state=imputed_state,
+                **picker_extra,
             )
         except Exception as e:
             close_processing_dialog()
