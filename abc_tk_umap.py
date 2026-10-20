@@ -389,7 +389,7 @@ class UmapWindow:
     # ---- the window
 
     def build(self):
-        pw = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        self.pw = pw = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         pw.pack(fill=tk.BOTH, expand=True)
         # the section panels
         left = ttk.Frame(pw)
@@ -421,6 +421,16 @@ class UmapWindow:
         self.build_side(side)
         pw.add(side, weight=0)
         self.build_tiles()
+        self.root.after(400, self.fit_left_pane)
+
+    def fit_left_pane(self):
+        """Once, at the start: the section pane is only as wide as its panels (the rest of the window goes to the UMAP)."""
+        if not self.tiles or not self.root.winfo_viewable():
+            return
+        self.layout_tiles()
+        want = self.tile_cols * (self.tile_px + 16) + 24
+        if want < self.pw.winfo_width() * 0.7:
+            self.pw.sashpos(0, want)
 
     def build_side(self, f):
         ttk.Label(f, text="Color by", font=("Segoe UI", 13, "bold")).pack(anchor="w")
@@ -499,7 +509,9 @@ class UmapWindow:
             ok = np.isfinite(xs) & np.isfinite(ys)
             if ok.any():
                 boxes[s] = (xs[ok].min(), xs[ok].max(), ys[ok].min(), ys[ok].max())
-        span = max(max(b[1] - b[0], b[3] - b[2]) for b in boxes.values()) * 1.06 or 1.0
+        span_x = max(b[1] - b[0] for b in boxes.values()) * 1.04 or 1.0          # (one size for every panel, so they share a scale)
+        span_y = max(b[3] - b[2] for b in boxes.values()) * 1.04 or 1.0
+        self.tile_aspect = span_x / span_y
         for s in self.sections:
             if s not in boxes:
                 continue
@@ -509,7 +521,7 @@ class UmapWindow:
             token = core.sanitize_section_token(s)
             title = tk.StringVar(fr, token)
             tk.Label(fr, textvariable=title, bg="#f4f4f4", font=("Segoe UI", 9, "bold")).pack(anchor="w")
-            pc = PointCanvas(fr, (mx - span / 2, mx + span / 2, my - span / 2, my + span / 2), flip_y=False, width=TILE_PX, height=TILE_PX)
+            pc = PointCanvas(fr, (mx - span_x / 2, mx + span_x / 2, my - span_y / 2, my + span_y / 2), flip_y=False, width=TILE_PX, height=int(TILE_PX / self.tile_aspect))
             pc.canvas.pack()
             pc.add_marker("hover", 7)
             tile = {"label": s, "frame": fr, "pc": pc, "title": title, "token": token, "tree": None}
@@ -528,19 +540,19 @@ class UmapWindow:
         if not getattr(self, "tiles", None):
             return
         w, h = max(self.tile_scroll.winfo_width(), 100), max(self.tile_scroll.winfo_height(), 100)
-        n, title = len(self.tiles), 26
+        n, title = len(self.tiles), 36
         best = (0, 1)
         for cols in range(1, n + 1):
             rows = -(-n // cols)
-            size = min((w - 6) // cols - 8, (h - 4) // rows - title - 4)
+            size = min((w - 6) // cols - 8, ((h - 4) // rows - title - 4) * self.tile_aspect)       # (the panel's width)
             if size > best[0]:
                 best = (size, cols)
-        px, cols = max(best[0], MIN_TILE_PX), best[1]
+        px, cols = int(max(best[0], MIN_TILE_PX)), best[1]
         if cols == self.tile_cols and px == self.tile_px:
             return
         self.tile_cols, self.tile_px = cols, px
         for k, t in enumerate(self.tiles):
-            t["pc"].canvas.config(width=px, height=px)
+            t["pc"].canvas.config(width=px, height=int(px / self.tile_aspect))
             t["frame"].grid(row=k // cols, column=k % cols, padx=4, pady=3, sticky="nw")
 
     def link_tiles(self, source, zoom, dx, dy):
@@ -598,7 +610,7 @@ class UmapWindow:
         `bg_rgb_fn(section label)` -> (x, y, rgb) of the section panel's background cells, or None."""
         self.rgb_run = rgb_run
         o = order_run
-        self.umap.set_layers([{"x": self.coords[o, 0], "y": self.coords[o, 1], "rgb": rgb_run[o], "size": 2}])
+        self.umap.set_layers([{"x": self.coords[o, 0], "y": self.coords[o, 1], "rgb": rgb_run[o], "size": 4}])
         self.umap.clear_labels()
         for text, x, y in labels or []:
             self.umap.add_label(text, x, y)
@@ -620,12 +632,12 @@ class UmapWindow:
             layers = []
             bgl = self.tile_fn(t["label"])
             if bgl is not None:
-                layers.append({"x": bgl[0], "y": bgl[1], "rgb": bgl[2], "size": 1})
+                layers.append({"x": bgl[0], "y": bgl[1], "rgb": bgl[2], "size": 2})
             key = self.rgb_run
             # the run's own cells of this section, in drawing order (lowest first)
             rank = self.rank_run
             sel = idx[np.argsort(rank[idx], kind="stable")]
-            layers.append({"x": self.cx[sel], "y": self.cy[sel], "rgb": key[sel], "size": 1})
+            layers.append({"x": self.cx[sel], "y": self.cy[sel], "rgb": key[sel], "size": 2})
             t["pc"].set_layers(layers)
         if self.tile_queue:
             self.tile_job = self.root.after(1, self.tile_step)
