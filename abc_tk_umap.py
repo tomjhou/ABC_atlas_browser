@@ -18,6 +18,7 @@ import time
 import tkinter as tk
 from tkinter import ttk
 
+import cv2
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageTk
@@ -31,6 +32,7 @@ RING = "#ff1493"
 MAX_COLORED_CATEGORIES = 400
 LEVEL_NAMES = {"class": "Class", "subclass": "Subclass", "supertype": "Supertype", "cluster": "Cluster", "leiden": "Leiden"}
 TILE_PX = 230
+MIN_TILE_PX = 120
 HOVER_RADIUS_PX = 9
 SCALE_UNITS = {("standard", "log"): "log1p(expr)", ("standard", "linear"): "expr (raw counts)",
                ("imputed", "log"): "log2 (imputed)", ("imputed", "linear"): "linear (imputed)"}
@@ -202,26 +204,25 @@ class PointCanvas:
         img = np.full((h, w, 3), 255, np.uint8)
         hw, hh = w / (2 * self.scale), h / (2 * self.scale)
         for lay in self.layers:
-            d = max(1, int(round(lay["size"] * zoom ** 0.4)))
-            pad = d
+            d = int(min(max(round(lay["size"] * zoom ** 0.7), 1), 40))          # (the dots grow as the view is zoomed in)
             x, y = lay["x"], lay["y"]
-            m = (x >= self.cx - hw - pad / self.scale) & (x <= self.cx + hw + pad / self.scale) & (y >= self.cy - hh - pad / self.scale) & (y <= self.cy + hh + pad / self.scale)
+            pm = d / self.scale
+            m = (x >= self.cx - hw - pm) & (x <= self.cx + hw + pm) & (y >= self.cy - hh - pm) & (y <= self.cy + hh + pm)
             idx = np.flatnonzero(m)
             if not len(idx):
                 continue
-            px = ((x[idx] - self.cx) * self.scale + w / 2).astype(np.int32)
+            px = ((x[idx] - self.cx) * self.scale + w / 2).astype(np.int32) + d
             dy = (y[idx] - self.cy) * self.scale
-            py = ((-dy if self.flip_y else dy) + h / 2).astype(np.int32)
+            py = ((-dy if self.flip_y else dy) + h / 2).astype(np.int32) + d
             rgb = lay["rgb"][idx]
-            lo, hi = -(d // 2), d - d // 2
-            r2 = (d / 2.0) ** 2
-            for oy in range(lo, hi):
-                for ox in range(lo, hi):
-                    if d >= 3 and ((ox - (lo + hi - 1) / 2.0) ** 2 + (oy - (lo + hi - 1) / 2.0) ** 2) > r2 + 0.25:
-                        continue
-                    xx, yy = px + ox, py + oy
-                    ok = (xx >= 0) & (xx < w) & (yy >= 0) & (yy < h)
-                    img[yy[ok], xx[ok]] = rgb[ok]
+            # each point writes its number (later = on top) at its pixel; a bigger dot is that number grown by a maximum filter
+            lab = np.zeros((h + 2 * d, w + 2 * d), np.float32)
+            lab[py, px] = np.arange(1, len(idx) + 1, dtype=np.float32)
+            if d > 1:
+                lab = cv2.dilate(lab, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d)))
+            lab = lab[d:d + h, d:d + w]
+            hit = lab > 0
+            img[hit] = rgb[lab[hit].astype(np.int64) - 1]
         self.photo = ImageTk.PhotoImage(Image.fromarray(img), master=self.canvas)
         self.canvas.itemconfig(self.item, image=self.photo)
         self.reposition()
@@ -519,11 +520,19 @@ class UmapWindow:
         self.layout_tiles()
 
     def layout_tiles(self):
+        """The panels are as big as they can be while all fitting in the pane (columns chosen for the biggest); if the pane is too
+        small for that to be readable they keep a minimum size and the pane scrolls."""
         if not getattr(self, "tiles", None):
             return
-        w = max(self.tile_scroll.winfo_width(), TILE_PX)
-        cols = max(1, w // (TILE_PX + 10))
-        px = max((w - 8) // cols - 8, 60)               # (the panels fill the pane's width)
+        w, h = max(self.tile_scroll.winfo_width(), 100), max(self.tile_scroll.winfo_height(), 100)
+        n, title = len(self.tiles), 26
+        best = (0, 1)
+        for cols in range(1, n + 1):
+            rows = -(-n // cols)
+            size = min((w - 6) // cols - 8, (h - 4) // rows - title - 4)
+            if size > best[0]:
+                best = (size, cols)
+        px, cols = max(best[0], MIN_TILE_PX), best[1]
         if cols == self.tile_cols and px == self.tile_px:
             return
         self.tile_cols, self.tile_px = cols, px
