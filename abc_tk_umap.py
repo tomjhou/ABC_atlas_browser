@@ -521,6 +521,11 @@ class UmapWindow(ExportsMixin):
             cid = core.extract_leading_numeric_id(pd.Series(self.info["class"])).to_numpy()
             frac = float(np.isin(cid, list(core.NON_NEURON_CLASS_IDS)).mean())
             self.bg_under = "nonneuron" if frac < 0.5 else "neuron"           # (the minority kind is drawn underneath)
+        # ...unless the run says which cell type it was made for: the launch screen's choice is in the run folder's name
+        name = Path(self.run_folder).name.lower() if self.run_folder is not None else ""
+        for prefix, under in (("umap_neurons_", "nonneuron"), ("umap_nonneurons_", "neuron"), ("umap_all_", None)):
+            if name.startswith(prefix):
+                self.bg_under = under
 
     def category_codes(self, level):
         """(codes of each run cell, uniques) of a level; and for the all-cell background (codes, uniques) over the same uniques."""
