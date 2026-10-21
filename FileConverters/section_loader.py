@@ -348,6 +348,7 @@ class SectionLoader:
         self.frames[n].pack(fill=tk.BOTH, expand=True)
         self.btn_back.config(state="normal" if n else "disabled")
         self.btn_next.config(text="Done: open in the alignment tool" if n == 2 else "Next")
+        self.update_next_button()
         self.var_help.set(("Choose the slide scans (.czi) and section images (.jp2) that hold your sections, or one .jpx stack on its own.",
                            "Set the threshold so that each section is tinted and debris is not, then accept the outlines.",
                            "Drag the pictures into the order of the sections along the brain.")[n])
@@ -444,6 +445,12 @@ class SectionLoader:
         self.need_images.append(close_button)
         return f
 
+    def update_next_button(self):
+        """On the first tab, Next is greyed out while the files in the list are still being read (their scenes, sizes and pixel sizes are what the
+        next tabs go by)."""
+        waiting = self.stage == 0 and not getattr(self, "infos_failed", False) and any(s.path not in self.infos for s in self.project.slides)
+        self.btn_next.state(["disabled"] if waiting else ["!disabled"])
+
     def refresh_slide_list(self):
         for button in getattr(self, "need_images", ()):          # (greyed while no image is in the list)
             button.state(["!disabled"] if self.project.slides else ["disabled"])
@@ -455,6 +462,7 @@ class SectionLoader:
                 s.path, (f"{info.scenes} sections" if sp.is_jpx(s.path) else info.scenes) if info else "counting...",
                 human_size(info.size_bytes) if info else "determining...",     # (until the file has been read)
                 (f"{px:g}" if px else "unknown") if info else ""))
+        self.update_next_button()
 
     def read_infos(self):
         todo = [s.path for s in self.project.slides if s.path not in self.infos]
@@ -462,6 +470,8 @@ class SectionLoader:
         if not todo:
             return
         self.var_status.set("Reading the files...")
+        self.infos_failed = False
+        self.update_next_button()
 
         def work():
             return [(p, sp.slide_info(p)) for p in todo]
@@ -470,6 +480,8 @@ class SectionLoader:
             if isinstance(res, BaseException):
                 messagebox.showerror("Can't read the slides", f"{type(res).__name__}: {res}", parent=self.root)
                 self.var_status.set("")
+                self.infos_failed = True                  # (Next must not stay grey for ever: the list can be corrected)
+                self.update_next_button()
                 return
             for p, info in res:
                 self.infos[p] = info
