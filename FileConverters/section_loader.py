@@ -386,6 +386,7 @@ class SectionLoader:
     def go_next(self):
         if self.busy:
             return
+        ns.foreground_active(4.0)        # (the click is answered first: the background locating and picture-making wait for a moment)
         if self.stage == 0:
             if not self.project.slides:
                 messagebox.showinfo("No slides", "Add at least one .czi slide scan or .jp2 section image first.", parent=self.root)
