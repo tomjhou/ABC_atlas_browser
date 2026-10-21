@@ -62,6 +62,9 @@ REQUIRED_PACKAGES = {"numpy": "numpy", "h5py": "h5py", "imagecodecs": "imagecode
 CZI_PACKAGES = {"czifile": "czifile"}   # the Zeiss .czi reader, installed only when a stack needs it
 
 
+PREVIEW_MAX_PX = 2500   # longest side of the cached preview of each section (the alignment tool's; the loader makes them ahead of it)
+
+
 def lower_thread_priority():
     """Make the calling thread yield to the rest of the program (Windows: below-normal priority), so that long background work
     does not make the window sluggish. No effect elsewhere."""
@@ -932,6 +935,40 @@ def czi_slide_thumbnail(path, max_px=300, colors=None):
         hi_c = max(float(np.percentile(v[v > 0], 99.5)) if (v > 0).any() else 1.0, 1.0)
         rgb += (np.clip(v / hi_c, 0, 1) ** 0.6)[:, :, None] * (np.array(colors[c % len(colors)], np.float32) / 255)
     return gray, (gx0, gy0, k), (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
+
+
+def render_czi_previews(stack, sections, scenes, lock, on_done=None, stop=None, workers=6):
+    """Make the previews of .czi sections (the scene each lies in, once per scene, into the dict `scenes`, guarded by `lock`), the slide scans in
+    parallel: a scan is read by one thread at a time (see _czi_lock_for), so one thread per scan, up to `workers` scans at once, each doing
+    that scan's sections in the order given. on_done(section, preview or None, error or None) is called as each is ready (from the threads);
+    `stop`, an Event, ends the work early."""
+    by_path = {}
+    for s in sections:
+        by_path.setdefault(s.source_path, []).append(s)
+
+    def one_scan(group):
+        for s in group:
+            if stop is not None and stop.is_set():
+                return
+            try:
+                key = (s.source_path, czi_scene_of(s, stack))
+                with lock:
+                    pv = scenes.get(key)
+                if pv is None:
+                    pv = czi_preview(s, stack, PREVIEW_MAX_PX)
+                    with lock:
+                        pv = scenes.setdefault(key, pv)
+            except Exception as e:
+                if on_done is not None:
+                    on_done(s, None, e)
+                continue
+            if on_done is not None:
+                on_done(s, pv, None)
+
+    if not by_path:
+        return
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(by_path))), initializer=lower_thread_priority) as pool:
+        list(pool.map(one_scan, by_path.values()))
 
 
 def czi_preview(section, stack, max_px):

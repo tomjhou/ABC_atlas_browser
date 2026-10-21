@@ -2037,9 +2037,10 @@ class SectionLoader:
         alignment tool picks it up from stack.prelocate (waits for what is left, and shows the sections as they are located)."""
         if getattr(stack, "prelocate", None) is not None or getattr(self, "reusing", False):
             return                                   # (coming back from the alignment tool, which keeps its own located stack: nothing to do)
-        if not any(s.source_path.lower().endswith(".czi") and s.czi_origin is None for s in stack.sections):
+        if not any(s.source_path.lower().endswith(".czi") for s in stack.sections):
             return
-        pre = {"done": threading.Event(), "problems": {}, "located": [], "text": "", "thumbs": {}}
+        pre = {"done": threading.Event(), "calibrated": threading.Event(), "problems": {}, "located": [], "text": "", "thumbs": {},
+               "scenes": {}, "lock": threading.Lock(), "stop": threading.Event(), "frames": None}
         stack.prelocate = pre
 
         def work():
@@ -2052,11 +2053,22 @@ class SectionLoader:
                 except Exception:
                     pass                                 # (the picture is only a convenience)
             try:
-                problems = ns.calibrate_stack_czi(stack, progress=lambda i, n, text: pre.__setitem__("text", text),
-                                                  on_located=pre["located"].append)
-                pre["problems"] = {k: v for k, v in problems.items() if v}
+                if any(s.source_path.lower().endswith(".czi") and s.czi_origin is None for s in stack.sections):
+                    problems = ns.calibrate_stack_czi(stack, progress=lambda i, n, text: pre.__setitem__("text", text),
+                                                      on_located=pre["located"].append)
+                    pre["problems"] = {k: v for k, v in problems.items() if v}
             except BaseException as e:               # (a failed install of the reader library, for one)
                 pre["problems"] = {"the .czi scans": str(e) or type(e).__name__}
+            pre["calibrated"].set()
+            # then the sections' pictures (the scene of each, as the alignment tool shows them), in the order chosen so far: the alignment
+            # tool takes them from here instead of reading them from the scans itself
+            try:
+                by_frame = {s.frame: s for s in stack.sections}
+                ordered = [by_frame[f] for f in (pre["frames"] or []) if f in by_frame] or list(stack.sections)
+                todo = [s for s in ordered if s.source_path.lower().endswith(".czi") and s.czi_origin is not None]
+                ns.render_czi_previews(stack, todo, pre["scenes"], pre["lock"], stop=pre["stop"])      # (the scans in parallel)
+            except BaseException:
+                pass
             pre["done"].set()
 
         threading.Thread(target=work, daemon=True).start()
@@ -2066,6 +2078,9 @@ class SectionLoader:
         proj, stack = self.project, self.jpx_stack
         self.jpx_by_frame = {s.frame: s for s in stack.sections}
         order = [f for f in proj.jpx_order if f in self.jpx_by_frame]
+        pre = getattr(stack, "prelocate", None)
+        if pre is not None:
+            pre["frames"] = list(order) or None      # (the pictures are made ahead in this order: see start_prelocate)
         named = set(order)
         order += [s.frame for s in stack.sections if s.frame not in named]
         self.order = [(0, f) for f in order]

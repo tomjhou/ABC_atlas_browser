@@ -86,7 +86,8 @@ def histogram_percentile(h, q):
     return lo + frac * (hi - lo)
 
 
-PREVIEW_MAX_PX = 2500   # longest side of the cached preview of each section
+PREVIEW_WORKERS = 6   # slide scans whose sections' pictures are made at the same time
+PREVIEW_MAX_PX = ns.PREVIEW_MAX_PX   # longest side of the cached preview of each section
 THUMB_MAX_PX = 1600     # longest side of the slide thumbnail as it is built (it is scaled to the left pane's width when shown)
 CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
                          "JhouLab", "jpx_aligner_cache")
@@ -1055,7 +1056,10 @@ class Aligner:
         else:
             thumbs_done.set()
 
-        posted, lock, czi_scenes = set(), threading.Lock(), {}
+        # (the previews the loader made ahead of time, while the order was being chosen, are used as they are: see start_prelocate)
+        posted = set()
+        lock = early["lock"] if early is not None else threading.Lock()
+        czi_scenes = early["scenes"] if early is not None else {}
 
         def post(s, pv, is_frame):
             """Hand a section's picture to the window (once), which shows it and un-greys the section."""
@@ -1148,7 +1152,7 @@ class Aligner:
                 seen = 0
                 n_czi = sum(1 for s in todo if s.source_path.lower().endswith(".czi"))
                 while True:
-                    finished = pre["done"].wait(0.3)
+                    finished = pre["calibrated"].wait(0.3)
                     if self.stack is not stack:
                         return
                     while seen < len(pre["located"]):
@@ -1171,6 +1175,25 @@ class Aligner:
                 self.msgs.put(("czi_ready", (stack, {k: v for k, v in problems.items() if v})))
             if verify_wanted:         # (also for a stack made from a saved alignment: a position still unchecked there is checked now)
                 start_verify()
+            # the .czi sections' pictures: the slide scans in parallel (the sections of one scan one after the other: a scan is read by one thread at
+            # a time), those the loader made ahead of time being used as they are
+            czi_todo = [s for s in todo if s.renderable and s.source_path.lower().endswith(".czi") and s.frame not in posted]
+            if czi_todo:
+                if early is not None:
+                    early["stop"].set()                  # (this takes over from the loader's thread)
+                stop_now = threading.Event()
+
+                def got(s, pv, err):
+                    if self.stack is not stack:
+                        stop_now.set()
+                        return
+                    if err is not None:
+                        self.msgs.put(("status", f"Couldn't read section {s.index + 1}: {err}"))
+                        return
+                    self.msgs.put(("status", f"Loading section {s.index + 1} of {len(stack.sections)}..."))
+                    post(s, pv, False)
+
+                ns.render_czi_previews(stack, czi_todo, czi_scenes, lock, on_done=got, stop=stop_now, workers=PREVIEW_WORKERS)
             for s in todo:
                 if self.stack is not stack:
                     return
