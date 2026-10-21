@@ -2827,6 +2827,9 @@ class Aligner:
         xml_on = tk.BooleanVar(tab, False)
         ttk.Checkbutton(row4, text="Outlines in reconstruction.xml (dash-dot lines; stack coordinates, where the sections pile up)",
                         variable=xml_on).pack(side=tk.LEFT)
+        arrow_on = tk.BooleanVar(tab, True)
+        ttk.Checkbutton(row4, text="Arrows: move to the previous section",
+                        variable=arrow_on).pack(side=tk.LEFT, padx=16)
         canvas = tk.Canvas(right, bg="white", highlightthickness=1, highlightbackground="gray70")
         canvas.pack(fill=tk.BOTH, expand=True, pady=4)
         readout = tk.StringVar(tab, "")
@@ -2871,6 +2874,21 @@ class Aligner:
             pxs = st.source_pixel_um or st.pixel_um
             P = np.asarray(sec.saved_points, float)
             return np.column_stack([(P[:, 0] / st.pixel_um + sec.czi_origin[0]) * pxs, (-P[:, 1] / st.pixel_um + sec.czi_origin[1]) * pxs])
+
+        def shift_to_previous(sec, centroid):
+            """How far (dx, dy in um, in the raw case-file coordinates) the section's centroid moves when the section is moved onto the
+            previous one of the stack. NeuroInfo stores each section's alignment relative to the one before it, so this is the alignment
+            step of that section; it is the translation exactly when there is no rotation between them (with one, the movement of the
+            centroid is what is shown: a translation by itself depends on where the rotation is taken about). None for the first section.
+            Both sections' base transforms (case file to stack) are used: the movement is D = G_prev^-1 . G_this."""
+            if sec.index <= 0 or sec.index >= len(st.sections):
+                return None
+            prev = st.sections[sec.index - 1]
+            if prev is sec or prev.R is None or sec.R is None:
+                return None
+            c = np.asarray(centroid, float)
+            moved = np.asarray(prev.R, float).T @ (np.asarray(sec.R, float) @ c + np.asarray(sec.t, float) - np.asarray(prev.t, float))
+            return float(moved[0] - c[0]), float(moved[1] - c[1])
 
         def redraw(_event=None):
             canvas.delete("all")
@@ -2964,6 +2982,14 @@ class Aligner:
                     cx, cy = self.polygon_centroid(p)
                     canvas.create_text(*to_canvas(cx, cy), text=label, fill=color, font=("Segoe UI", size, "bold"))
                     state["items"].append((s, k, p, kind))
+                    if kind == "raw" and arrow_on.get():
+                        d = shift_to_previous(s, (cx, cy))
+                        if d is not None and np.hypot(*d) > 1.0:
+                            ax, ay = to_canvas(cx, cy)
+                            ay += 17                                   # (just below the number, so that the two do not overlap)
+                            bx = ax + d[0] * scale
+                            by = ay + (d[1] * scale if y_down.get() else -d[1] * scale)
+                            canvas.create_line(ax, ay, bx, by, fill=color, width=2, arrow=tk.LAST, arrowshape=(11, 13, 4))
 
         def motion(event):
             v = state["view"]
@@ -2976,6 +3002,10 @@ class Aligner:
             for s, k, p, kind in state["items"]:
                 if cv2.pointPolygonTest(p.astype(np.float32).reshape(-1, 1, 2), (float(x), float(y)), False) >= 0:
                     hit = f"   | inside the {kind} outline of section {s.index + 1} of the stack"
+                    if kind == "raw" and arrow_on.get():
+                        d = shift_to_previous(s, self.polygon_centroid(p))
+                        if d is not None:
+                            hit += f"   | onto section {s.index}: dX = {d[0]:+.1f}, dY = {d[1]:+.1f} um (length {np.hypot(*d):.1f} um)"
                     break
             readout.set(f"X = {x:.1f} um, Y = {y:.1f} um{hit}")
 
@@ -3012,7 +3042,7 @@ class Aligner:
         canvas.bind("<ButtonPress-1>", press)
         canvas.bind("<B1-Motion>", move)
         canvas.bind("<Double-Button-1>", lambda e: (state.update(zoom=None), redraw()))
-        for var in (y_down, raw_on, rec_on, scene_on, stage_on, xml_on):
+        for var in (y_down, raw_on, rec_on, scene_on, stage_on, xml_on, arrow_on):
             var.trace_add("write", lambda *_: redraw())
         lb.selection_set(1 if len(names) > 1 else 0)
         tab.redraw = redraw
