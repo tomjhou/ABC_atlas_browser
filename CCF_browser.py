@@ -2224,8 +2224,9 @@ class CCFBrowser:
                 self.settings_status.set("Busy loading; try again when it finishes.")
                 return False
             if (self.edit_version != self.saved_version or self.overlay_count) and not messagebox.askyesno(
-                    "Painted changes", "Switching atlas discards the painted overlay and the applied edits "
-                    "(they are not saved anywhere). Continue?", parent=window):
+                    "Painted changes", "Switching atlas discards the applied edits (they are not saved anywhere). The painted red "
+                    "overlay is kept if the new atlas has the same size and resolution as this one, and discarded if it has not. "
+                    "Continue?", parent=window):
                 return False
             self.atlas_path = wanted
             if wanted:
@@ -2368,7 +2369,13 @@ class CCFBrowser:
         self.update_comparison_mode()
         self.label_ids = (self.region_table['region_id'].to_numpy()
                           if self.region_table is not None and 'region_id' in self.region_table else None)
-        self.overlay, self.overlay_count, self.edit_count, self.undo_stack = None, 0, 0, []
+        # The painted (red) overlay belongs to positions, not to an atlas: an atlas of the same size and resolution keeps it. The edits
+        # already applied were made in the old volume, so they and their undo steps go with it.
+        keep_overlay = (self.overlay is not None and self.overlay.shape == tuple(VOLUME_SHAPE)
+                        and previous == (tuple(VOLUME_SHAPE), VOXEL_UM))
+        if not keep_overlay:
+            self.overlay, self.overlay_count = None, 0
+        self.edit_count, self.undo_stack = 0, []
         self.edit_version = self.saved_version = 0
         self.value_cache, self.stroke = None, None
         self.set_tool('none')
