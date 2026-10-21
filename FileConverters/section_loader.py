@@ -515,6 +515,22 @@ class SectionLoader:
                                     "to an empty list (use \"Close project\" first), and add scans only to a project that has none.",
                                     parent=self.root)
                 return
+        if len(paths) == 1 and sp.is_jpx(paths[0]) and not self.project.slides:
+            # a project of this JPX may exist already (saved when it was loaded before, with its order and alignment): open it, or start afresh
+            existing = sp.projects_for_jpx(paths[0])
+            if existing:
+                when = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(existing[0])))
+                more = (f"\n\n({len(existing) - 1} other project(s) of this JPX are in the same folder.)" if len(existing) > 1 else "")
+                answer = messagebox.askyesnocancel(
+                    "A project of this JPX exists",
+                    f"{os.path.basename(paths[0])} already has a project here:\n\n{os.path.basename(existing[0])}  (saved {when}){more}\n\n"
+                    f"Yes: open that project, with its order and alignment.\n"
+                    f"No: start a new project of this JPX (as another file).\nCancel: do not add it.", parent=self.root)
+                if answer is None:
+                    return
+                if answer:
+                    self.open_project(existing[0])
+                    return
         same = lambda a, b: os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
         folder = folder or os.path.dirname(os.path.abspath(paths[0]))
         refused = [p for p in paths if not same(os.path.dirname(os.path.abspath(p)), folder)]

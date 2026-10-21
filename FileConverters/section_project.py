@@ -622,6 +622,33 @@ class Project:
         return os.path.join(os.path.dirname(os.path.abspath(first)), os.path.splitext(os.path.basename(first))[0] + PROJECT_SUFFIX)
 
 
+def projects_for_jpx(jpx_path):
+    """The project files beside a JPX that are about it, most recently saved first. A project is named after its first image, so they are
+    <name>_project.json, <name>_2_project.json ... for <name>.jpx (only those are read: a folder may hold many big project files)."""
+    folder = os.path.dirname(os.path.abspath(jpx_path))
+    stem = os.path.splitext(os.path.basename(jpx_path))[0]
+    found = []
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return []
+    same = lambda a, b: os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+    for name in names:
+        if not name.endswith(PROJECT_SUFFIX):
+            continue
+        rest = name[:-len(PROJECT_SUFFIX)]
+        if rest != stem and not (rest.startswith(stem + "_") and rest[len(stem) + 1:].isdigit()):
+            continue
+        path = os.path.join(folder, name)
+        try:
+            proj = Project.load(path)
+        except Exception:
+            continue
+        if proj.is_jpx and same(proj.jpx_path, jpx_path):
+            found.append((os.path.getmtime(path), path))
+    return [p for _, p in sorted(found, reverse=True)]
+
+
 ##################################################
 #
 #    From a project to a stack
