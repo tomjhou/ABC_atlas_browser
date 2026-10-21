@@ -1189,16 +1189,22 @@ class _Frame:
         self.layout = None
         self.partial = source is not None and j2k_partial is not None
 
-    def _stream(self, keep_res=None, skip=None, window=None):
-        """The codestream to decode: a reduced one when the file can give that, else the whole frame."""
+    def _stream(self, keep_res=None, skip=None, window=None, truncate=True):
+        """The codestream to decode: a reduced one when the file can give that, else the whole frame. For a reduced picture (`skip`, no window)
+        and `truncate` (the default) the stream stops after the resolutions that are wanted: only their packet lengths are read from the file,
+        about a quarter of what the whole layout takes, and the decoder, asked for no more than those resolutions, accepts it."""
         if self.partial:
             try:
                 path, box = self.source
                 with open(path, "rb") as f:
-                    if self.layout is None:
-                        self.layout = j2k_partial.parse_layout(f, box.payload_offset, box.payload_length)
-                    keep = self.layout.levels - skip if skip is not None else -1
-                    return j2k_partial.build(f, box.payload_offset, self.layout, keep, window)
+                    if self.layout is not None:
+                        lay = self.layout
+                    elif truncate and skip is not None and window is None:
+                        lay = j2k_partial.parse_layout(f, box.payload_offset, box.payload_length, reduce=skip)   # (not kept: a window needs it all)
+                    else:
+                        lay = self.layout = j2k_partial.parse_layout(f, box.payload_offset, box.payload_length)
+                    keep = lay.levels - skip if skip is not None else -1
+                    return j2k_partial.build(f, box.payload_offset, lay, keep, window)
             except (j2k_partial.Unsupported, KeyError):
                 self.partial = False
         if self.data is None:
@@ -1209,7 +1215,10 @@ class _Frame:
 
     def reduced_mean(self, skip):
         """The frame at 1/2**skip, averaged over its channels (float32)."""
-        img = imagecodecs.jpeg2k_decode(self._stream(skip=skip), skipres=skip)
+        try:
+            img = imagecodecs.jpeg2k_decode(self._stream(skip=skip), skipres=skip)
+        except Exception:                                  # (the decoder did not take the short stream: the whole layout, as before)
+            img = imagecodecs.jpeg2k_decode(self._stream(skip=skip, truncate=False), skipres=skip)
         return img.astype(np.float32).mean(2) if img.ndim == 3 else img.astype(np.float32)
 
     def window_mean(self, win):

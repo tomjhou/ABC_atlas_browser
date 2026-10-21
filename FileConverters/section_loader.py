@@ -107,7 +107,10 @@ def jpx_crop(stack, path, frame, section, target_px=256):
     frame_obj = ns._Frame(source=(path, jpx_frame_boxes(path)[frame]))
     for k in range(skip, -1, -1):                  # (as reduced as the file allows, up to what the thumbnail needs)
         try:
-            img = imagecodecs.jpeg2k_decode(frame_obj._stream(skip=k), skipres=k)
+            try:
+                img = imagecodecs.jpeg2k_decode(frame_obj._stream(skip=k), skipres=k)
+            except Exception:                              # (the decoder did not take the short stream: the whole layout, as before)
+                img = imagecodecs.jpeg2k_decode(frame_obj._stream(skip=k, truncate=False), skipres=k)
             break
         except Exception:
             if k == 0:

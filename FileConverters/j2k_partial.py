@@ -29,8 +29,11 @@ class Layout:
     """The structure of one codestream: its main header, and for each tile-part (resolution) its header and packet lengths."""
 
 
-def parse_layout(f, off, length):
-    """Read the main header and the tile-part headers (which hold the packet lengths) of the codestream at f[off:off + length]."""
+def parse_layout(f, off, length, reduce=None):
+    """Read the main header and the tile-part headers (which hold the packet lengths) of the codestream at f[off:off + length]. With `reduce`
+    (the number of resolutions dropped, as the decoder's skipres), only the tile-parts of the resolutions kept are read: the layout is then
+    partial (L.partial), build() makes a stream that simply stops after them (a decoder asked for no more than those resolutions takes it),
+    and the packet lengths of the big high-resolution tile-parts, most of what the whole layout reads, are not read."""
     def rd(o, n):
         f.seek(off + o)
         return f.read(n)
@@ -69,7 +72,9 @@ def parse_layout(f, off, length):
         if L.layers != 1 or L.prog not in (1, 2) or len(L.pp) != L.levels + 1:
             raise Unsupported("needs one layer and resolution progression")
         L.tps, pos = [], L.main_end
-        while pos < length - 2:
+        L.partial = reduce is not None
+        wanted = max(L.levels - reduce, 0) + 1 if L.partial else L.levels + 1      # (how many tile-parts: one per resolution, lowest first)
+        while pos < length - 2 and len(L.tps) < wanted:
             sot = rd(pos, 12)
             if _u16(sot, 0) != 0xFF90:
                 raise Unsupported("tile-part not found")
@@ -103,7 +108,7 @@ def parse_layout(f, off, length):
                 raise Unsupported("packet lengths missing or not adding up")
             L.tps.append(dict(sot=sot, header_other=b"".join(other), data_start=data_start, lens=lens))
             pos += psot
-        if len(L.tps) != L.levels + 1:
+        if len(L.tps) != wanted:
             raise Unsupported("not one tile-part per resolution")
         for r, tp in enumerate(L.tps):
             nx, ny = _grid(L, r)
@@ -126,6 +131,8 @@ def build(f, off, layout, keep_res, window=None, pad=1, gap=1 << 18):
     precincts that cover window = (u0, v0, w, h) at full resolution, plus `pad` precincts around them (the wavelet filters
     reach over the window's border). Ranges of the file less than `gap` bytes apart are read together."""
     L = layout
+    if getattr(L, "partial", False) and window is not None:
+        raise Unsupported("a partial layout holds the low resolutions only")
     plan, ranges = [], []
     for r, tp in enumerate(L.tps):
         px, py = 2 ** L.pp[r][0], 2 ** L.pp[r][1]
