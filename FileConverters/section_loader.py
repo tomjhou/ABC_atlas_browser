@@ -2016,11 +2016,18 @@ class SectionLoader:
             return                                   # (coming back from the alignment tool, which keeps its own located stack: nothing to do)
         if not any(s.source_path.lower().endswith(".czi") and s.czi_origin is None for s in stack.sections):
             return
-        pre = {"done": threading.Event(), "problems": {}, "located": [], "text": ""}
+        pre = {"done": threading.Event(), "problems": {}, "located": [], "text": "", "thumbs": {}}
         stack.prelocate = pre
 
         def work():
             ns.lower_thread_priority()
+            # the slide scans' overview pictures first (a few seconds): the alignment tool shows them above its list the moment it opens,
+            # instead of waiting behind the locating, which keeps each scan busy
+            for path in sorted({s.source_path for s in stack.sections if s.source_path.lower().endswith(".czi")}):
+                try:
+                    pre["thumbs"][path] = ns.czi_slide_thumbnail(path, 1600)
+                except Exception:
+                    pass                                 # (the picture is only a convenience)
             try:
                 problems = ns.calibrate_stack_czi(stack, progress=lambda i, n, text: pre.__setitem__("text", text),
                                                   on_located=pre["located"].append)

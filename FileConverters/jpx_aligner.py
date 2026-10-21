@@ -1033,19 +1033,27 @@ class Aligner:
         todo.sort(key=lambda s: abs(s.index - self.cur))
 
         czi_paths = sorted({s.source_path for s in todo if s.source_path.lower().endswith(".czi")})
+        early = getattr(stack, "prelocate", None)         # (the loader may have made some of the pictures already: see start_prelocate)
+        thumbs_done = threading.Event()
         if czi_paths:
             max_px = THUMB_MAX_PX   # (large; the picture is scaled to the left pane's width as it is drawn)
 
             def thumbs():
                 ns.lower_thread_priority()
-                for path in czi_paths:
-                    try:
-                        img, geometry = ns.czi_slide_thumbnail(path, max_px)
-                    except Exception:
-                        continue   # (the picture is only a convenience)
-                    self.msgs.put(("thumb", (stack, path, img, geometry)))
+                try:
+                    for path in czi_paths:
+                        try:
+                            made = early["thumbs"].get(path) if early is not None else None
+                            img, geometry = made if made is not None else ns.czi_slide_thumbnail(path, max_px)
+                        except Exception:
+                            continue   # (the picture is only a convenience)
+                        self.msgs.put(("thumb", (stack, path, img, geometry)))
+                finally:
+                    thumbs_done.set()
 
             threading.Thread(target=thumbs, daemon=True).start()
+        else:
+            thumbs_done.set()
 
         posted, lock, czi_scenes = set(), threading.Lock(), {}
 
@@ -1126,13 +1134,19 @@ class Aligner:
 
         def work():
             ns.lower_thread_priority()   # (the window stays responsive while the images load)
+            # a slide scan can be read by one thread at a time, and locating, checking and loading its sections keeps it busy for minutes: the
+            # overview pictures above the list (a few seconds in all) go first, or they would not appear until those are done with the scan
+            self.msgs.put(("status", "Preparing for load: reading the slide scans' overview pictures..."))
+            thumbs_done.wait(30)
             frame_boxes = None
             pre = getattr(stack, "prelocate", None)
             if pre is not None:
                 # the loader (step 3) started locating the sections while the order was being chosen: wait for what is left, showing the
                 # sections as they are located
                 stack.prelocate = None
+                self.msgs.put(("status", "Preparing for load: locating the sections on the slide scans (started while you ordered them)..."))
                 seen = 0
+                n_czi = sum(1 for s in todo if s.source_path.lower().endswith(".czi"))
                 while True:
                     finished = pre["done"].wait(0.3)
                     if self.stack is not stack:
@@ -1142,8 +1156,8 @@ class Aligner:
                         seen += 1
                     if finished:
                         break
-                    if pre["text"]:
-                        self.msgs.put(("status", pre["text"]))
+                    self.msgs.put(("status", "Preparing for load: locating the sections on the slide scans (started while you ordered them)... "
+                                   f"{seen} of {n_czi} located" + ("\n" + pre["text"] if pre["text"] else "")))
                 self.msgs.put(("czi_ready", (stack, dict(pre["problems"]))))
             elif any(s.source_path.lower().endswith(".czi") and s.czi_origin is None for s in todo):
                 self.msgs.put(("status", "Preparing for load: starting the Zeiss .czi reader (installed first if it is missing)..."))
