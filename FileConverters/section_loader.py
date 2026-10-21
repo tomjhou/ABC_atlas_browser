@@ -1066,10 +1066,17 @@ class SectionLoader:
 
     def write_project(self, proj):
         """Save the project (to its own file, or a new one) and note it in the list of recent projects."""
+        created = not self.project.path                  # (a project's file is made the first time it is saved)
         path = self.save_path()
         proj.save(path)
         sp.add_recent_project(path)
         self.update_title()
+        if created:
+            messagebox.showinfo(
+                "Project file created",
+                f"A project file was made for this work:\n\n{path}\n\nIt keeps the outlines, the order and the alignment, so that you "
+                f"can come back to them: open it later with \"Open a saved project\" or \"Open recent projects\", or add the same JPX again "
+                f"and choose to open its project.", parent=self.root)
 
     def save_path(self):
         """Where the project is saved: the file it was opened from, else a new name that doesn't take the place of another project's
