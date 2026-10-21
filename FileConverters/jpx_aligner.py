@@ -190,6 +190,27 @@ def clear_recent():
     save_settings(recent=[])
 
 
+def decode_frame_reduced(jpx_path, frame_box, max_px):
+    """(picture, full width, full height) of a JPX frame decoded at 1/2**k, k as large as keeps its longer side at least `max_px`: only
+    that part of the file is read (a few percent of the frame; see j2k_partial), not the whole frame. A codestream that is not laid out
+    for it (or a decoder that does not take the short stream) is read in full, as before."""
+    with open(jpx_path, "rb") as f:
+        w, h, _nc = ns.codestream_size(f, frame_box)
+    k = int(max(0, min(6, math.floor(math.log2(max(h, w) / max_px))))) if max(h, w) > max_px else 0
+    frame = ns._Frame(source=(jpx_path, frame_box))
+    for skip in range(k, -1, -1):
+        try:
+            try:
+                img = imagecodecs.jpeg2k_decode(frame._stream(skip=skip), skipres=skip)
+            except Exception:                              # (the decoder did not take the short stream: the whole layout)
+                img = imagecodecs.jpeg2k_decode(frame._stream(skip=skip, truncate=False), skipres=skip)
+            return img, w, h
+        except Exception:
+            if skip == 0:
+                raise
+    raise RuntimeError("unreachable")
+
+
 def load_frame_preview(jpx_path, frame_box, index):
     """Downsampled copy of one frame of the JPX itself (the same kind of tuple as load_preview), cached on disk. Used for
     sections whose source image this tool cannot read: the frame is already on the stack canvas, so it is shown as it is."""
@@ -202,13 +223,17 @@ def load_frame_preview(jpx_path, frame_box, index):
                 return d["img"], float(d["kx"]), float(d["ky"])
         except Exception:
             pass  # rebuild a damaged cache file
-    with open(jpx_path, "rb") as f:
-        full = imagecodecs.jpeg2k_decode(ns.read_payload(f, frame_box))
+    # (decoded already reduced, 1/2**k with the longer side still at least PREVIEW_MAX_PX, so that the first picture of a big stack does
+    # not wait for the whole frame to be read and decoded; w, h are the frame's full size)
+    t_decode = time.time()
+    full, w, h = decode_frame_reduced(jpx_path, frame_box, PREVIEW_MAX_PX)
+    print(f"[aligner load] frame {index + 1} of the JPX decoded at {full.shape[1]} x {full.shape[0]} (frame {w} x {h}) in "
+          f"{time.time() - t_decode:.1f} s", flush=True)
     if full.ndim == 2:
         full = full[..., None]
-    h, w = full.shape[:2]
-    k = max(1, math.ceil(max(h, w) / PREVIEW_MAX_PX))
-    pw, ph = max(1, round(w / k)), max(1, round(h / k))
+    fh, fw = full.shape[:2]
+    k = max(1, math.ceil(max(fh, fw) / PREVIEW_MAX_PX))
+    pw, ph = max(1, round(fw / k)), max(1, round(fh / k))
     img = np.stack([cv2.resize(full[..., c], (pw, ph), interpolation=cv2.INTER_AREA)
                     for c in range(full.shape[2])], -1)
     del full
@@ -303,6 +328,7 @@ class Aligner:
         self.loading_previews = False   # section images are still being loaded in the background
         self.levels = []            # per channel [lo, hi] (display only)
         self.levels_set = False
+        self.auto2_pending = False  # opened with the loader's Auto: Auto2 is applied once all the pictures have loaded
         self.level_cache = {}       # id(picture) -> (weak reference to it, its brightness histograms), see level_hist
         self._busy = False
         self.calibrating = False    # the .czi sections are being located on their slide scans
@@ -489,6 +515,18 @@ class Aligner:
         root.bind("<FocusOut>", lambda e: self.modifier_lost(), add="+")
 
     def build_right(self, right):
+        # "Back" at the bottom right, above the status bar, where step 3's Back button is; the brightness buttons and sliders at the top
+        # right, as in step 3. (Packed first at the bottom, so that the panels above fill from the top.)
+        back_row = ttk.Frame(right)
+        back_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+        self.back_button = ttk.Button(back_row, text="Back to step 3, order sections", command=self.go_back_to_ordering)
+        self.back_button.pack(side=tk.RIGHT)
+        self.back_button.state(["disabled"])   # (until a stack that came from the section loader is shown)
+        Tooltip(self.back_button, "Back to step 3: order the sections. This window is kept as it is and comes back with Next.")
+        self.chan_frame = ttk.LabelFrame(right, text="Brightness (applies to all sections, affects view only)", padding=6)
+        self.chan_frame.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(self.chan_frame, text="(open a stack)").pack()
+
         f = ttk.LabelFrame(right, text="Current section", padding=6)
         f.pack(fill=tk.X, pady=(0, 6))
         # (advanced mode only)
@@ -542,11 +580,7 @@ class Aligner:
         ttk.Checkbutton(f, text="Crosshair at the centre of the canvas", variable=self.var_crosshair,
                         command=self.redraw).pack(anchor="w")
 
-        self.chan_frame = ttk.LabelFrame(right, text="Brightness (applies to all sections, affects view only)", padding=6)
-        self.chan_frame.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(self.chan_frame, text="(open a stack)").pack()
-
-        f = ttk.LabelFrame(right, text="Export", padding=6)
+        f = self.export_frame = ttk.LabelFrame(right, text="Export", padding=6)
         f.pack(fill=tk.X, pady=(0, 6))
         # (the quality and re-render choices are for advanced mode only; the defaults are the sensible ones)
         self.export_advanced = [
@@ -655,7 +689,7 @@ class Aligner:
         """Show the features meant for experienced users only in advanced mode (and use the plain ones otherwise)."""
         if self.var_advanced.get():
             self.mode_frame.pack(fill=tk.X, before=self.label_opacity)
-            self.view_frame.pack(fill=tk.X, pady=(0, 6), before=self.chan_frame)
+            self.view_frame.pack(fill=tk.X, pady=(0, 6), before=self.export_frame)
             for w in self.export_advanced:
                 w.grid()
             self.follow_check.grid()
@@ -841,7 +875,7 @@ class Aligner:
         if self.busy or self.opening or not self.confirm_discard():
             return
         path = filedialog.askopenfilename(
-            parent=self.root, title="Open a reconstruction (NeuroInfo or exported by this tool)",
+            parent=self.root, title=f"Open a reconstruction: a .jpx file from NeuroInfo or exported by this tool (or a section project, {sp.PROJECT_SUFFIX})",
             filetypes=[("JPX stacks and section projects", "*.jpx *" + sp.PROJECT_SUFFIX + " *" + sp.OLD_PROJECT_SUFFIX), ("JPX stacks", "*.jpx"),
                        ("Section projects (from the step that finds the sections)", "*" + sp.PROJECT_SUFFIX + " *" + sp.OLD_PROJECT_SUFFIX), ("All files", "*.*")],
             initialdir=self.stack.folder if self.stack else None)
@@ -993,6 +1027,7 @@ class Aligner:
         self.view = None
         self.levels = [[0.0, 65535.0] for _ in range(stack.channels)]
         self.levels_set = False
+        self.auto2_pending = False
         self.build_channel_controls()
         self.var_spacing.set(f"{stack.z_spacing_um:g}" if stack.z_spacing_um > 0 else "")
         if stack.jpx_path:
@@ -1000,6 +1035,7 @@ class Aligner:
         else:
             self.fit_row.grid()
         self.project_path = os.path.abspath(path) if path and sp.is_project_path(path) else ""
+        self.back_button.state(["!disabled"] if self.project_path else ["disabled"])   # (only a stack from the section loader can go back)
         self.project_obj = getattr(self, "pending_project", None) if self.project_path else None
         self.pending_project = None
         self.saved_sig = self.stack_signature() if (self.project_obj is not None and self.project_obj.alignment) else None
@@ -1035,6 +1071,10 @@ class Aligner:
         todo.sort(key=lambda s: abs(s.index - self.cur))
 
         czi_paths = sorted({s.source_path for s in todo if s.source_path.lower().endswith(".czi")})
+        first_scan = todo[0].source_path if todo and todo[0].source_path.lower().endswith(".czi") else None
+        if first_scan in czi_paths:
+            czi_paths.remove(first_scan)
+            czi_paths.insert(0, first_scan)      # (the overview of the current section's scan first: its section is shown before the rest)
         early = getattr(stack, "prelocate", None)         # (the loader may have made some of the pictures already: see start_prelocate)
         thumbs_done = threading.Event()
         if czi_paths:
@@ -1043,13 +1083,27 @@ class Aligner:
             def thumbs():
                 ns.lower_thread_priority()
                 try:
-                    for path in czi_paths:
-                        try:
-                            made = early["thumbs"].get(path) if early is not None else None
-                            img, geometry = made if made is not None else ns.czi_slide_thumbnail(path, max_px)
-                        except Exception:
-                            continue   # (the picture is only a convenience)
-                        self.msgs.put(("thumb", (stack, path, img, geometry)))
+                    if early is not None and "thumbs_done" in early:
+                        # the loader is making the overview pictures (one scan after the other): each is shown as it appears. They are not
+                        # made again here, which would only make the two threads wait for each other's scans
+                        sent = set()
+                        while self.stack is stack:
+                            finished = early["thumbs_done"].wait(0.2)
+                            for path in czi_paths:
+                                made = early["thumbs"].get(path)
+                                if made is not None and path not in sent:
+                                    sent.add(path)
+                                    self.msgs.put(("thumb", (stack, path, made[0], made[1])))
+                            if finished:
+                                break
+                    else:
+                        for path in czi_paths:
+                            try:
+                                made = early["thumbs"].get(path) if early is not None else None
+                                img, geometry = made if made is not None else ns.czi_slide_thumbnail(path, max_px)
+                            except Exception:
+                                continue   # (the picture is only a convenience)
+                            self.msgs.put(("thumb", (stack, path, img, geometry)))
                 finally:
                     thumbs_done.set()
 
@@ -1071,6 +1125,8 @@ class Aligner:
                 n = len(posted)
                 if not first:
                     first.append(time.time() - t_start)
+                    print(f"[aligner load] first section ready {first[0]:.1f} s after the start "
+                          f"({'its own frame in the JPX' if is_frame else 'rendered from ' + os.path.basename(s.source_path)})", flush=True)
             try:
                 self.level_hist(pv[0])      # (ready for the Auto buttons of the display levels, which then need no time)
             except Exception:
@@ -1137,12 +1193,27 @@ class Aligner:
 
         self.start_verify = start_verify
 
+        marks = {}   # seconds after the start at which each phase of the loading was done, for the "Loaded ..." line
+
         def work():
             ns.lower_thread_priority()   # (the window stays responsive while the images load)
             # a slide scan can be read by one thread at a time, and locating, checking and loading its sections keeps it busy for minutes: the
             # overview pictures above the list (a few seconds in all) go first, or they would not appear until those are done with the scan
-            self.msgs.put(("status", "Preparing for load: reading the slide scans' overview pictures..."))
-            thumbs_done.wait(30)
+            # The current section first, before the overview pictures of all the scans (23 scans took 14 s, and every section waited for
+            # them): it needs only its own scan, whose overview is read first. Only when the sections already have their positions on
+            # the scan (otherwise they must be located first, below). Pictures the loader made ahead of time are used as they are.
+            if not self.calibrating and todo and todo[0].renderable and first_scan is not None:
+                t_first = time.time()
+                try:
+                    post(todo[0], czi_picture(todo[0]), False)
+                    marks["current section's picture took"] = time.time() - t_first
+                except Exception:
+                    pass                      # (tried again, with its message, in the loop below)
+            if early is None:
+                # (with the loader's thread making them, the sections do not wait for the overview pictures: only a convenience)
+                self.msgs.put(("status", "Preparing for load: reading the slide scans' overview pictures..."))
+                thumbs_done.wait(30)
+                marks[f"scan overviews ({len(czi_paths)})"] = time.time() - t_start
             frame_boxes = None
             pre = getattr(stack, "prelocate", None)
             if pre is not None:
@@ -1174,6 +1245,7 @@ class Aligner:
                     problems = {"the .czi scans": str(e) or type(e).__name__}
                 locate_seconds[0] = time.time() - t_locate
                 self.msgs.put(("czi_ready", (stack, {k: v for k, v in problems.items() if v})))
+            marks["sections located"] = time.time() - t_start
             if verify_wanted:         # (also for a stack made from a saved alignment: a position still unchecked there is checked now)
                 start_verify()
             # the .czi sections' pictures: the slide scans in parallel (the sections of one scan one after the other: a scan is read by one thread at
@@ -1207,9 +1279,14 @@ class Aligner:
                         pv = czi_picture(s)
                     elif is_frame:
                         if frame_boxes is None:
+                            t_boxes = time.time()
                             frame_boxes = [b for b in ns.read_boxes(stack.jpx_path) if b.kind == b"jp2c"]
+                            marks[f"finding the {len(frame_boxes)} frames in the JPX took"] = time.time() - t_boxes
                         self.msgs.put(("status", f"Loading section {s.index + 1} of {len(stack.sections)}..."))
+                        t_pic = time.time()
                         pv = load_frame_preview(stack.jpx_path, frame_boxes[s.frame], s.frame)
+                        if "first frame picture took" not in marks:
+                            marks["first frame picture took"] = time.time() - t_pic
                     else:
                         cached = preview_is_cached(s.source_path)
                         self.msgs.put(("status", f"{'Loading' if cached else 'Building (first time only)'} section {s.index + 1} of {len(stack.sections)}..."))
@@ -1223,6 +1300,7 @@ class Aligner:
             print(f"Loaded {os.path.basename(stack.jpx_path)}: {len(posted)} of {len(todo)} sections in {open_seconds + total:.1f} s "
                   f"(reading the NeuroInfo files {open_seconds:.1f} s; the first section was ready {first[0] if first else 0:.1f} s "
                   f"after that" + (f"; locating the sections on the slide scans {locate_seconds[0]:.1f} s" if locate_seconds[0] else "")
+                  + "; [" + ", ".join(f"{k} {v:.1f} s" for k, v in marks.items()) + "]"
                   + f"; {total / n:.2f} s per section, not counting dialogs you answered)", flush=True)
             self.msgs.put(("loaded", (stack, f"Ready. {len(posted)} of {len(todo)} sections loaded.")))
 
@@ -1249,6 +1327,8 @@ class Aligner:
                         self.refresh_list()
                         self.update_controls()
                         self.var_status.set(text)
+                        if self.auto2_pending:    # (opened with the loader's Auto: now that every picture is here, Auto2)
+                            self.set_levels("all")
                 elif kind == "thumb":
                     stack, path, img, geometry = payload
                     if stack is self.stack:
@@ -1320,6 +1400,7 @@ class Aligner:
     def set_levels(self, how):
         """The Auto1 / Auto2 / Full buttons: "current" = percentiles (1 and 99.7) of the current section's picture, "all" = of all
         the pictures loaded so far, "full" = 0 and 65535 with no analysis. Empty pixels (0) don't count. View only."""
+        self.auto2_pending = False                # (a choice made here, by the user or by the start setting, ends any waiting for Auto2)
         if not self.stack or not self.stack.sections:
             return
         if how == "full":
@@ -1348,6 +1429,17 @@ class Aligner:
             self.chan_vars[c][2].set(hi)
         self.levels_set = True                    # (the automatic setting from the first picture must not override this)
         self.redraw()
+
+    def set_start_brightness(self, mode):
+        """Open with the brightness the loader's thumbnails were set to: "full" (Full scale) is Full now; "auto" is Auto2, which needs all
+        the pictures, so it is applied when they have loaded (until then the first picture's automatic setting shows). Anything else
+        leaves the usual behaviour."""
+        if mode == "full":
+            self.set_levels("full")
+        elif mode == "auto":
+            self.auto2_pending = self.loading_previews
+            if not self.loading_previews:
+                self.set_levels("all")
 
     def level_hist(self, img):
         """The brightness histograms of a section picture, one per channel (channels x LEVEL_BINS counts; empty pixels, 0, are left

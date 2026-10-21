@@ -34,14 +34,16 @@ already shows; the others' codestreams are copied byte for byte.
     python neuroinfo_stack.py info "<reconstruction.jpx or stack folder>"
     python neuroinfo_stack.py roundtrip "<stack>" "<out.jpx>" [--compare]
 
-Requires numpy, h5py, imagecodecs, opencv-python (installed automatically if
-missing, like tifs_to_jp2.py).
+Requires numpy, imagecodecs, opencv-python (installed automatically if missing, like tifs_to_jp2.py). h5py, which reads
+NeuroInfo case files (.h5), is checked (and installed if missing) at startup too: if it cannot be installed the program still
+starts, with H5PY_PROBLEM set so the start window can say so at once.
 """
 
 import argparse
 import contextlib
 import copy
 import datetime
+import hashlib
 import importlib.util
 import itertools
 import json
@@ -55,8 +57,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
 
-REQUIRED_PACKAGES = {"numpy": "numpy", "h5py": "h5py", "imagecodecs": "imagecodecs",
-                     "cv2": "opencv-python"}
+REQUIRED_PACKAGES = {"numpy": "numpy", "imagecodecs": "imagecodecs", "cv2": "opencv-python"}
 
 
 CZI_PACKAGES = {"czifile": "czifile"}   # the Zeiss .czi reader, installed only when a stack needs it
@@ -108,7 +109,9 @@ def ensure_packages(required=None, exit_on_failure=True):
         site.addsitedir(user_site)
     still = [pip for mod, pip in required.items() if importlib.util.find_spec(mod) is None]
     if still:
-        message = f"Couldn't install {', '.join(still)}; install them with pip and try again."
+        message = (f"Couldn't install {', '.join(still)} for Python {sys.version.split()[0]} "
+                   f"({'64' if sys.maxsize > 2 ** 32 else '32'}-bit); a very new Python often has no prebuilt "
+                   "libraries yet: use Python 3.13 (see ensure_python.bat), or install them with pip and try again.")
         if exit_on_failure:
             sys.exit(message)
         raise ImportError(message)
@@ -116,8 +119,37 @@ def ensure_packages(required=None, exit_on_failure=True):
 
 ensure_packages()
 
+
+H5PY_PROBLEM = None   # why h5py is unavailable (None when it is fine): only the reader of NeuroInfo case files needs it
+
+
+def check_h5py():
+    """Install h5py if it is missing, now (at startup) rather than when a case file is first read. Returns None if it is
+    usable, else the explanation, which is also kept in H5PY_PROBLEM and printed."""
+    global H5PY_PROBLEM
+    try:
+        ensure_packages({"h5py": "h5py"}, exit_on_failure=False)
+        import h5py  # noqa: F401
+        H5PY_PROBLEM = None
+    except ImportError as e:
+        H5PY_PROBLEM = str(e) or "h5py could not be imported."
+        print(chr(10) + "!" * 78 + chr(10) + f"WARNING: {H5PY_PROBLEM}" + chr(10)
+              + "NeuroInfo case files (.h5) cannot be read until this is fixed." + chr(10) + "!" * 78 + chr(10), flush=True)
+    return H5PY_PROBLEM
+
+
+def _h5py():
+    """The h5py module (checked at startup; raises ImportError with the reason when it is not available)."""
+    if H5PY_PROBLEM:
+        raise ImportError(H5PY_PROBLEM)
+    import h5py
+    return h5py
+
+
+check_h5py()
+
+
 import cv2  # noqa: E402
-import h5py  # noqa: E402
 import imagecodecs  # noqa: E402
 import numpy as np  # noqa: E402
 
@@ -537,7 +569,7 @@ def _xml_guids(xml_path):
 def _h5_matches(h5_path, guids):
     """Whether the case file holds all of these contour GUIDs (None if it cannot be read)."""
     try:
-        with h5py.File(h5_path, "r") as f:
+        with _h5py().File(h5_path, "r") as f:
             return guids <= {k.upper() for k in f["BrainMaker/Contours"].keys()}
     except Exception:
         return None
@@ -577,9 +609,19 @@ def _find_neuroinfo_files(jpx_path, locate=None):
                                     f"wasn't found in\n{folder}")
         xml_path = chosen
 
-    # --- the case file
+    return xml_path, find_case_file(folder, _xml_guids(xml_path), locate)
+
+
+def find_case_file(folder, guids, locate=None):
+    """The NeuroInfo case file (.h5) in `folder` that goes with a reconstruction whose section GUIDs are `guids`. Nothing assumes a name for
+    it: the GUIDs say which .h5 files fit, and when exactly one does it is used without asking. The user is asked (the likeliest offered
+    first) when several fit, when none fits and when there is none at all; see _find_neuroinfo_files for `locate`."""
+    files = {n.lower(): n for n in os.listdir(folder)}
+
+    def listing(ext):
+        return sorted(n for n in files.values() if n.lower().endswith(ext))
+
     candidates = listing(".h5")
-    guids = _xml_guids(xml_path)
     notes = {}
     for n in candidates:
         fits = _h5_matches(os.path.join(folder, n), guids)
@@ -598,7 +640,53 @@ def _find_neuroinfo_files(jpx_path, locate=None):
             raise FileNotFoundError("This JPX has no alignment data of its own, and its NeuroInfo case file (.h5) "
                                     f"{'was not chosen' if candidates else 'wasn' + chr(39) + 't found'} in\n{folder}")
         h5_path = chosen
-    return xml_path, h5_path
+    return h5_path
+
+
+def read_reconstruction_xml(xml_path):
+    """What a NeuroInfo reconstruction .xml says about itself: {"guids": the section GUIDs (upper case), "jpx_name": the file name of
+    the JPX as recorded in it (a path of the machine it was made on, or just a name; "" if none), "slices": the number of sections it
+    says the JPX holds (0 if not said)}. Raises ValueError for any other .xml (NeuroInfo writes big ones for cell detection)."""
+    if os.path.getsize(xml_path) > 100e6:
+        raise ValueError("this is too big to be a reconstruction file (a few MB at most)")
+    with open(xml_path, encoding="latin-1") as f:
+        text = f.read()
+    if 'name="SectionOutline"' not in text:
+        raise ValueError("this is not a NeuroInfo reconstruction file (no section outlines in it)")
+    name = re.search(r"<image>\s*<filename>([^<]*)</filename>", text)
+    slices = re.search(r'<zspacing [^>]*slices="(\d+)"', text)
+    return {"guids": {g.upper() for g in re.findall(r'name="GUID"><s>([0-9A-Fa-f]+)</s>', text)},
+            "jpx_name": name.group(1).strip() if name else "", "slices": int(slices.group(1)) if slices else 0}
+
+
+def find_jpx_for_xml(xml_path, jpx_name, locate=None):
+    """The JPX of a reconstruction .xml, found beside it. The name the XML records is the strongest hint (the path itself if that file
+    exists, else the same file name in the XML's folder), then a JPX with the XML's own name; when that settles on exactly one it is
+    used, else the user is asked through locate("jpx", recorded name, folder, candidates, reason, default, notes). Nothing is read
+    from the JPX files (a name is a weaker link than the GUIDs that tie the .xml to its .h5, and can be out of date)."""
+    folder = os.path.dirname(os.path.abspath(xml_path))
+    if jpx_name and os.path.isabs(jpx_name) and os.path.isfile(jpx_name):
+        return jpx_name
+    recorded = os.path.basename(jpx_name.replace("\\", "/")) if jpx_name else ""
+    stem = os.path.splitext(os.path.basename(xml_path))[0].lower()
+    jpxs = sorted(n for n in os.listdir(folder) if n.lower().endswith(".jpx"))
+    notes = {}
+    for n in jpxs:
+        why = (["named in the .xml"] if recorded and n.lower() == recorded.lower() else []) + \
+              (["same name as the .xml"] if os.path.splitext(n)[0].lower() == stem else [])
+        if why:
+            notes[n] = "; ".join(why)
+    sure = [n for n in jpxs if "named in the .xml" in notes.get(n, "")] or [n for n in jpxs if n in notes]
+    if len(sure) == 1:
+        return os.path.join(folder, sure[0])
+    default = sure[0] if sure else (jpxs[0] if jpxs else None)
+    chosen = locate("jpx", recorded, folder, jpxs, "ambiguous" if jpxs else "missing", default, notes) if locate else None
+    if not chosen and not locate and default:
+        chosen = os.path.join(folder, default)
+    if not chosen:
+        raise FileNotFoundError(f"No JPX was chosen for {os.path.basename(xml_path)}"
+                                + (f" (it names {recorded})" if recorded else "") + f" in\n{folder}")
+    return chosen
 
 
 def neuroinfo_check(jpx_path):
@@ -641,7 +729,7 @@ def _load_neuroinfo(jpx_path, locate=None):
         w, h, nc = codestream_size(f, frames[0])
     stack = Stack(jpx_path, w, h, nc, pixel_um, origin=os.path.abspath(jpx_path), case_file=os.path.basename(h5_path))
 
-    with h5py.File(h5_path, "r") as f:
+    with _h5py().File(h5_path, "r") as f:
         bm = f["BrainMaker"]
         chain = {_s(r["Previous"]): _s(r["Name"]) for r in bm["OrderedSections/Contours"][()]}
         order, cur = [], ""

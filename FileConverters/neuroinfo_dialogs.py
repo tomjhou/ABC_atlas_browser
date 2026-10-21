@@ -43,8 +43,14 @@ def locate_file(parent, kind, expected, folder, candidates, reason="missing", de
     another; for a file that is not there at all, only Browse. Returns the path, or None if the user declines.
     `parent` is the window the dialog belongs to."""
     notes = notes or {}
-    what = "case file (.h5)" if kind == "h5" else "reconstruction file (.xml)"
-    if reason == "ambiguous":
+    what = {"h5": "case file (.h5)", "jpx": "JPX stack (.jpx)"}.get(kind, "reconstruction file (.xml)")
+    if kind == "jpx":      # (asked when a reconstruction .xml was opened: its JPX is what is being looked for)
+        if reason == "ambiguous":
+            text = (f"{expected} wasn't found beside the reconstruction file. " if expected else "") + \
+                   f"Which {what} goes with it?\n{folder}"
+        else:
+            text = f"No {what} was found beside the reconstruction file, in\n{folder}\n\nLocate it?"
+    elif reason == "ambiguous":
         text = (f"Which {what} goes with this JPX?\n{folder}" if kind == "h5" else
                 f"{expected} wasn't found beside the JPX. Which {what} goes with it?\n{folder}")
     else:
@@ -75,7 +81,7 @@ def locate_file(parent, kind, expected, folder, candidates, reason="missing", de
         dlg.destroy()
 
     def browse():
-        types = [("HDF5 files", "*.h5 *.H5")] if kind == "h5" else [("XML files", "*.xml")]
+        types = {"h5": [("HDF5 files", "*.h5 *.H5")], "jpx": [("JPX stacks", "*.jpx")]}.get(kind, [("XML files", "*.xml")])
         path = filedialog.askopenfilename(parent=dlg, title=f"Locate the {what}", initialdir=folder,
                                           filetypes=types + [("All files", "*.*")])
         if path:

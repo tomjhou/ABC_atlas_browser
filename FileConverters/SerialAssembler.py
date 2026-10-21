@@ -92,6 +92,7 @@ def detect_and_align():
             aligner = jpx_aligner.Aligner(None)
             aligner.return_to_launcher = True
             aligner.show_stack(stack, project.path)
+            aligner.set_start_brightness(loader.aligner_brightness())   # (the ordering tab's Auto / Full scale)
             aligner.reuse_info = sp.reuse_info(project, stack)
         aligner.run()
         if not aligner.back_to_ordering:         # (the alignment window was closed: back to the start window)
@@ -99,8 +100,28 @@ def detect_and_align():
         resume = project.path
 
 
+def warn_if_h5py_missing():
+    """Up front, before any work: say so when h5py (which reads NeuroInfo case files) could not be installed. Returns
+    False if the user chose to stop."""
+    if not ns.H5PY_PROBLEM:
+        return True
+    from tkinter import messagebox
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        return messagebox.askyesno(
+            "h5py is missing",
+            f"{ns.H5PY_PROBLEM}" + chr(10) * 2 + "Without it, NeuroInfo case files (.h5) cannot be read, so the alignment of a "
+            "NeuroInfo stack cannot be recovered. Everything else works." + chr(10) * 2 + "Continue anyway?",
+            icon="warning", parent=root)
+    finally:
+        root.destroy()
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    if not warn_if_h5py_missing():
+        return
     if argv:                                  # a file named: straight to the alignment tool
         run_aligner(path=argv[0])
         return

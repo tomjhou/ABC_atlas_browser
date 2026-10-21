@@ -159,8 +159,11 @@ class SectionLoader:
         self.order_key = None           # project.polygons_key() when the order was last set
         self.jpx_stack, self.jpx_stack_path = None, ""     # a JPX project: its stack once opened (for the ordering tab)
         self.neuro = {}                                    # JPX path -> what neuroinfo_check found (and what the user chose about it)
+        self.neuro_presets = {}                            # JPX path -> {"xml", "h5"} found from a reconstruction .xml that was added
         self.jpx_by_frame = {}                             # frame -> its section
         self.jpx_crops, self.jpx_inflight = {}, set()      # frame -> (colour crop, outline in it, um per pixel) or False; frames being made
+        self.bright_mode = "auto"                          # Auto / Full scale of a JPX's thumbnails (the alignment tool starts with the same)
+        self.stale_thumbs = set()                          # JPX thumbnails shown as they are until their new version (brightness, scale) is made
         self.jpx_pool, self.jpx_tick_id = None, None
         # ---- the strip of stages
         self.strip = tk.Frame(self.root, bg="#eef1f5")
@@ -580,6 +583,8 @@ class SectionLoader:
                 self.infos[p] = info
                 if neuro is not None:
                     self.neuro[p] = neuro
+                if p in self.neuro_presets:                # (found from the reconstruction .xml that was added: not asked again)
+                    self.neuro[p] = {"state": "found", "chosen": True, **self.neuro_presets[p]}
             self.refresh_slide_list()
             self.queue_preload()
             self.var_status.set(f"{len(self.project.slides)} slide(s).")
@@ -611,11 +616,18 @@ class SectionLoader:
         paths mapped differently): the dialog starts there, and files from elsewhere are refused. For a new project the first image
         chosen sets the folder."""
         folder = self.project.folder()
-        paths = filedialog.askopenfilenames(parent=self.root, title="Slide scans, section images and JPX stacks", initialdir=folder or None, filetypes=[
-            ("Slide scans, section images and JPX stacks", "*.czi *.jp2 *.j2k *.j2c *.jpx"), ("Zeiss .czi", "*.czi"),
-            ("JPEG 2000 section images", "*.jp2 *.j2k *.j2c"), ("JPX stack of sections", "*.jpx"), ("All files", "*.*")])
+        paths = filedialog.askopenfilenames(
+            parent=self.root, title="Slide scans, section images, JPX stacks, or a NeuroInfo reconstruction (.xml)", initialdir=folder or None,
+            filetypes=[("Slide scans, section images, JPX stacks and NeuroInfo .xml", "*.czi *.jp2 *.j2k *.j2c *.jpx *.xml"),
+                       ("Zeiss .czi", "*.czi"), ("JPEG 2000 section images", "*.jp2 *.j2k *.j2c"), ("JPX stack of sections", "*.jpx"),
+                       ("NeuroInfo reconstruction .xml (its JPX and case file are found from it)", "*.xml"), ("All files", "*.*")])
         if not paths:
             return
+        if any(p.lower().endswith(".xml") for p in paths):
+            jpx = self.jpx_from_reconstruction_xml(paths)
+            if not jpx:
+                return
+            paths = [jpx]                                # (from here on, as if the JPX had been chosen: its XML and case file are known)
         if any(sp.is_jpx(p) for p in paths) or self.project.is_jpx:
             # a JPX is a stack of sections already, with their outlines: a project of its own, not mixed with scans or other stacks
             if self.project.slides or len(paths) > 1:
@@ -658,6 +670,38 @@ class SectionLoader:
         self.refresh_slide_list()
         self.update_title()
         self.read_infos()
+
+    def jpx_from_reconstruction_xml(self, paths):
+        """A NeuroInfo reconstruction .xml was chosen: find its JPX and its case file (.h5) beside it, as far as they can be told from the
+        files (see ns.find_jpx_for_xml, ns.find_case_file), asking only where that does not settle it. Returns the JPX's path, or None (the
+        reason is shown); the .xml and .h5 found are remembered for when the JPX is opened."""
+        if len(paths) != 1:
+            messagebox.showinfo("NeuroInfo reconstruction file", "A NeuroInfo reconstruction file (.xml) is added on its own: it brings its "
+                                "JPX and case file with it. Choose just that one file.", parent=self.root)
+            return None
+        xml = os.path.normpath(paths[0])
+        if self.project.slides:
+            messagebox.showinfo("NeuroInfo reconstruction file", "A JPX stack is a project of its own: it can't be combined with other files. "
+                                "Add it to an empty list (use \"Close project\" first).", parent=self.root)
+            return None
+        try:
+            info = ns.read_reconstruction_xml(xml)
+        except (OSError, ValueError) as e:
+            messagebox.showerror("NeuroInfo reconstruction file", f"{os.path.basename(xml)}: {e}", parent=self.root)
+            return None
+        locate = lambda *args, **kwargs: neuroinfo_dialogs.locate_file(self.root, *args, **kwargs)
+        self.var_status.set("Looking for the JPX and the case file...")
+        self.root.update_idletasks()
+        try:
+            jpx = os.path.normpath(ns.find_jpx_for_xml(xml, info["jpx_name"], locate))
+            h5 = ns.find_case_file(os.path.dirname(os.path.abspath(xml)), info["guids"], locate)
+        except (OSError, ValueError) as e:
+            self.var_status.set("")
+            messagebox.showinfo("NeuroInfo reconstruction file", str(e), parent=self.root)
+            return None
+        self.neuro_presets[jpx] = {"xml": xml, "h5": os.path.normpath(h5)}
+        self.var_status.set(f"{os.path.basename(xml)}: using {os.path.basename(jpx)} and {os.path.basename(h5)}.")
+        return jpx
 
     def save_slide_list(self):
         """Write the project file (a new project's is named after the first image of the list as it is now). Done when going on from the
@@ -2086,17 +2130,22 @@ class SectionLoader:
             self.draw_order()
 
     def on_bright(self):
-        """Auto / Full scale: the thumbnails of a JPX are made again from the pictures already read."""
+        """Auto / Full scale: the thumbnails of a JPX are made again from the pictures already read. The old ones stay on screen and
+        are each replaced as its new version is made (clearing them first would show black cells until they were rebuilt)."""
+        self.bright_mode = self.var_bright.get()
         if self.project.is_jpx:
-            self.thumbs = {}
-            self.draw_order()
+            self.stale_thumbs = set(self.thumbs)
+
+    def aligner_brightness(self):
+        """"auto" or "full" for the alignment tool to start with (the Brightness buttons of a JPX's ordering tab), or None for slide
+        scans, whose thumbnails have no such setting."""
+        return self.bright_mode if self.project.is_jpx else None
 
     def on_fit_thumbs(self):
         """"Scale sections to fit thumbnails" changed: the thumbnails are made again."""
         if self.project.is_jpx:
-            self.thumbs = {}                         # (made again from the pictures already read, a few at a time, as the window asks)
-            self.draw_order()
-            return
+            self.stale_thumbs = set(self.thumbs)     # (made again from the pictures already read, a few at a time, as the window asks;
+            return                                   # the old ones stay on screen until each is replaced)
         self.thumbs = {}
         self.build_thumbs()
         self.draw_order()
@@ -2142,6 +2191,7 @@ class SectionLoader:
     def enter_order_jpx(self):
         proj = self.project
         self.thumbs = {}
+        self.stale_thumbs = set()
         for b in getattr(self, "bright_buttons", ()):
             b.state(["!disabled"])
         self.var_spacing.set(f"{proj.z_spacing_um:g}" if proj.z_spacing_um > 0 else "")
@@ -2195,21 +2245,28 @@ class SectionLoader:
             return                                   # (coming back from the alignment tool, which keeps its own located stack: nothing to do)
         if not any(s.source_path.lower().endswith(".czi") for s in stack.sections):
             return
-        pre = {"done": threading.Event(), "calibrated": threading.Event(), "problems": {}, "located": [], "text": "", "thumbs": {},
-               "scenes": {}, "lock": threading.Lock(), "stop": threading.Event(), "frames": None}
+        pre = {"done": threading.Event(), "calibrated": threading.Event(), "thumbs_done": threading.Event(), "problems": {}, "located": [],
+               "text": "", "thumbs": {}, "scenes": {}, "lock": threading.Lock(), "stop": threading.Event(), "frames": None}
         stack.prelocate = pre
 
         def work():
             ns.lower_thread_priority()
-            # the slide scans' overview pictures first (a few seconds): the alignment tool shows them above its list the moment it opens,
-            # instead of waiting behind the locating, which keeps each scan busy
+            needs_locating = any(s.source_path.lower().endswith(".czi") and s.czi_origin is None for s in stack.sections)
+            if not needs_locating:
+                pre["calibrated"].set()                  # (nothing to locate: the alignment tool need not wait for the overview pictures below,
+                                                         # which take a long time for many scans and are only a convenience)
+            # the slide scans' overview pictures first (a few seconds each): the alignment tool shows them above its list as they are
+            # made, instead of waiting behind the locating, which keeps each scan busy
             for path in sorted({s.source_path for s in stack.sections if s.source_path.lower().endswith(".czi")}):
+                if pre["stop"].is_set():
+                    break
                 try:
                     pre["thumbs"][path] = ns.czi_slide_thumbnail(path, 1600)
                 except Exception:
                     pass                                 # (the picture is only a convenience)
+            pre["thumbs_done"].set()
             try:
-                if any(s.source_path.lower().endswith(".czi") and s.czi_origin is None for s in stack.sections):
+                if needs_locating:
                     problems = ns.calibrate_stack_czi(stack, progress=lambda i, n, text: pre.__setitem__("text", text),
                                                       on_located=pre["located"].append)
                     pre["problems"] = {k: v for k, v in problems.items() if v}
@@ -2258,7 +2315,7 @@ class SectionLoader:
         last_row = int((canvas.canvasy(max(canvas.winfo_height(), 1)) - CELL_PAD) // row_h) + 2
         made = False
         for key in self.grid.order[first_row * cols:(last_row + 1) * cols]:
-            if key in self.thumbs:
+            if key in self.thumbs and key not in self.stale_thumbs:
                 continue
             crop = self.jpx_crops.get(key[1], 0)
             if crop is False:
@@ -2298,7 +2355,7 @@ class SectionLoader:
             return
         self.jpx_crops[frame] = data
         if not self.var_fit_thumbs.get():
-            self.thumbs = {}                         # (to one scale for all: a new picture can change that scale, so they are all made again)
+            self.stale_thumbs = set(self.thumbs)     # (to one scale for all: a new picture can change that scale, so they are all made again)
 
     def jpx_make_thumb(self, key):
         """The thumbnail of a section from its picture, fitted to the thumbnail (or, with "Scale sections to fit thumbnails" off, drawn to the
@@ -2316,6 +2373,7 @@ class SectionLoader:
         img = cv2.resize(rgb, (max(int(w * f), 1), max(int(h * f), 1)), interpolation=cv2.INTER_AREA)
         cv2.polylines(img, [(poly * f).astype(np.int32)], True, (255, 212, 0), 1, cv2.LINE_AA)
         self.thumbs[key] = ImageTk.PhotoImage(Image.fromarray(img), master=self.root)
+        self.stale_thumbs.discard(key)
         return True
 
     def draw_order(self):
