@@ -516,6 +516,11 @@ class UmapWindow(ExportsMixin):
                 self.rois.append((str(r["section"]), *vals))
         self.cache = {}
         self.run_index = pd.Index(a.obs_names)
+        self.bg_under = None
+        if self.info.get("class") is not None:
+            cid = core.extract_leading_numeric_id(pd.Series(self.info["class"])).to_numpy()
+            frac = float(np.isin(cid, list(core.NON_NEURON_CLASS_IDS)).mean())
+            self.bg_under = "nonneuron" if frac < 0.5 else "neuron"           # (the minority kind is drawn underneath)
 
     def category_codes(self, level):
         """(codes of each run cell, uniques) of a level; and for the all-cell background (codes, uniques) over the same uniques."""
@@ -583,7 +588,8 @@ class UmapWindow(ExportsMixin):
             self.pw.sashpos(0, want)
 
     def build_side(self, f):
-        ttk.Label(f, text="Color by", font=("Segoe UI", 13, "bold")).pack(anchor="w")
+        self.color_label = ttk.Label(f, text="Color by", font=("Segoe UI", 13, "bold"))
+        self.color_label.pack(anchor="w")
         self.var_mode = tk.StringVar(f, "all")
         for value, text in (("all", "All groups"), ("single", "Specific group(s)"), ("gene", "Gene"), ("imputed", "Imputed Gene")):
             ttk.Radiobutton(f, text=text, value=value, variable=self.var_mode, command=self.on_mode).pack(anchor="w")
@@ -651,7 +657,7 @@ class UmapWindow(ExportsMixin):
     def build_buttons(self, f):
         ttk.Style(self.root).configure("Side.TButton", font=("Segoe UI", 9))
         bar = ttk.Frame(f)
-        bar.pack(fill=tk.X, side=tk.BOTTOM, pady=(8, 0))
+        bar.pack(fill=tk.X, side=tk.TOP, pady=(0, 10), before=self.color_label)
         bar.columnconfigure(0, weight=1)
         bar.columnconfigure(1, weight=1)
         self.group_buttons = []
@@ -854,7 +860,14 @@ class UmapWindow(ExportsMixin):
         layers = []
         bgl = self.tile_fn(t["label"])
         if bgl is not None:
-            layers.append({"x": bgl[0], "y": bgl[1], "rgb": bgl[2], "size_mm": DOT_MM})
+            x, y, rgb, w = bgl
+            if self.bg_under is not None and self.bg["levels"].get("class") is not None:
+                # the cells of the other kind (non-neurons in a neuron run) go underneath, so they never cover the ones being looked at
+                ids = core.extract_leading_numeric_id(pd.Series(self.bg["levels"]["class"][w])).to_numpy()
+                non_neuron = np.isin(ids, list(core.NON_NEURON_CLASS_IDS))
+                o = np.argsort(~non_neuron if self.bg_under == "nonneuron" else non_neuron, kind="stable")
+                x, y, rgb = x[o], y[o], rgb[o]
+            layers.append({"x": x, "y": y, "rgb": rgb, "size_mm": DOT_MM})
         # the run's own cells of this section, in drawing order (lowest first)
         sel = idx[np.argsort(self.rank_run[idx], kind="stable")]
         layers.append({"x": self.cx[sel], "y": self.cy[sel], "rgb": self.rgb_run[sel], "size_mm": DOT_MM})
@@ -883,7 +896,7 @@ class UmapWindow(ExportsMixin):
                 return None
             c = bgc[w] if bgc is not None else np.full(len(w), -1)
             col = np.where((c >= 0)[:, None], lut[np.maximum(c, 0)], LIGHT_GREY)
-            return self.bg["x"][w], self.bg["y"][w], col.astype(np.uint8)
+            return self.bg["x"][w], self.bg["y"][w], col.astype(np.uint8), w
 
         # each coloured group's number at its centre
         cent = pd.DataFrame({"g": codes, "x": self.coords[:, 0], "y": self.coords[:, 1]})
@@ -966,7 +979,7 @@ class UmapWindow(ExportsMixin):
             h = np.where(c >= 0, hit[np.maximum(c, 0)], 0)
             col = np.where((h > 0)[:, None], lut[np.maximum(c, 0)], LIGHT_GREY).astype(np.uint8)
             o = np.argsort(h, kind="stable")
-            return self.bg["x"][w][o], self.bg["y"][w][o], col[o]
+            return self.bg["x"][w][o], self.bg["y"][w][o], col[o], w[o]
 
         self.apply(rgb, order, bg_fn)
         counts = {t: int((uid[np.maximum(codes, 0)] == t)[codes >= 0].sum()) for t in ids}
@@ -1164,14 +1177,14 @@ class UmapWindow(ExportsMixin):
             if w is None:
                 return None
             if bg_vals is None:
-                return self.bg["x"][w], self.bg["y"][w], np.tile(LIGHT_GREY, (len(w), 1))
+                return self.bg["x"][w], self.bg["y"][w], np.tile(LIGHT_GREY, (len(w), 1)), w
             v = bg_vals[w]
             ok = np.isfinite(v)
             tt = np.clip((v - vmin) / (vmax - vmin), 0, 1) if vmax > vmin else np.zeros_like(v)
             col = viridis_rgb(np.where(ok, tt, 0))
             col[~ok] = LIGHT_GREY
             o = np.argsort(np.where(ok, v, -np.inf), kind="stable")           # (highest on top)
-            return self.bg["x"][w][o], self.bg["y"][w][o], col[o]
+            return self.bg["x"][w][o], self.bg["y"][w][o], col[o], w[o]
 
         self.apply(rgb, order, bg_fn)
         self.draw_colorbar(vmin, vmax, scale, dataset)
@@ -1223,7 +1236,7 @@ class UmapWindow(ExportsMixin):
                 chans.append(np.clip((np.nan_to_num(v, nan=lo) - lo) / (hi - lo), 0, 1) if hi > lo else np.zeros(len(w)))
             col = (core.multi_gene_rgb(chans, (0.0, 0.0, 0.0)) * 255).astype(np.uint8)
             o = np.argsort(intensity(chans), kind="stable")
-            return self.bg["x"][w][o], self.bg["y"][w][o], col[o]
+            return self.bg["x"][w][o], self.bg["y"][w][o], col[o], w[o]
 
         self.apply(rgb, order, bg_fn, extra_umap_layers=extra, dark=True)
         to_log2 = 1.0 if dataset == "imputed" or scale == "linear" else float(np.log2(np.e))
