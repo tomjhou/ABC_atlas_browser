@@ -2821,6 +2821,7 @@ class Aligner:
         xs.grid(row=1, column=0, sticky="ew")
         right = ttk.Frame(paned)
         paned.add(right, weight=3)
+        paned.after(150, lambda: paned.sashpos(0, int(paned.winfo_width() * 0.62)) if paned.winfo_width() > 200 else None)
         text = tk.Text(right, wrap="none", font=("Consolas", 10), state="disabled", background="white")
         tys = ttk.Scrollbar(right, orient=tk.VERTICAL, command=text.yview)
         txs = ttk.Scrollbar(right, orient=tk.HORIZONTAL, command=text.xview)
