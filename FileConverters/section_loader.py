@@ -61,19 +61,40 @@ def jpx_frame_boxes(path):
         return _jpx_frames[path]
 
 
+def jpx_colorize(raw, stack, mode="auto"):
+    """The thumbnail picture (RGB uint8) of a section's raw crop (H x W x channels, as the frame holds it), the channels in their colors.
+    mode "auto": each channel stretched on its own, from its 1st to its 99.7th percentile (x1.3) of the nonzero pixels, so that every
+    section is bright enough to see; "full": the whole range of the file's numbers (0 to 65535 for 16 bits), as it is, so that sections
+    can be compared (a faint one then looks faint)."""
+    top = float(np.iinfo(raw.dtype).max) if np.issubdtype(raw.dtype, np.integer) else 65535.0
+    rgbf = np.zeros(raw.shape[:2] + (3,), np.float32)
+    for c in range(raw.shape[2]):
+        v = raw[..., c].astype(np.float32)
+        if mode == "full":
+            lo_v, hi_v = 0.0, top
+        else:
+            nz = v[v > 0]
+            lo_v = float(np.percentile(nz, 1)) if nz.size else 0.0
+            hi_v = max(float(np.percentile(nz, 99.7)) * 1.3 if nz.size else 1.0, lo_v + 1.0)
+        color = np.array(stack.channel_info[c].color if c < len(stack.channel_info) else (255, 255, 255), np.float32) / 255
+        rgbf += np.clip((v - lo_v) / (hi_v - lo_v), 0, 1)[..., None] * color
+    return (np.clip(rgbf, 0, 1) * 255).astype(np.uint8)
+
+
 def jpx_crop(stack, path, frame, section, target_px=256):
-    """A colour picture of one section of a JPX, cropped round its outline from the JPX's own frame (the section as NeuroInfo rendered it,
-    so no slide scan is needed): (RGB uint8 picture, the outline in it, um per picture pixel). Only the reduced picture the thumbnail needs
-    is read from the frame (a few percent of it), and the result is kept on disk, so that the next time is instant."""
+    """The raw picture of one section of a JPX, cropped round its outline from the JPX's own frame (the section as NeuroInfo rendered it,
+    so no slide scan is needed): (the crop, H x W x channels as the frame holds it; the outline in it; um per picture pixel). Only the reduced
+    picture the thumbnail needs is read from the frame (a few percent of it), and the result is kept on disk, so that the next time is
+    instant. jpx_colorize makes the thumbnail of it, at whatever brightness is asked for."""
     st = os.stat(path)
     P = section.stack_points
     outline_hash = hashlib.sha1(np.round(P, 1).tobytes()).hexdigest()[:12]
-    key = f"jpxcrop1|{os.path.abspath(path).lower()}|{st.st_size}|{st.st_mtime_ns}|{frame}|{outline_hash}|{target_px}"
+    key = f"jpxcrop2|{os.path.abspath(path).lower()}|{st.st_size}|{st.st_mtime_ns}|{frame}|{outline_hash}|{target_px}"
     cache = os.path.join(sp.CACHE_DIR, "jt_" + hashlib.sha1(key.encode()).hexdigest() + ".npz")
     if os.path.isfile(cache):
         try:
             with np.load(cache) as d:
-                return d["rgb"], d["poly"], float(d["um"])
+                return d["raw"], d["poly"], float(d["um"])
         except Exception:
             pass                                   # (a damaged cache file: made again)
     px = stack.pixel_um
@@ -98,23 +119,15 @@ def jpx_crop(stack, path, frame, section, target_px=256):
     crop = img[y0:-(-int(b[1]) // s), x0:-(-int(b[0]) // s)]
     if crop.size == 0:
         raise ValueError("the outline is outside the frame")
-    rgbf = np.zeros(crop.shape[:2] + (3,), np.float32)
-    for c in range(crop.shape[2]):
-        v = crop[..., c].astype(np.float32)
-        nz = v[v > 0]
-        lo_v = float(np.percentile(nz, 1)) if nz.size else 0.0
-        hi_v = max(float(np.percentile(nz, 99.7)) * 1.3 if nz.size else 1.0, lo_v + 1.0)
-        color = np.array(stack.channel_info[c].color if c < len(stack.channel_info) else (255, 255, 255), np.float32) / 255
-        rgbf += np.clip((v - lo_v) / (hi_v - lo_v), 0, 1)[..., None] * color
-    rgb = (np.clip(rgbf, 0, 1) * 255).astype(np.uint8)
+    raw = np.ascontiguousarray(crop)
     poly_c = (poly / s - np.array([x0, y0])).astype(np.float32)
     try:
         tmp = cache + ".partial.npz"
-        np.savez(tmp, rgb=rgb, poly=poly_c, um=px * s)
+        np.savez(tmp, raw=raw, poly=poly_c, um=px * s)
         os.replace(tmp, cache)
     except OSError:
         pass
-    return rgb, poly_c, px * s
+    return raw, poly_c, px * s
 
 
 class SectionLoader:
@@ -142,6 +155,7 @@ class SectionLoader:
         self.result = None
         self.order_key = None           # project.polygons_key() when the order was last set
         self.jpx_stack, self.jpx_stack_path = None, ""     # a JPX project: its stack once opened (for the ordering tab)
+        self.neuro = {}                                    # JPX path -> what neuroinfo_check found (and what the user chose about it)
         self.jpx_by_frame = {}                             # frame -> its section
         self.jpx_crops, self.jpx_inflight = {}, set()      # frame -> (colour crop, outline in it, um per pixel) or False; frames being made
         self.jpx_pool, self.jpx_tick_id = None, None
@@ -410,9 +424,10 @@ class SectionLoader:
                   foreground="gray30").pack(anchor="w", pady=(0, 8))
         mid = ttk.Frame(f)
         mid.pack(fill=tk.BOTH, expand=True)
-        cols = ("name", "scenes", "size", "pixel")
+        cols = ("name", "scenes", "size", "pixel", "neuro")
         self.slide_tree = ttk.Treeview(mid, columns=cols, show="headings", selectmode="extended", height=14)
-        for c, t, w, a in (("name", "File", 620, "w"), ("scenes", "Scenes", 90, "e"), ("size", "Size", 110, "e"), ("pixel", "Pixel (um)", 90, "e")):
+        for c, t, w, a in (("name", "File", 620, "w"), ("scenes", "Scenes", 90, "e"), ("size", "Size", 110, "e"), ("pixel", "Pixel (um)", 90, "e"),
+                           ("neuro", "NeuroInfo files", 170, "w")):
             self.slide_tree.heading(c, text=t)
             self.slide_tree.column(c, width=w, anchor=a)
         sb = ttk.Scrollbar(mid, orient=tk.VERTICAL, command=self.slide_tree.yview)
@@ -445,10 +460,78 @@ class SectionLoader:
         self.need_images.append(close_button)
         return f
 
+    def neuro_state(self, path):
+        return getattr(self, "neuro", {}).get(path)
+
+    def neuro_unresolved(self, path):
+        """A JPX from NeuroInfo whose .xml / .h5 are not there and the user has not yet said what to do about it."""
+        n = self.neuro_state(path)
+        return bool(n) and n.get("state") == "missing" and not n.get("kept")
+
+    def neuro_text(self, path):
+        """The "NeuroInfo files" column: what a JPX needs beside it (blank for other files)."""
+        if not sp.is_jpx(path):
+            return ""
+        n = self.neuro_state(path)
+        if n is None:
+            return "" if self.project.alignment else ("checking..." if path not in self.infos else "")
+        state = n["state"]
+        if state == "own":
+            return "not needed"
+        if state == "found":
+            return "found" + (" (chosen)" if n.get("xml") and n.get("chosen") else "")
+        if state == "missing":
+            what = " and ".join({"xml": ".xml", "h5": "case file"}[k] for k in n["missing"])
+            return f"MISSING: {what}" + (" (kept anyway)" if n.get("kept") else "")
+        return "could not check"
+
+    def resolve_missing_neuroinfo(self):
+        """For each JPX added whose NeuroInfo files are missing: say so now (not at step 3), and ask what to do."""
+        for slide in list(self.project.slides):
+            n = self.neuro_state(slide.path)
+            while n and n.get("state") == "missing" and not n.get("kept"):
+                name = os.path.basename(slide.path)
+                what = " and ".join({"xml": f"{os.path.splitext(name)[0]}.xml (the reconstruction)", "h5": "the case file (.h5)"}[k] for k in n["missing"])
+                choice = neuroinfo_dialogs.missing_files_dialog(self.root, name, what)
+                if choice == "keep":
+                    n["kept"] = True
+                elif choice == "remove":
+                    self.project.slides = [s for s in self.project.slides if s.path != slide.path]
+                    self.neuro.pop(slide.path, None)
+                    self.infos.pop(slide.path, None)
+                    if not self.project.slides:
+                        self.reset_project()
+                    self.var_status.set(f"{name} was not added.")
+                    break
+                else:
+                    self.locate_neuroinfo(slide.path)
+                    n = self.neuro_state(slide.path)
+        self.refresh_slide_list()
+
+    def locate_neuroinfo(self, path):
+        """The user points at the .xml and the .h5 of a JPX (as many as are missing); what is chosen is used when the JPX is opened."""
+        n = self.neuro[path]
+        folder = os.path.dirname(os.path.abspath(path))
+        stem = os.path.splitext(os.path.basename(path))[0]
+        chosen = {}
+        for kind in ("xml", "h5"):
+            if kind == "xml" and "xml" not in n["missing"]:
+                continue
+            if kind == "h5" and "h5" not in n["missing"] and "xml" not in n["missing"]:
+                continue
+            names = sorted(f for f in os.listdir(folder) if f.lower().endswith("." + kind))
+            got = neuroinfo_dialogs.locate_file(self.root, kind, f"{stem}.xml" if kind == "xml" else "the case file (.h5)", folder, names,
+                                                "ambiguous" if names else "missing", names[0] if names else None, {})
+            if not got:
+                return                                   # (cancelled: back to the question)
+            chosen[kind] = got
+        self.neuro[path] = {"state": "found", "chosen": True, **chosen}
+
     def update_next_button(self):
         """On the first tab, Next is greyed out while the files in the list are still being read (their scenes, sizes and pixel sizes are what the
         next tabs go by)."""
-        waiting = self.stage == 0 and not getattr(self, "infos_failed", False) and any(s.path not in self.infos for s in self.project.slides)
+        waiting = self.stage == 0 and not getattr(self, "infos_failed", False) and (
+            any(s.path not in self.infos for s in self.project.slides) or any(self.neuro_unresolved(s.path) for s in self.project.slides))
         self.btn_next.state(["disabled"] if waiting else ["!disabled"])
 
     def refresh_slide_list(self):
@@ -461,7 +544,7 @@ class SectionLoader:
             self.slide_tree.insert("", tk.END, iid=str(i), values=(
                 s.path, (f"{info.scenes} sections" if sp.is_jpx(s.path) else info.scenes) if info else "counting...",
                 human_size(info.size_bytes) if info else "determining...",     # (until the file has been read)
-                (f"{px:g}" if px else "unknown") if info else ""))
+                (f"{px:g}" if px else "unknown") if info else "", self.neuro_text(s.path)))
         self.update_next_button()
 
     def read_infos(self):
@@ -473,8 +556,14 @@ class SectionLoader:
         self.infos_failed = False
         self.update_next_button()
 
+        check_neuro = not self.project.alignment       # (a project with its alignment saved opens its JPX without NeuroInfo's files)
+
         def work():
-            return [(p, sp.slide_info(p)) for p in todo]
+            out = []
+            for p in todo:
+                info = sp.slide_info(p)
+                out.append((p, info, ns.neuroinfo_check(p) if check_neuro and sp.is_jpx(p) else None))
+            return out
 
         def done(res):
             if isinstance(res, BaseException):
@@ -483,11 +572,14 @@ class SectionLoader:
                 self.infos_failed = True                  # (Next must not stay grey for ever: the list can be corrected)
                 self.update_next_button()
                 return
-            for p, info in res:
+            for p, info, neuro in res:
                 self.infos[p] = info
+                if neuro is not None:
+                    self.neuro[p] = neuro
             self.refresh_slide_list()
             self.queue_preload()
             self.var_status.set(f"{len(self.project.slides)} slide(s).")
+            self.resolve_missing_neuroinfo()
 
         self.background(work, done)
 
@@ -1887,6 +1979,17 @@ class SectionLoader:
         self.var_fit_thumbs = tk.BooleanVar(f, True)
         ttk.Checkbutton(top, text="Scale sections to fit thumbnails", variable=self.var_fit_thumbs,
                         command=self.on_fit_thumbs).pack(side=tk.RIGHT, padx=8)
+        # brightness of a JPX's thumbnails, as the alignment tool's buttons: Auto stretches each picture on its own, Full scale shows the
+        # file's numbers as they are (the thumbnails of scans are made from one overview of the slide, with one stretch for all)
+        self.var_bright = tk.StringVar(f, "auto")
+        bright = ttk.Frame(top)
+        bright.pack(side=tk.RIGHT, padx=8)
+        ttk.Label(bright, text="Brightness:").pack(side=tk.LEFT, padx=(0, 4))
+        self.bright_buttons = []
+        for text, value in (("Auto", "auto"), ("Full scale", "full")):
+            b = ttk.Radiobutton(bright, text=text, value=value, variable=self.var_bright, style="Toolbutton", command=self.on_bright)
+            b.pack(side=tk.LEFT, padx=1)
+            self.bright_buttons.append(b)
         help_label.pack(side=tk.LEFT)      # (packed last: if the window is narrow it is the help text that is cut, not the buttons)
 
         def caption(key, i):
@@ -1924,6 +2027,8 @@ class SectionLoader:
         if proj.is_jpx:
             self.enter_order_jpx()
             return
+        for b in getattr(self, "bright_buttons", ()):
+            b.state(["disabled"])                    # (a scan's thumbnails come from one overview of the slide)
         key = proj.polygons_key()
         if proj.order and self.order_key == key and all(si < len(proj.slides) and pi < len(proj.slides[si].polygons) for si, pi in proj.order):
             self.order = list(proj.order)
@@ -1950,6 +2055,12 @@ class SectionLoader:
         if all(self.project.slides[si].path in self.ov for si, _ in self.order):
             self.var_status.set("")
             self.build_thumbs()
+            self.draw_order()
+
+    def on_bright(self):
+        """Auto / Full scale: the thumbnails of a JPX are made again from the pictures already read."""
+        if self.project.is_jpx:
+            self.thumbs = {}
             self.draw_order()
 
     def on_fit_thumbs(self):
@@ -2003,6 +2114,8 @@ class SectionLoader:
     def enter_order_jpx(self):
         proj = self.project
         self.thumbs = {}
+        for b in getattr(self, "bright_buttons", ()):
+            b.state(["!disabled"])
         self.var_spacing.set(f"{proj.z_spacing_um:g}" if proj.z_spacing_um > 0 else "")
         if self.jpx_stack is not None and self.jpx_stack_path == proj.jpx_path:
             self.jpx_ready()
@@ -2014,6 +2127,9 @@ class SectionLoader:
 
         def ask(*args, **kwargs):
             """A NeuroInfo file to choose (see ns.open_stack): the dialog is made, and waited for, by the window's thread."""
+            chosen = (self.neuro.get(path) or {}).get(args[0]) if args else None
+            if chosen:
+                return chosen                            # (the user located it when the JPX was added)
             finished, answer = threading.Event(), {}
 
             def run():
@@ -2119,6 +2235,7 @@ class SectionLoader:
             crop = self.jpx_crops.get(key[1], 0)
             if crop is False:
                 continue                             # (this frame couldn't be read: a blank thumbnail)
+            ns.foreground_active()                   # (a thumbnail in view is wanted: the background locating and picture-making wait for it)
             if crop:
                 made = self.jpx_make_thumb(key) or made
             elif key[1] not in self.jpx_inflight and len(self.jpx_inflight) < 6:
@@ -2161,7 +2278,8 @@ class SectionLoader:
         crop = self.jpx_crops.get(key[1])
         if not crop:
             return False
-        rgb, poly, um = crop
+        raw, poly, um = crop
+        rgb = jpx_colorize(raw, self.jpx_stack, self.var_bright.get())
         h, w = rgb.shape[:2]
         if self.var_fit_thumbs.get():
             f = min(THUMB_W / w, THUMB_H / h)

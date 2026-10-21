@@ -65,6 +65,22 @@ CZI_PACKAGES = {"czifile": "czifile"}   # the Zeiss .czi reader, installed only 
 PREVIEW_MAX_PX = 2500   # longest side of the cached preview of each section (the alignment tool's; the loader makes them ahead of it)
 
 
+_foreground_until = [0.0]
+
+
+def foreground_active(seconds=1.5):
+    """Something the user is looking at right now is being made (the loader's thumbnails, as they scroll): the background work (locating,
+    pictures made ahead) pauses at its next step, for this long after the last call, so that what is on screen comes first."""
+    _foreground_until[0] = time.time() + seconds
+
+
+def yield_to_foreground(max_wait=30.0):
+    """Called by background work between steps: wait while foreground_active says the user is waiting for something (at most max_wait)."""
+    t0 = time.time()
+    while time.time() < _foreground_until[0] and time.time() - t0 < max_wait:
+        time.sleep(0.05)
+
+
 def lower_thread_priority():
     """Make the calling thread yield to the rest of the program (Windows: below-normal priority), so that long background work
     does not make the window sluggish. No effect elsewhere."""
@@ -585,6 +601,23 @@ def _find_neuroinfo_files(jpx_path, locate=None):
     return xml_path, h5_path
 
 
+def neuroinfo_check(jpx_path):
+    """Whether a JPX can be opened: what it needs beside it, without asking anything. {"state": "own"} (written by this tool: its alignment is
+    inside it), {"state": "found", "xml": path, "h5": path}, {"state": "missing", "missing": ["xml" and/or "h5"], "folder": folder}, or
+    {"state": "error", "text": ...} when the check itself failed (nothing is claimed then)."""
+    try:
+        if find_aligner_json(jpx_path) is not None:
+            return {"state": "own"}
+        xml_path, h5_path = _find_neuroinfo_files(jpx_path, None)
+        return {"state": "found", "xml": xml_path, "h5": h5_path}
+    except FileNotFoundError as e:
+        text = str(e)
+        return {"state": "missing", "missing": ["xml"] if ".xml" in text.split("\n")[0] else ["h5"], "text": text,
+                "folder": os.path.dirname(os.path.abspath(jpx_path))}
+    except Exception as e:
+        return {"state": "error", "text": f"{type(e).__name__}: {e}"}
+
+
 def _load_neuroinfo(jpx_path, locate=None):
     folder = os.path.dirname(os.path.abspath(jpx_path))
     xml_path, h5_path = _find_neuroinfo_files(jpx_path, locate)
@@ -848,6 +881,7 @@ def czi_levels(path, scene=0):
 
 def czi_read(path, scene, level=0):
     """A scene at pyramid `level` (each level halves the resolution), H x W x C."""
+    yield_to_foreground()
     with _czi_lock_for(path):
         arr = czi_file(path).scenes[scene].levels[level].asarray(maxworkers=CZI_WORKERS)
     if arr.ndim == 2:
@@ -858,6 +892,7 @@ def czi_read(path, scene, level=0):
 def czi_read_region(path, scene, x, y, w, h):
     """The part (x, y, w, h) of a scene at full resolution, in slide pixels, as H x W x C (zeros where the scene does not
     reach). Only the tiles under it are read, which is far quicker than the whole scene."""
+    yield_to_foreground()
     with _czi_lock_for(path):
         level = czi_file(path).scenes[scene].levels[0]
         try:
@@ -1382,6 +1417,7 @@ def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progr
     frames = [b for b in read_boxes(stack.jpx_path) if b.kind == b"jp2c"]
 
     def load_frame(sec):
+        yield_to_foreground()
         with open(stack.jpx_path, "rb") as f:
             img = imagecodecs.jpeg2k_decode(read_payload(f, frames[sec.frame]))
         return img[..., None] if img.ndim == 2 else img

@@ -2030,6 +2030,8 @@ class Aligner:
         w, h = event.width, event.height
         old = self.last_size
         self.last_size = (w, h)
+        if old == (w, h) and self.view is not None:
+            return                       # (a layout change that left the canvas as it was: the picture does not need drawing again)
         if self.view is not None and old and old != (w, h) and w > 20 and h > 20:
             if self.fitted:
                 self.view = None   # redraw fits it to the new size
