@@ -11,6 +11,7 @@ blocks until the window is closed, like the matplotlib one. Not yet in this vers
 the group (family) highlight on hover, and the exports.
 """
 import colorsys
+import gc
 import queue
 import re
 from pathlib import Path
@@ -42,7 +43,8 @@ TILE_PX = 230
 MIN_TILE_PX = 120
 HOVER_HOLD_MS = 250                # the pointer must rest this long before the plots dim
 GROUP_HOLD_MS = 500                # ...and this long before the cell's group is marked
-DOT_MM = 0.05                      # a cell's dot in the section panels: 50 um across on the tissue
+DOT_MM = 0.03                      # a cell's dot in the section panels: 30 um across on the tissue
+BIG_DOT_PX = 40                    # dots wider than this are drawn one by one as circles (the maximum filter gets slow)
 SCALEBAR_UM = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000)
 HOVER_RADIUS_PX = 9
 SCALE_UNITS = {("standard", "log"): "log1p(expr)", ("standard", "linear"): "expr (raw counts)",
@@ -241,9 +243,9 @@ class PointCanvas:
         hw, hh = w / (2 * self.scale), h / (2 * self.scale)
         for lay in self.layers:
             if "size_mm" in lay:                                              # (a size on the tissue: the same at any window size)
-                d = int(min(max(round(lay["size_mm"] * self.scale), 1), 40))
+                d = int(max(round(lay["size_mm"] * self.scale), 1))
             else:
-                d = int(min(max(round(lay["size"] * zoom ** 0.7), 1), 40))          # (the dots grow as the view is zoomed in)
+                d = int(max(round(lay["size"] * zoom ** 0.7), 1))          # (the dots grow as the view is zoomed in)
             x, y = lay["x"], lay["y"]
             pm = d / self.scale
             m = (x >= self.cx - hw - pm) & (x <= self.cx + hw + pm) & (y >= self.cy - hh - pm) & (y <= self.cy + hh + pm)
@@ -256,6 +258,11 @@ class PointCanvas:
             rgb = lay["rgb"][idx]
             if lay.get("shape") == "plus":
                 stamp_plus(img, px, py, rgb, d)
+                continue
+            if d > BIG_DOT_PX:                                             # (very big dots, so few on screen: each drawn as a circle, later ones on top)
+                r = d // 2
+                for X, Y, c in zip(px.tolist(), py.tolist(), rgb.tolist()):
+                    cv2.circle(img, (X, Y), r, c, -1)
                 continue
             px, py = px + d, py + d
             # each point writes its number (later = on top) at its pixel; a bigger dot is that number grown by a maximum filter
@@ -431,6 +438,8 @@ class UmapWindow(ExportsMixin):
         self.root.update()
         self.msgs = queue.Queue()
         self.busy = False
+        self.gc_was_enabled = gc.isenabled()
+        gc.disable()
         self.mode = "all"                  # "all" | "single" | "gene" | "imputed"
         self.level = "subclass" if "subclass" in adata.obs.columns else "class"
         self.shown_gene = None
@@ -576,7 +585,7 @@ class UmapWindow(ExportsMixin):
     def build_side(self, f):
         ttk.Label(f, text="Color by", font=("Segoe UI", 13, "bold")).pack(anchor="w")
         self.var_mode = tk.StringVar(f, "all")
-        for value, text in (("all", "All groups"), ("single", "Single group(s)"), ("gene", "Gene"), ("imputed", "Imputed Gene")):
+        for value, text in (("all", "All groups"), ("single", "Specific group(s)"), ("gene", "Gene"), ("imputed", "Imputed Gene")):
             ttk.Radiobutton(f, text=text, value=value, variable=self.var_mode, command=self.on_mode).pack(anchor="w")
         self.level_frame = ttk.LabelFrame(f, text="Level", padding=6)
         self.level_frame.pack(fill=tk.X, pady=(8, 0))
@@ -584,7 +593,7 @@ class UmapWindow(ExportsMixin):
         self.build_level_radios()
         self.box = ttk.Frame(f)
         self.box.pack(fill=tk.X, pady=(8, 0))
-        # a group number box (Single group(s))
+        # a group number box (Specific group(s))
         self.id_frame = ttk.LabelFrame(self.box, text="Group number(s)", padding=6)
         ttk.Label(self.id_frame, text="One or more, separated by commas (Enter):", foreground="gray30", wraplength=300).pack(anchor="w")
         self.var_ids = tk.StringVar(f, "")
@@ -907,10 +916,10 @@ class UmapWindow(ExportsMixin):
             rows.append((int(m.group(1)) if m else 10 ** 9, m.group(1) if m else str(uniques[u]), hexcolor(rank_color(r)), int(counts[u])))
         rows.sort()
         for k, (_n, label, col, cnt) in enumerate(rows):
-            y = 3 + 18 * k
-            c.create_rectangle(6, y + 2, 18, y + 14, fill=col, outline="")
-            c.create_text(26, y, anchor="nw", text=f"{label}  ({cnt})", font=("Segoe UI", 9))
-        c.configure(scrollregion=(0, 0, 300, 6 + 18 * len(rows)))
+            cy = 4 + 22 * k + 11
+            c.create_rectangle(6, cy - 6, 18, cy + 6, fill=col, outline="")
+            c.create_text(26, cy, anchor="w", text=f"{label}  ({cnt})", font=("Segoe UI", 9))
+        c.configure(scrollregion=(0, 0, 300, 8 + 22 * len(rows)))
         self.group_list.pack(fill=tk.BOTH, expand=True, pady=(6, 0), after=self.box)
 
     def parse_ids(self):
@@ -987,11 +996,12 @@ class UmapWindow(ExportsMixin):
             return
         self.legend.pack(fill=tk.X, pady=(6, 0), after=self.box)
         self.legend.delete("all")
-        self.legend.config(height=18 * len(ids) + 4)
+        self.legend.config(height=22 * len(ids) + 8)
         for k, t in enumerate(ids):
             col = "#%02x%02x%02x" % tuple(int(v) for v in colors[t])
-            self.legend.create_rectangle(4, 4 + 18 * k, 18, 16 + 18 * k, fill=col, outline="")
-            self.legend.create_text(26, 3 + 18 * k, anchor="nw", text=f"{t}  ({counts[t]} cells)", font=("Segoe UI", 9))
+            cy = 4 + 22 * k + 11
+            self.legend.create_rectangle(4, cy - 6, 18, cy + 6, fill=col, outline="")
+            self.legend.create_text(26, cy, anchor="w", text=f"{t}  ({counts[t]} cells)", font=("Segoe UI", 9))
 
     # ---- genes
 
@@ -1299,6 +1309,9 @@ class UmapWindow(ExportsMixin):
                 z = core.section_z_text(t["label"], self.abc_cache, wait=False, short=True)
                 if z:
                     t["title"].set(f"{t['token']}   {z}")
+        self.ticks = getattr(self, "ticks", 0) + 1
+        if self.ticks % 20 == 0 and not self.busy:          # (garbage is collected here, on the Tk thread: a worker thread freeing Tk images fails)
+            gc.collect()
         self.poll_id = self.root.after(300, self.poll)
 
     # ---- hover and the link between the UMAP and the section panels
@@ -1586,6 +1599,8 @@ class UmapWindow(ExportsMixin):
     # ---- closing
 
     def close(self):
+        if self.gc_was_enabled:
+            gc.enable()
         try:
             self.root.after_cancel(self.poll_id)
         except Exception:
