@@ -576,7 +576,7 @@ class UmapWindow(ExportsMixin):
         self.umap.on_view = None
         self.umap_tree = cKDTree(c)
         pw.add(mid, weight=3)
-        side = ttk.Frame(pw, padding=10, width=360)
+        side = ttk.Frame(pw, padding=10, width=420)
         side.pack_propagate(False)
         self.build_side(side)
         pw.add(side, weight=0)
@@ -637,7 +637,7 @@ class UmapWindow(ExportsMixin):
         # the legend for Single group(s)
         self.legend = tk.Canvas(f, width=300, height=10, highlightthickness=0)
         self.group_list = ttk.Frame(f)                      # the groups' numbers and colors (All groups), scrollable
-        self.group_canvas = tk.Canvas(self.group_list, width=300, height=120, highlightthickness=0, bg="white")
+        self.group_canvas = tk.Canvas(self.group_list, width=300, height=40, highlightthickness=0, bg="white")
         gsb = ttk.Scrollbar(self.group_list, orient=tk.VERTICAL, command=self.group_canvas.yview)
         self.group_canvas.configure(yscrollcommand=gsb.set)
         gsb.pack(side=tk.RIGHT, fill=tk.Y)
@@ -647,7 +647,21 @@ class UmapWindow(ExportsMixin):
         hov = ttk.LabelFrame(f, text="Under the pointer", padding=6)
         hov.pack(fill=tk.X, side=tk.BOTTOM, pady=(6, 0))
         self.var_cell = tk.StringVar(f, "Hover over a cell in the UMAP or a section.")
-        ttk.Label(hov, textvariable=self.var_cell, wraplength=300, justify=tk.LEFT).pack(anchor="w")
+        self.cell_hint = ttk.Label(hov, textvariable=self.var_cell, wraplength=320, justify=tk.LEFT)
+        self.cell_hint.pack(anchor="w")
+        # the hovered cell as a table: what it is / its number / its name, each in a column of its own
+        self.cell_grid = ttk.Frame(hov)
+        self.cell_grid.columnconfigure(2, weight=1)
+        self.cell_grid.bind("<Configure>", lambda e: self.fit_cell_names())
+        self.cell_cells = []
+        for r in range(12):
+            a = ttk.Label(self.cell_grid, foreground="gray35", font=("Segoe UI", 9, "bold"))
+            b = ttk.Label(self.cell_grid, width=6, anchor="e", font=("Segoe UI", 10, "bold"))
+            c = ttk.Label(self.cell_grid, wraplength=190, justify=tk.LEFT)
+            a.grid(row=r, column=0, sticky="nw", padx=(0, 8))
+            b.grid(row=r, column=1, sticky="ne", padx=(0, 8))
+            c.grid(row=r, column=2, sticky="nw")
+            self.cell_cells.append((a, b, c))
         self.var_status = tk.StringVar(f, "")
         ttk.Label(f, textvariable=self.var_status, foreground="gray30", wraplength=300, justify=tk.LEFT).pack(anchor="w", side=tk.BOTTOM)
         ttk.Label(f, text="wheel: zoom   drag: pan   double-click: whole view", foreground="gray40", wraplength=300).pack(anchor="w", side=tk.BOTTOM, pady=(0, 6))
@@ -1359,6 +1373,62 @@ class UmapWindow(ExportsMixin):
             lines.append("(not in the UMAP)")
         return "\n".join(lines)
 
+    def cell_rows(self, info):
+        """The hovered cell as table rows: (what, number, name). A group's label '268 CS-PRNr-DR ...' is split into its number and its name."""
+        rows = []
+        sec = info["sec"]
+        if sec is not None:
+            rows.append(("Section", core.sanitize_section_token(sec), ""))
+        i = info["umap_idx"]
+        for k in LEVEL_NAMES:
+            if i is not None:
+                v = self.info[k][i] if self.info.get(k) is not None else None
+            else:
+                arr = self.bg["levels"].get(k) if self.bg else None
+                v = arr[info["bg_idx"]] if arr is not None else None
+            if v is None or str(v) == "nan":
+                continue
+            m = re.match(r"^\s*(\d+)\s*(.*)$", str(v))
+            rows.append((LEVEL_NAMES[k], m.group(1) if m else "", m.group(2) if m else str(v)))
+        z = core.section_z_text(sec, self.abc_cache, wait=False) if sec is not None else ""
+        if z:
+            rows.append(("", "", z))
+        if i is not None and self.values is not None:
+            for gene, vals in self.values:
+                rows.append((gene, f"{vals[i]:.3g}" if np.isfinite(vals[i]) else "n/a", ""))
+        elif i is None:
+            rows.append(("", "", "(not in the UMAP)"))
+        return rows
+
+    def fit_cell_names(self):
+        """The names wrap at the table's right edge, whatever the screen's scaling."""
+        try:
+            x2 = self.cell_grid.grid_bbox(column=2, row=0)[0]
+        except tk.TclError:
+            return
+        wl = max(self.cell_grid.winfo_width() - x2 - 4, 60)
+        for _a, _b, c in self.cell_cells:
+            if int(str(c.cget("wraplength"))) != wl:
+                c.config(wraplength=wl)
+
+    def show_cell_rows(self, rows):
+        self.cell_hint.pack_forget()
+        self.cell_grid.pack(fill=tk.X, anchor="w")
+        for k, (a, b, c) in enumerate(self.cell_cells):
+            if k < len(rows):
+                what, num, name = rows[k]
+                a.config(text=what)
+                b.config(text=num)
+                c.config(text=name)
+                a.grid()
+                b.grid()
+                c.grid()
+            else:
+                a.grid_remove()
+                b.grid_remove()
+                c.grid_remove()
+        self.root.after_idle(self.fit_cell_names)
+
     def cell_info(self, i, source):
         return {"key": ("run", i), "umap_idx": i, "bg_idx": None, "sec": self.section_of[i] if self.section_of is not None else None,
                 "x": self.cx[i] if self.cx is not None else np.nan, "y": self.cy[i] if self.cy is not None else np.nan, "source": source}
@@ -1373,7 +1443,8 @@ class UmapWindow(ExportsMixin):
             self.umap.set_marker("hover", None, None)
             for t in self.tiles:
                 t["pc"].set_marker("hover", None, None)
-            self.var_cell.set("Hover over a cell in the UMAP or a section.")
+            self.cell_grid.pack_forget()
+            self.cell_hint.pack(anchor="w")
             return
         src = info["source"]
         i = info["umap_idx"]
@@ -1387,7 +1458,7 @@ class UmapWindow(ExportsMixin):
                 t["pc"].set_marker("hover", info["x"], info["y"], style="ring" if src == "section" else "mirror")
             else:
                 t["pc"].set_marker("hover", None, None)
-        self.var_cell.set(self.level_text(info))
+        self.show_cell_rows(self.cell_rows(info))
 
     def hover(self, info):
         """The pointer is on a cell (info) or on none (None). The ring and description are immediate; once it rests, the plots dim and, a
