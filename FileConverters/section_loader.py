@@ -450,7 +450,7 @@ class SectionLoader:
         side.pack(side=tk.LEFT, fill=tk.Y)
         ttk.Button(side, text="Add images...", command=self.add_slides).pack(fill=tk.X)
         self.need_images = []              # the buttons that mean nothing until an image has been added (see refresh_slide_list)
-        for text, command, pad in (("Remove", self.remove_slides, 6), ("Move up", lambda: self.move_slide(-1), 0),
+        for text, command, pad in (("Remove image", self.remove_slides, 6), ("Move up", lambda: self.move_slide(-1), 0),
                                    ("Move down", lambda: self.move_slide(1), 6), ("Set pixel size...", self.set_pixel_size, 0)):
             button = ttk.Button(side, text=text, command=command)
             button.pack(fill=tk.X, pady=pad)
