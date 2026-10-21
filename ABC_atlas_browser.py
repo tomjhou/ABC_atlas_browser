@@ -11205,8 +11205,19 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
         if run_folder is not None:
             tk_title = f"{Path(run_folder).name} — {tk_title}"
         from abc_tk_umap import show_umap_window_tk
-        show_umap_window_tk(adata, abc_cache, imputed_state=imputed_state, adata_backed=adata_backed, rois=rois,
-                        run_folder=run_folder, ensure_imputed=ensure_imputed_gene_dataset_loaded, title=tk_title)
+        # The functions of this file the Tk viewer uses (it cannot import this file: it is the program).
+        host_names = (
+            'CACHE_DIR', 'UMAP_SAVE_DPI', 'SECTION_MAPS_SAVE_DPI', 'THREED_SHELL_POINTS', 'load_viewer_settings', 'save_viewer_settings',
+            'prompt_viewer_settings_dialog', 'umap_params_key', 'umap_params_label', 'umap_params_are_default', 'umap_params_token',
+            'normalize_umap_params', 'write_last_umap_params', 'ensure_umap_variant_csv', 'load_umap_variant', 'open_with_default_viewer',
+            'unique_export_paths', 'prompt_deg_comparison_mode', 'materialize_subset', 'compute_de_genes', 'mean_log2_expression',
+            'ensure_ccf_downloaded', 'load_ccf_for_cells', 'load_parcellation_names', 'run_with_loading_window', 'brain_outline_segments',
+            'open_3d_group_view', 'build_3d_edges', 'write_3d_group_html', 'category_rank_shape', 'visible_points_only', 'sc')
+        host = {name: globals()[name] for name in host_names}
+        host['settings_dialog'] = prompt_viewer_settings_dialog
+        host['umap_circle_sizes'] = UMAP_CIRCLE_SIZE_REGISTRY
+        show_umap_window_tk(adata, abc_cache, imputed_state=imputed_state, adata_backed=adata_backed, rois=rois, run_folder=run_folder,
+                            ensure_imputed=ensure_imputed_gene_dataset_loaded, title=tk_title, host=host, params=tk_params)
         return
 
     # This window builds one Axes (plus its own scatter/text/spine

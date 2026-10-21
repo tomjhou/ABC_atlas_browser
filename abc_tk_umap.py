@@ -13,6 +13,7 @@ the group (family) highlight on hover, and the exports.
 import colorsys
 import queue
 import re
+from pathlib import Path
 import threading
 import time
 import tkinter as tk
@@ -25,7 +26,9 @@ from PIL import Image, ImageTk
 from scipy.spatial import cKDTree
 
 import abc_core as core
+from abc_tk_umap_export import ExportsMixin, hexcolor
 
+LEIDEN_KEY = "leiden"
 GREY = np.array([205, 205, 205], np.uint8)
 MULTI_BG = (26, 26, 26)           # the plots' background in the multi-gene view (a zero-expression cell is black, so it must not melt into it)
 MAX_GENES = 6                      # the first three are red / green / blue circles; the next three the same colors as small dots on top
@@ -258,7 +261,11 @@ class PointCanvas:
             # each point writes its number (later = on top) at its pixel; a bigger dot is that number grown by a maximum filter
             lab = np.zeros((h + 2 * d, w + 2 * d), np.float32)
             lab[py, px] = np.arange(1, len(idx) + 1, dtype=np.float32)
-            if d > 1:
+            if lay.get("shape") == "half" and d > 1:                     # (the right half of a disc, flat side on the cell)
+                k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d))
+                k[:, :d // 2] = 0
+                lab = cv2.dilate(lab, k[:, d // 2:], anchor=(0, d // 2))
+            elif d > 1:
                 lab = cv2.dilate(lab, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d)))
             lab = lab[d:d + h, d:d + w]
             hit = lab > 0
@@ -405,9 +412,14 @@ class PointCanvas:
 
 # ---------------------------------------------------------------------------------------------------------------------- the window
 
-class UmapWindow:
-    def __init__(self, adata, abc_cache, imputed_state, adata_backed, rois, run_folder, ensure_imputed, title, parent=None):
+class UmapWindow(ExportsMixin):
+    def __init__(self, adata, abc_cache, imputed_state, adata_backed, rois, run_folder, ensure_imputed, title, parent=None, host=None, params=None):
         self.adata, self.abc_cache = adata, abc_cache
+        self.host = host or {}             # the browser's own functions this window uses (settings dialog, UMAP variants, the exports)
+        self.run_folder = run_folder
+        self.params = dict(params) if params else None
+        self.viewer_settings = self.host["load_viewer_settings"]() if "load_viewer_settings" in self.host else {"hover_enabled": True, "gene456_shape": "small circle", "umap_circle_size": "Default", "persist_settings": False}
+        self.base_title = title
         self.imputed_state = imputed_state if imputed_state is not None else {"adata": None, "load_thread": None, "load_error": None}
         self.ensure_imputed = ensure_imputed
         self.own_root = parent is None
@@ -429,8 +441,15 @@ class UmapWindow:
         self.gene_cache = None             # ((genes, imputed, scale), values read) of the genes shown, so a legend click re-uses them
         self.hidden = set()                # the genes switched off by a legend click
         self.multi_rows = None
+        self.last_ids = None               # the groups typed in Single group(s): level, targets, colors, cells
+        self.export_cat = None             # what the categorical colours mean (for a saved legend)
+        self.label_info = []
+        self.view_kind, self.view_token, self.view_title = "all", "all", ""
         self.hover_key = None
+        self.variants = {}                 # UMAP parameter key -> (coordinates, Leiden labels), the ones already shown
         self.load_data(adata_backed, rois)
+        if self.host and self.params is not None:
+            self.variants[self.host["umap_params_key"](self.params)] = (self.coords.copy(), self.info.get("leiden"))
         loading.destroy()
         self.build()
         self.recolor()
@@ -466,7 +485,8 @@ class UmapWindow:
                     order = np.argsort(codes, kind="stable")
                     starts = np.searchsorted(codes[order], np.arange(len(uniques) + 1))
                     where = {u: order[starts[i]:starts[i + 1]] for i, u in enumerate(uniques)}
-                    self.bg = {"ids": adata_backed.obs_names, "x": pd.to_numeric(bsp["x"], errors="coerce").to_numpy(), "y": pd.to_numeric(bsp["y"], errors="coerce").to_numpy(),
+                    self.bg = {"ids": adata_backed.obs_names, "sec_arr": bsec.to_numpy(), "z": (pd.to_numeric(bsp["z"], errors="coerce").to_numpy() if "z" in bsp.columns else None),
+                               "x": pd.to_numeric(bsp["x"], errors="coerce").to_numpy(), "y": pd.to_numeric(bsp["y"], errors="coerce").to_numpy(),
                                "where": where, "levels": {k: (bsp[k].astype(str).to_numpy() if k in bsp.columns else None) for k in LEVEL_NAMES}}
             except Exception as e:
                 print(f"Could not load the all-cell background for the section panels: {e}", flush=True)
@@ -537,7 +557,7 @@ class UmapWindow:
         self.umap.on_view = None
         self.umap_tree = cKDTree(c)
         pw.add(mid, weight=3)
-        side = ttk.Frame(pw, padding=10, width=330)
+        side = ttk.Frame(pw, padding=10, width=360)
         side.pack_propagate(False)
         self.build_side(side)
         pw.add(side, weight=0)
@@ -558,11 +578,10 @@ class UmapWindow:
         self.var_mode = tk.StringVar(f, "all")
         for value, text in (("all", "All groups"), ("single", "Single group(s)"), ("gene", "Gene"), ("imputed", "Imputed Gene")):
             ttk.Radiobutton(f, text=text, value=value, variable=self.var_mode, command=self.on_mode).pack(anchor="w")
-        lv = ttk.LabelFrame(f, text="Level", padding=6)
-        lv.pack(fill=tk.X, pady=(8, 0))
+        self.level_frame = ttk.LabelFrame(f, text="Level", padding=6)
+        self.level_frame.pack(fill=tk.X, pady=(8, 0))
         self.var_level = tk.StringVar(f, self.level)
-        for k, name in enumerate(self.levels):
-            ttk.Radiobutton(lv, text=LEVEL_NAMES[name], value=name, variable=self.var_level, command=self.on_level).grid(row=k // 2, column=k % 2, sticky="w", padx=(0, 14))
+        self.build_level_radios()
         self.box = ttk.Frame(f)
         self.box.pack(fill=tk.X, pady=(8, 0))
         # a group number box (Single group(s))
@@ -597,6 +616,14 @@ class UmapWindow:
         self.cbar.bind("<Button-1>", self.on_legend_click)
         # the legend for Single group(s)
         self.legend = tk.Canvas(f, width=300, height=10, highlightthickness=0)
+        self.group_list = ttk.Frame(f)                      # the groups' numbers and colors (All groups), scrollable
+        self.group_canvas = tk.Canvas(self.group_list, width=300, height=120, highlightthickness=0, bg="white")
+        gsb = ttk.Scrollbar(self.group_list, orient=tk.VERTICAL, command=self.group_canvas.yview)
+        self.group_canvas.configure(yscrollcommand=gsb.set)
+        gsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.group_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.group_canvas.bind("<MouseWheel>", lambda e: self.group_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+        self.build_buttons(f)
         hov = ttk.LabelFrame(f, text="Under the pointer", padding=6)
         hov.pack(fill=tk.X, side=tk.BOTTOM, pady=(6, 0))
         self.var_cell = tk.StringVar(f, "Hover over a cell in the UMAP or a section.")
@@ -606,8 +633,39 @@ class UmapWindow:
         ttk.Label(f, text="wheel: zoom   drag: pan   double-click: whole view", foreground="gray40", wraplength=300).pack(anchor="w", side=tk.BOTTOM, pady=(0, 6))
         self.update_frames()
 
+    def build_level_radios(self):
+        for w in self.level_frame.winfo_children():
+            w.destroy()
+        for k, name in enumerate(self.levels):
+            ttk.Radiobutton(self.level_frame, text=LEVEL_NAMES[name], value=name, variable=self.var_level, command=self.on_level).grid(row=k // 2, column=k % 2, sticky="w", padx=(0, 14))
+
+    def build_buttons(self, f):
+        ttk.Style(self.root).configure("Side.TButton", font=("Segoe UI", 9))
+        bar = ttk.Frame(f)
+        bar.pack(fill=tk.X, side=tk.BOTTOM, pady=(8, 0))
+        bar.columnconfigure(0, weight=1)
+        bar.columnconfigure(1, weight=1)
+        self.group_buttons = []
+        rows = ((("Settings...", self.open_settings, False), ("Open data folder", self.open_data_folder, False)),
+                (("Save section maps", self.save_section_maps, False), ("Save UMAP", self.save_umap, False)),
+                (("Export DEGs", self.export_degs, True), ("Export expression", self.export_expression, True)),
+                (("Export coordinates", self.export_coordinates, True), ("3D view", self.show_3d, True)),
+                (("3D in browser", self.show_3d_browser, True), ("Close", self.close, False)))
+        for r, pair in enumerate(rows):
+            for c, (text, cmd, grouped) in enumerate(pair):
+                b = ttk.Button(bar, text=text, command=cmd, style="Side.TButton")
+                b.grid(row=r, column=c, sticky="ew", padx=2, pady=2)
+                if grouped:
+                    self.group_buttons.append(b)
+        self.update_group_buttons()
+
+    def update_group_buttons(self):
+        """The group exports and 3D views are for the groups typed in Single group(s)."""
+        for b in self.group_buttons:
+            b.state(["!disabled"] if self.mode == "single" else ["disabled"])
+
     def update_frames(self):
-        for w in (self.id_frame, self.gene_frame, self.legend):
+        for w in (self.id_frame, self.gene_frame, self.legend, self.group_list):
             w.pack_forget()
         if self.mode == "single":
             self.id_frame.pack(fill=tk.X)
@@ -708,6 +766,7 @@ class UmapWindow:
                 return
         self.mode = mode
         self.update_frames()
+        self.update_group_buttons()
         self.recolor()
 
     def on_level(self):
@@ -725,12 +784,16 @@ class UmapWindow:
     def recolor(self):
         self.var_status.set("")
         self.legend.pack_forget()
+        self.group_list.pack_forget()
         if self.mode == "all":
             self.color_all()
         elif self.mode == "single":
             self.color_single()
         else:
             self.color_gene()
+
+    def dot_scale(self):
+        return self.host.get("umap_circle_sizes", {}).get(self.viewer_settings.get("umap_circle_size", "Default"), 1.0)
 
     def apply(self, rgb_run, order_run, bg_rgb_fn, labels=None, extra_umap_layers=(), dark=False):
         """Show the colouring. `rgb_run`: (n, 3) colour of each run cell; `order_run`: the order to draw them in (lowest first);
@@ -741,8 +804,9 @@ class UmapWindow:
         self.umap.set_background(bgc)
         for t in self.tiles:
             t["pc"].set_background(bgc)
-        self.umap.set_layers([{"x": self.coords[o, 0], "y": self.coords[o, 1], "rgb": rgb_run[o], "size": 4}] + list(extra_umap_layers))
+        self.umap.set_layers([{"x": self.coords[o, 0], "y": self.coords[o, 1], "rgb": rgb_run[o], "size": 4 * self.dot_scale()}] + list(extra_umap_layers))
         self.umap.clear_labels()
+        self.label_info = list(labels or [])
         for text, x, y, color in labels or []:
             self.umap.add_label(text, x, y, color)
         self.umap.reposition()
@@ -821,10 +885,33 @@ class UmapWindow:
             dark = (lut[g].astype(float) * 0.55).astype(int)               # (the group's own color, darker)
             labels.append((m.group(1) if m else str(uniques[g]), row["x"], row["y"], "#%02x%02x%02x" % tuple(dark)))
         self.apply(rgb, np.arange(self.n), bg_fn, labels)
-        self.umap.current = f"all_{level}"
+        self.view_kind, self.view_token = "all", f"all_{level}"
+        self.view_title = f"All {LEVEL_NAMES[level].lower()}s"
+        rank_of = np.full(len(uniques), -1)
+        rank_of[ranked] = np.arange(len(ranked))
+        self.export_cat = {"rank": np.where(codes >= 0, rank_of[np.maximum(codes, 0)], -1), "title": LEVEL_NAMES[level],
+                           "entries": [(hexcolor(rank_color(r)), str(uniques[u]), int(counts[u])) for r, u in enumerate(ranked)]}
+        self.shown_values = None
         n_cat = int((counts > 0).sum())
         self.var_status.set(f"Showing all {n_cat} {LEVEL_NAMES[level].lower()}s" + (f"; the {len(ranked)} largest colored, the rest gray." if n_cat > len(ranked) else " (numbers at each center)."))
         self.values = None
+        self.draw_group_list(ranked, uniques, counts)
+
+    def draw_group_list(self, ranked, uniques, counts):
+        """The colored groups by number, each with its swatch and cell count (the ones past the colored cap are gray and not listed)."""
+        c = self.group_canvas
+        c.delete("all")
+        rows = []
+        for r, u in enumerate(ranked):
+            m = re.match(r"^\s*(\d+)", str(uniques[u]))
+            rows.append((int(m.group(1)) if m else 10 ** 9, m.group(1) if m else str(uniques[u]), hexcolor(rank_color(r)), int(counts[u])))
+        rows.sort()
+        for k, (_n, label, col, cnt) in enumerate(rows):
+            y = 3 + 18 * k
+            c.create_rectangle(6, y + 2, 18, y + 14, fill=col, outline="")
+            c.create_text(26, y, anchor="nw", text=f"{label}  ({cnt})", font=("Segoe UI", 9))
+        c.configure(scrollregion=(0, 0, 300, 6 + 18 * len(rows)))
+        self.group_list.pack(fill=tk.BOTH, expand=True, pady=(6, 0), after=self.box)
 
     def parse_ids(self):
         ids, bad = [], []
@@ -874,6 +961,14 @@ class UmapWindow:
 
         self.apply(rgb, order, bg_fn)
         counts = {t: int((uid[np.maximum(codes, 0)] == t)[codes >= 0].sum()) for t in ids}
+        full = {t: (str(uniques[np.flatnonzero(uid == t)[0]]) if (uid == t).any() else f"{LEVEL_NAMES[level]} {t}") for t in ids}
+        self.last_ids = {"level": level, "targets": ids, "colors": colors, "counts": counts}
+        self.view_kind, self.view_token = "single", f"{level}_{'-'.join(str(t) for t in ids)}"
+        self.view_title = f"{LEVEL_NAMES[level]} {', '.join(str(t) for t in ids)}"
+        order_of = {t: i for i, t in enumerate(ids)}
+        self.export_cat = {"rank": np.where((codes >= 0) & (hit[np.maximum(codes, 0)] > 0), hit[np.maximum(codes, 0)] - 1, -1), "title": LEVEL_NAMES[level],
+                           "entries": [(hexcolor(colors[t]), full[t], counts[t]) for t in ids]}
+        self.shown_values = None
         parts = []
         if ids:
             parts.append("Highlighting " + ", ".join(f"{t} ({counts[t]} cells)" for t in ids if counts[t]))
@@ -1031,9 +1126,16 @@ class UmapWindow:
         if self.mode not in ("gene", "imputed") or (self.mode == "imputed") != imputed:
             return
         self.values = [(g, pv[0]) for g, pv in zip(genes, per_gene)]
+        self.view_token = "_".join(genes) + ("_imputed" if imputed else "")
+        self.export_cat = None
         if len(genes) == 1:
+            self.view_kind = "gene"
+            self.view_title = f"{genes[0]}{' [imputed]' if imputed else ''}"
+            self.shown_values = (genes[0], dataset, scale, per_gene[0][0])
             self.show_single(genes[0], dataset, scale, per_gene[0][0], per_gene[0][1])
         else:
+            self.view_kind, self.multi_genes = "multi", list(genes)
+            self.view_title = " / ".join(f"{g} ({CHANNEL_NAMES[i]})" for i, g in enumerate(genes)) + (" [imputed]" if imputed else "")
             self.show_multi(genes, dataset, scale, per_gene)
 
     def show_single(self, gene, dataset, scale, vals, bg_vals):
@@ -1090,7 +1192,9 @@ class UmapWindow:
             vis = np.flatnonzero(inten > 0)
             vis = vis[np.argsort(inten[vis], kind="stable")]
             drgb = (core.multi_gene_rgb([d[vis] for d in dots], (0.0, 0.0, 0.0)) * 255).astype(np.uint8)
-            extra = [{"x": self.coords[vis, 0], "y": self.coords[vis, 1], "rgb": drgb, "size": 2}]
+            half = self.viewer_settings.get("gene456_shape") == "half circle"       # (the Settings choice: a half circle as big as the base one, or a small circle)
+            extra = [{"x": self.coords[vis, 0], "y": self.coords[vis, 1], "rgb": drgb, "size": (4 if half else 2) * self.dot_scale(),
+                      "shape": "half" if half else "circle"}]
 
         def bg_fn(label):
             if not self.bg:
@@ -1349,14 +1453,14 @@ class UmapWindow:
             self.tile_scroll.yview_moveto(max(0.0, (top - 10) / total))
 
     def umap_motion(self, px, py):
-        if px is None:
+        if px is None or not self.viewer_settings.get("hover_enabled", True):
             self.hover(None)
             return
         i = self.umap.nearest(self.umap_tree, px, py)
         self.hover(None if i is None else self.cell_info(i, "umap"))
 
     def tile_motion(self, tile, px, py):
-        if px is None:
+        if px is None or not self.viewer_settings.get("hover_enabled", True):
             self.hover(None)
             return
         if tile["tree"] is None:
@@ -1383,6 +1487,101 @@ class UmapWindow:
             return
         u = int(tile["umap_of"][k])
         self.hover(self.cell_info(u, "section") if u >= 0 else self.bg_cell_info(tile["label"], int(tile["good"][k])))
+
+    # ---- Settings and the UMAP parameters
+
+    def open_settings(self):
+        dialog = self.host.get("settings_dialog")
+        if dialog is None or self.busy:
+            return
+        new = dialog(self.root, self.viewer_settings, umap_params=self.params, n_cells=self.n)
+        if new is None:
+            return
+        new_params = new.pop("umap_params", None)        # (belong to this run, not to the user's preferences)
+        shape_changed = new.get("gene456_shape") != self.viewer_settings.get("gene456_shape")
+        size_changed = new.get("umap_circle_size") != self.viewer_settings.get("umap_circle_size")
+        self.viewer_settings.update(new)
+        self.host["save_viewer_settings"](self.viewer_settings)
+        if not self.viewer_settings.get("hover_enabled", True):
+            self.hover(None)
+        if (size_changed or (shape_changed and self.mode in ("gene", "imputed"))) and not self.busy:
+            self.recolor()
+        if new_params is not None and self.params is not None:
+            self.switch_variant(new_params)
+
+    def switch_variant(self, new_params):
+        """Show the UMAP for these parameters: from memory, else from the run's cache, else by calculating it (progress window)."""
+        h = self.host
+        key = h["umap_params_key"](new_params)
+        if key == h["umap_params_key"](self.params):
+            return
+        entry = self.variants.get(key)
+        message = None
+        if entry is None:
+            folder = self.run_folder if self.run_folder is not None else h["CACHE_DIR"]
+            self.var_status.set("Working... recalculating the UMAP; the viewer is locked until it finishes.")
+            self.root.config(cursor="watch")
+            self.root.update()
+            try:
+                csv_path, message = h["ensure_umap_variant_csv"](self.adata, new_params, folder)
+                if csv_path is None:
+                    self.var_status.set(message or "The UMAP was not recalculated.")
+                    return
+                try:
+                    new_coords, new_leiden = h["load_umap_variant"](csv_path, self.adata.obs_names)
+                except Exception as e:
+                    self.var_status.set(f"Could not read the recalculated UMAP: {e}")
+                    return
+            finally:
+                self.root.config(cursor="")
+            entry = (np.asarray(new_coords, dtype=float)[:, :2], None if new_leiden is None else np.asarray(new_leiden, dtype=object).astype(str))
+            self.variants[key] = entry
+        self.install_variant(entry[0], entry[1], new_params)
+        self.var_status.set(message or f"UMAP shown with {h['umap_params_label'](new_params)}.")
+
+    def install_variant(self, new_coords, new_leiden, new_params):
+        """Swap the embedding and its Leiden clustering in place and redraw everything derived from either."""
+        h = self.host
+        self.hover(None)
+        self.coords = np.asarray(new_coords, dtype=float)[:, :2].copy()
+        if new_leiden is not None:
+            self.adata.obs[LEIDEN_KEY] = pd.Categorical(new_leiden)
+            self.info["leiden"] = np.asarray(new_leiden).astype(str)
+        else:
+            self.adata.obs.drop(columns=[LEIDEN_KEY], inplace=True, errors="ignore")
+            self.info["leiden"] = None
+        for k in [k for k in self.cache if isinstance(k, tuple) and k[1] == "leiden"]:
+            del self.cache[k]
+        self.levels = [k for k in LEVEL_NAMES if self.info[k] is not None]
+        if self.level not in self.levels:
+            self.level = self.levels[0]
+            self.var_level.set(self.level)
+        self.build_level_radios()
+        c = self.coords
+        padx = (c[:, 0].max() - c[:, 0].min()) * 0.05 or 1.0
+        pady = (c[:, 1].max() - c[:, 1].min()) * 0.05 or 1.0
+        self.umap.home = (c[:, 0].min() - padx, c[:, 0].max() + padx, c[:, 1].min() - pady, c[:, 1].max() + pady)
+        self.umap.fit()
+        self.umap_tree = cKDTree(c)
+        self.params = h["normalize_umap_params"](new_params)
+        self.root.title(self.window_title())
+        if self.run_folder is not None:
+            h["write_last_umap_params"](self.run_folder, self.params)
+        self.recolor()
+
+    def window_title(self):
+        title = "Interactive UMAP viewer"
+        h = self.host
+        if self.params is not None and not h["umap_params_are_default"](self.params):
+            title = f"{title} ({h['umap_params_label'](self.params)})"
+        if self.run_folder is not None:
+            title = f"{Path(self.run_folder).name} \u2014 {title}"
+        return title
+
+    def open_data_folder(self):
+        folder = Path(self.run_folder) if self.run_folder is not None else Path(self.host["CACHE_DIR"])
+        folder.mkdir(parents=True, exist_ok=True)
+        self.host["open_with_default_viewer"](folder)
 
     # ---- closing
 
@@ -1412,10 +1611,12 @@ class UmapWindow:
 
 
 def show_umap_window_tk(adata, abc_cache, imputed_state=None, adata_backed=None, rois=None, run_folder=None, ensure_imputed=None, title=None,
-                        parent=None):
-    """Open the viewer and return when it is closed."""
+                        parent=None, host=None, params=None):
+    """Open the viewer and return when it is closed. `host`: the browser's own functions (see UmapWindow); `params`: the UMAP parameters
+    the embedding in `adata` was made with."""
     if "X_umap" not in adata.obsm:
         print("No UMAP embedding available; skipping the interactive UMAP viewer.")
         return
-    win = UmapWindow(adata, abc_cache, imputed_state, adata_backed, rois, run_folder, ensure_imputed, title or "Interactive UMAP viewer", parent)
+    win = UmapWindow(adata, abc_cache, imputed_state, adata_backed, rois, run_folder, ensure_imputed, title or "Interactive UMAP viewer", parent,
+                     host=host, params=params)
     win.run()
