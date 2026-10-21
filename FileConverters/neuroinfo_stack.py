@@ -407,6 +407,7 @@ class Stack:
     pixel_corrected: bool = False    # pixel_um was changed here: the next export writes it into the JPX's own metadata
     deleted: int = 0                 # how many sections were deleted since opening
     case_file: str = ""              # the NeuroInfo case file (.h5) the alignment was recovered from, when it was
+    case_file_path: str = ""         # ...and where it is (the full path)
     z_spacing_um: float = 0.0        # distance between adjacent sections (um): NeuroInfo's xmp:SizeZ in the JPX; 0 if not known
     unsaved: bool = False            # made in memory from slide scans (no JPX behind it yet): everything is still to be exported
 
@@ -727,7 +728,8 @@ def _load_neuroinfo(jpx_path, locate=None):
     frames = [b for b in read_boxes(jpx_path) if b.kind == b"jp2c"]
     with open(jpx_path, "rb") as f:
         w, h, nc = codestream_size(f, frames[0])
-    stack = Stack(jpx_path, w, h, nc, pixel_um, origin=os.path.abspath(jpx_path), case_file=os.path.basename(h5_path))
+    stack = Stack(jpx_path, w, h, nc, pixel_um, origin=os.path.abspath(jpx_path), case_file=os.path.basename(h5_path),
+                  case_file_path=os.path.abspath(h5_path))
 
     with _h5py().File(h5_path, "r") as f:
         bm = f["BrainMaker"]

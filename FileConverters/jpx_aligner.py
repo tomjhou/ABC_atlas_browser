@@ -2776,6 +2776,191 @@ class Aligner:
                          f"{-s.rotation_deg:+.2f}", "yes" if s.mirrored else "no", len(s.case_points)))
         return rows
 
+    def build_h5_tab(self, parent):
+        """The third tab of the analysis window: the case file's (.h5) contents as a tree. Groups open and close; the details of what is
+        selected (its attributes, and a dataset's shape, type and values) are shown beside it. Children are read when a group is opened,
+        so a big file opens at once (and a group that links back to one above it can be followed as far as one cares to)."""
+        st = self.stack
+        tab = ttk.Frame(parent)
+        path = getattr(st, "case_file_path", "") or ""
+        if not path and st.case_file:
+            path = os.path.join(os.path.dirname(os.path.abspath(st.jpx_path)), st.case_file)
+        if not path or not os.path.isfile(path):
+            ttk.Label(tab, padding=20, justify=tk.LEFT, text=(
+                "This stack has no NeuroInfo case file (.h5) to browse: it was opened from a JPX written by this tool, or from a project.\n"
+                "(For a reconstruction opened from NeuroInfo's own files, this tab shows the case file.)" if not st.case_file else
+                f"The case file {st.case_file} was not found at its place.")).pack(anchor="w")
+            return tab
+        h5py = ns._h5py()
+        try:
+            f = h5py.File(path, "r", locking=False)
+        except TypeError:                                  # (an h5py without the locking option)
+            f = h5py.File(path, "r")
+        tab.bind("<Destroy>", lambda e: (f.close() if e.widget is tab else None), add="+")
+        top = ttk.Frame(tab, padding=(6, 6, 6, 0))
+        top.pack(fill=tk.X)
+        ttk.Label(top, text=path, foreground="gray30").pack(side=tk.LEFT)
+        paned = ttk.PanedWindow(tab, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        left = ttk.Frame(paned)
+        paned.add(left, weight=2)
+        scale = self.root.winfo_fpixels("1i") / 96
+        ttk.Style(tab).configure("H5.Treeview", rowheight=round(22 * scale))
+        tree = ttk.Treeview(left, columns=("what",), selectmode="browse", style="H5.Treeview")
+        tree.heading("#0", text="Name")
+        tree.heading("what", text="What")
+        tree.column("#0", width=round(330 * scale), stretch=True)
+        tree.column("what", width=round(230 * scale), stretch=False)
+        ys = ttk.Scrollbar(left, orient=tk.VERTICAL, command=tree.yview)
+        xs = ttk.Scrollbar(left, orient=tk.HORIZONTAL, command=tree.xview)
+        tree.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        left.rowconfigure(0, weight=1)
+        left.columnconfigure(0, weight=1)
+        tree.grid(row=0, column=0, sticky="nsew")
+        ys.grid(row=0, column=1, sticky="ns")
+        xs.grid(row=1, column=0, sticky="ew")
+        right = ttk.Frame(paned)
+        paned.add(right, weight=3)
+        text = tk.Text(right, wrap="none", font=("Consolas", 10), state="disabled", background="white")
+        tys = ttk.Scrollbar(right, orient=tk.VERTICAL, command=text.yview)
+        txs = ttk.Scrollbar(right, orient=tk.HORIZONTAL, command=text.xview)
+        text.configure(yscrollcommand=tys.set, xscrollcommand=txs.set)
+        right.rowconfigure(0, weight=1)
+        right.columnconfigure(0, weight=1)
+        text.grid(row=0, column=0, sticky="nsew")
+        tys.grid(row=0, column=1, sticky="ns")
+        txs.grid(row=1, column=0, sticky="ew")
+        MAX_ROWS = 300
+
+        def b(v):
+            return v.decode("utf-8", "replace") if isinstance(v, bytes) else v
+
+        def fmt(v, width=110):
+            """A value (attribute or dataset content) as text: short ones in one line, arrays summarised."""
+            v = b(v)
+            if isinstance(v, np.ndarray) and v.dtype.kind in "SO":
+                v = np.array([b(x) for x in v.ravel()], dtype=object).reshape(v.shape)
+            if isinstance(v, np.ndarray):
+                return np.array2string(v, max_line_width=width, threshold=60, edgeitems=4, suppress_small=True, separator=", ")
+            if isinstance(v, np.generic):
+                return str(v.item()) if v.dtype.kind not in "SO" else str(b(v.item()))
+            return str(v)
+
+        def what(obj, link):
+            tag = "" if link is None or isinstance(link, h5py.HardLink) else (
+                " (soft link to " + link.path + ")" if isinstance(link, h5py.SoftLink) else " (external link)")
+            if isinstance(obj, h5py.Group):
+                return f"group, {len(obj)} item{'s' if len(obj) != 1 else ''}{tag}"
+            if isinstance(obj, h5py.Dataset):
+                kind = "compound" if obj.dtype.names else str(obj.dtype)
+                return f"dataset {obj.shape} {kind}{tag}"
+            return type(obj).__name__ + tag
+
+        def fill(item):
+            """Replace an item's placeholder child by the real children (done when the group is first opened)."""
+            kids = tree.get_children(item)
+            if len(kids) == 1 and tree.set(kids[0], "what") == "":
+                tree.delete(kids[0])
+            else:
+                return
+            group = f[item] if item != "/" else f
+            for name in group:
+                full = (item.rstrip("/") + "/" + name)
+                try:
+                    link = group.get(name, getlink=True)
+                    obj = group.get(name)
+                except Exception as e:
+                    tree.insert(item, tk.END, iid=full, text=name, values=(f"unreadable: {e}",))
+                    continue
+                tree.insert(item, tk.END, iid=full, text=name, values=(what(obj, link),))
+                if isinstance(obj, h5py.Group) and len(obj):
+                    tree.insert(full, tk.END, values=("",))            # (a placeholder: makes the item expandable)
+
+        def show(item):
+            obj = f[item] if item != "/" else f
+            lines = [f"Path:  {item}"]
+            lines.append("Type:  " + (what(obj, None)))
+            try:
+                info = h5py.h5o.get_info(obj.id)
+                lines.append(f"Object address in the file: {info.addr}   (the same address under two paths is one object)")
+            except Exception:
+                pass
+            if isinstance(obj, h5py.Dataset):
+                lines.append(f"Shape: {obj.shape}   dtype: {obj.dtype}   chunks: {obj.chunks}   compression: {obj.compression}")
+            attrs = dict(obj.attrs)
+            lines.append("")
+            lines.append(f"Attributes ({len(attrs)}):")
+            for k, v in attrs.items():
+                lines.append(f"  {k} = {fmt(v)}")
+            if not attrs:
+                lines.append("  (none)")
+            if isinstance(obj, h5py.Dataset):
+                lines.append("")
+                try:
+                    n = obj.shape[0] if obj.shape else 1
+                    data = obj[:MAX_ROWS] if obj.shape else obj[()]
+                    if obj.dtype.names:
+                        lines.append(f"Values ({'first ' + str(MAX_ROWS) + ' of ' if n > MAX_ROWS else ''}{n} rows; fields {', '.join(obj.dtype.names)}):")
+                        for row in data:
+                            lines.append("  " + ",  ".join(f"{name}={fmt(row[name])}" for name in obj.dtype.names))
+                    else:
+                        lines.append(f"Values{' (first ' + str(MAX_ROWS) + ' of ' + str(n) + ' along the first axis)' if n > MAX_ROWS else ''}:")
+                        lines.append(fmt(data, 140) if not isinstance(data, np.ndarray) or data.ndim < 2 else
+                                     "\n".join("  " + fmt(r, 140) for r in data))
+                except Exception as e:
+                    lines.append(f"Values could not be read: {type(e).__name__}: {e}")
+            elif isinstance(obj, h5py.Group):
+                lines.append("")
+                lines.append(f"Members ({len(obj)}): " + ", ".join(list(obj)[:60]) + (" ..." if len(obj) > 60 else ""))
+            text.config(state="normal")
+            text.delete("1.0", tk.END)
+            text.insert("1.0", "\n".join(lines))
+            text.config(state="disabled")
+
+        root_item = "/"
+        tree.insert("", tk.END, iid=root_item, text="/", values=(what(f, None),), open=False)
+        tree.insert(root_item, tk.END, values=("",))
+        fill(root_item)
+        tree.item(root_item, open=True)
+        tree.bind("<<TreeviewOpen>>", lambda e: fill(tree.focus()))
+        tree.bind("<<TreeviewSelect>>", lambda e: tree.selection() and show(tree.selection()[0]))
+        tree.selection_set(root_item)
+        bar = ttk.Frame(tab, padding=(6, 0, 6, 6))
+        bar.pack(fill=tk.X)
+
+        def expand_below(levels):
+            """Open the selected item and everything under it, `levels` deep."""
+            sel = tree.selection()
+            if not sel:
+                return
+
+            def go(item, depth):
+                fill(item)
+                tree.item(item, open=True)
+                if depth > 1:
+                    for child in tree.get_children(item):
+                        if tree.get_children(child):
+                            go(child, depth - 1)
+            go(sel[0], levels)
+
+        def collapse_all():
+            for item in tree.get_children(root_item):
+                tree.item(item, open=False)
+            tree.see(root_item)
+
+        def copy_path():
+            sel = tree.selection()
+            if sel:
+                tab.clipboard_clear()
+                tab.clipboard_append(sel[0])
+
+        ttk.Button(bar, text="Open 2 levels below", command=lambda: expand_below(2)).pack(side=tk.LEFT)
+        ttk.Button(bar, text="Collapse all", command=collapse_all).pack(side=tk.LEFT, padx=6)
+        ttk.Button(bar, text="Copy path", command=copy_path).pack(side=tk.LEFT)
+        ttk.Label(bar, foreground="gray30", text="Open a group to see what it holds; select anything for its attributes and values.").pack(side=tk.LEFT, padx=12)
+        tab.h5_tree = tree     # (for tests)
+        return tab
+
     def build_outline_tab(self, parent):
         """The second tab of the analysis window: choose a slide at the left; at the right every outline of that slide, numbered,
         drawn at the coordinates the case file stores (no transform of any kind)."""
@@ -3072,6 +3257,7 @@ class Aligner:
         tab1 = ttk.Frame(notebook)
         notebook.add(tab1, text="Sections")
         notebook.add(self.build_outline_tab(notebook), text="Outlines by slide (raw coordinates)")
+        notebook.add(self.build_h5_tab(notebook), text="Case file (.h5) browser")
         ttk.Label(tab1, text=summary, padding=(8, 6)).pack(anchor="w")
         frame = ttk.Frame(tab1)
         frame.pack(fill=tk.BOTH, expand=True, padx=8)
