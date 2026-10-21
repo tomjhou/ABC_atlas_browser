@@ -1163,11 +1163,12 @@ def _crop_zero(arr, x0, y0, x1, y1):
     return out
 
 
-def czi_candidates(stack, czi_path, section, frame, coarse=None, hint=None, pre_reduced=0):
+def czi_candidates(stack, czi_path, section, frame, coarse=None, hint=None, pre_reduced=0, scenes=None):
     """Coarse matches of the section's frame (H x W x C) against every scene of the scan: [(score, scene, X0, Y0), ...], best
     first, each with the origin it implies (to within a few pixels). `coarse` is a dict that keeps the scenes' coarse images
     from one call to the next (they are the same for every section of the scan). With hint = (X0, Y0, band_x, band_y), the
-    origin is only looked for within that band around the expected one (far fewer places to try)."""
+    origin is only looked for within that band around the expected one (far fewer places to try). With `scenes` (a set of scene
+    numbers) only those scenes are searched."""
     boxes = czi_scenes(czi_path)
     level = min(3, min(czi_levels(czi_path, i) for i in range(len(boxes))) - 1)
     S = 2 ** level
@@ -1179,6 +1180,8 @@ def czi_candidates(stack, czi_path, section, frame, coarse=None, hint=None, pre_
         tmpl = _czi_template(frame.astype(np.float32).mean(2), section, stack, S, box)
     found = []
     for i, (x0, y0, w, h) in enumerate(boxes):
+        if scenes is not None and i not in scenes:
+            continue
         key = (czi_path, i, level)
         if coarse is not None and key in coarse:
             arr = coarse[key]
@@ -1440,7 +1443,7 @@ def _fine_match(czi_path, scene, tmpl, sbox, X0, Y0, margins=FINE_MARGINS):
     return best
 
 
-def czi_locate_fast(stack, czi_path, section, frame, coarse, guesses=(), candidate=None, strong=0.9, hint=None):
+def czi_locate_fast(stack, czi_path, section, frame, coarse, guesses=(), candidate=None, strong=0.9, hint=None, scenes=None):
     """Place a section on the scan from `frame` (a _Frame). Returns (candidates, (X0, Y0, score) or None).
 
     `guesses` are origins (X0, Y0, margin) expected from the sections placed already; each is tried first (a match at the
@@ -1499,6 +1502,10 @@ def czi_locate_fast(stack, czi_path, section, frame, coarse, guesses=(), candida
         if hint is not None:   # (the coarse search only over the band where the origin is expected)
             found = czi_candidates(stack, czi_path, section, small, coarse, hint=hint, pre_reduced=8)
         if not found or found[0][0] < strong:
+            near = scenes() if callable(scenes) else scenes      # (the scenes the stage positions put it in; worked out only now it is needed)
+            if near:
+                found = czi_candidates(stack, czi_path, section, small, coarse, pre_reduced=8, scenes=near)
+        if not found or found[0][0] < strong:
             found = czi_candidates(stack, czi_path, section, small, coarse, pre_reduced=8)
     if not found or (candidate is None and found[0][0] < strong):
         return found, None
@@ -1506,7 +1513,7 @@ def czi_locate_fast(stack, czi_path, section, frame, coarse, guesses=(), candida
     return found, attempt(X0, Y0, scene, FINE_MARGINS)
 
 
-def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progress=None, on_located=None, workers=2, share=True, scans_at_once=None):
+def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progress=None, on_located=None, workers=None, share=True, scans_at_once=None):
     """Locate the sections of every .czi source of the stack that have no czi_origin yet, so that they can be rendered.
 
     NeuroInfo's slide coordinates relate to the scan by an offset (X0, Y0) that it does not record, found here by matching each
@@ -1515,8 +1522,11 @@ def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progr
     taking the X0 the clear matches agree on. Returns {file name: error text or ""}. progress(done, total, text) is called as
     the sections are located, and on_located(section) as soon as each one has its czi_origin (possibly from another thread).
     With `share` (and 6 or more sections in the scan) only a few sections are located and the scan's other sections are given
-    their origin (czi_assumed is set on those); see verify_czi_origins."""
+    their origin (czi_assumed is set on those); see verify_czi_origins. `workers` is how many sections of one scan are looked at
+    at once; by default the processors (all but two) shared out among the scans that are located at the same time, so that a stack
+    from one or two scans uses them all and one from many scans keeps two for each, as before."""
     frames = [b for b in read_boxes(stack.jpx_path) if b.kind == b"jp2c"]
+    worker_count = [workers or 2]       # (set below, once it is known how many scans are located at once)
 
     def load_frame(sec):
         yield_to_foreground()
@@ -1588,8 +1598,49 @@ def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progr
                 if len(done_) >= 4 and np.ptp(ys) > 3000:
                     slope, icpt = np.polyfit(ys, y0s, 1)
                     resid = float(np.std(y0s - (slope * ys + icpt)))
-                    return float(np.median(xs)), float(slope * y + icpt), 100, int(max(1100, 4 * resid + 300))
-                return None
+                    if 4 * resid + 300 <= 1500:
+                        return float(np.median(xs)), float(slope * y + icpt), 100, int(max(1100, 4 * resid + 300))
+                # Y0 follows neither one value nor the outline's y (as in the scans of NeuroInfo 2026, where it differs between sections by
+                # thousands of pixels): the Y0 of the sections nearest in the case file's coordinates is the best guess, with a band
+                # wide enough for how far apart those few are
+                if not done_ or not len(sec.saved_points) or len(done_[0]) < 5:
+                    return None
+                near = sorted(done_, key=lambda d: np.hypot(d[3] - float(sec.saved_points[:, 0].mean()), d[4] - float(sec.saved_points[:, 1].mean())))[:3]
+                y0n = np.array([d[2] for d in near])
+                band = int(max(1500, 1.2 * np.ptp(y0n) + 800))
+                if band > 3000:      # (a wide band lets the search match against the empty padding past a scene's edge: not worth it; the
+                    return None      # scenes the stage positions name are the better way to narrow it down then)
+                return float(np.median(xs)), float(y0n[0]), 100, band
+
+            def scenes_for(sec):
+                """The scenes of the scan the stage positions put the section in, or None. The case file's coordinates are the stage's
+                with an offset that is (nearly) the same for the whole scan: it is taken from the sections placed so far, by finding where
+                each lay in stage um (its scene's own centre, and its pixel offset from it) and comparing with its case-file position.
+                The section's expected stage position then says which scenes (with 3 mm to spare) to look in, instead of all of them."""
+                with lock:
+                    done_ = list(located_so_far)
+                if not done_ or not len(sec.saved_points) or len(done_[0]) < 5:
+                    return None
+                stage, boxes = czi_scene_stage(path), czi_scenes(path)
+                if not stage or len(stage) != len(boxes):
+                    return None
+                pxs = stack.source_pixel_um or stack.pixel_um
+                offs = []
+                for _y, X0, Y0, cx, cy in done_:
+                    px_x, px_y = cx / stack.pixel_um + X0, -cy / stack.pixel_um + Y0
+                    j = next((i for i, (bx, by, bw, bh) in enumerate(boxes) if bx <= px_x < bx + bw and by <= px_y < by + bh), None)
+                    if j is None:
+                        continue
+                    bx, by, bw, bh = boxes[j]
+                    sx = stage[j][0] + (px_x - (bx + bw / 2)) * pxs
+                    sy = stage[j][1] + (px_y - (by + bh / 2)) * pxs
+                    offs.append((cx - sx, cy - sy))
+                if not offs:
+                    return None
+                ox, oy = np.median(np.array(offs), axis=0)
+                x, y = float(sec.saved_points[:, 0].mean()) - ox, float(sec.saved_points[:, 1].mean()) - oy
+                near = {i for i, (scx, scy, sw, sh) in enumerate(stage) if abs(x - scx) <= sw / 2 + 3000 and abs(y - scy) <= sh / 2 + 3000}
+                return near if near and len(near) < len(boxes) else None
 
             def guesses_for(sec):
                 """Origins (X0, Y0, margin) to try for the section first, from those placed already in this scan. X0 is the same
@@ -1625,7 +1676,7 @@ def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progr
                 report()
                 if fast:
                     found, placed = czi_locate_fast(stack, path, sec, payload(sec), coarse, guesses_for(sec), strong=strong,
-                                                    hint=hint_for(sec))
+                                                    hint=hint_for(sec), scenes=lambda: scenes_for(sec))
                 else:
                     frame = load_frame(sec)
                     found = czi_candidates(stack, path, sec, frame, coarse)
@@ -1640,7 +1691,8 @@ def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progr
                     if score >= accept:
                         sec.czi_origin = (X0, Y0)
                         with lock:
-                            located_so_far.append((float(sec.saved_points[:, 1].mean()) / stack.pixel_um, X0, Y0))
+                            located_so_far.append((float(sec.saved_points[:, 1].mean()) / stack.pixel_um, X0, Y0,
+                                                   float(sec.saved_points[:, 0].mean()), float(sec.saved_points[:, 1].mean())))
                         if on_located:
                             on_located(sec)
                 active.discard(sec.index)
@@ -1658,7 +1710,7 @@ def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progr
             if first_path and path == first_path[0]:
                 first_ready.set()
             rest = todo[1:]
-            with ThreadPoolExecutor(max_workers=workers, initializer=lower_thread_priority) as pool:
+            with ThreadPoolExecutor(max_workers=worker_count[0], initializer=lower_thread_priority) as pool:
                 if fast and share and len(todo) >= 6:
                     # The sections of a scan often share one origin (the spread between them is at the level of the matching's
                     # own noise). So a few of the largest sections are located properly, and if the origin they agree on is
@@ -1747,6 +1799,9 @@ def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progr
     first_path[:] = todo_paths[:1]
     if scans_at_once is None:   # (a scan's own steps follow one another, so more scans at once is what keeps the processors busy: 45 s
         scans_at_once = max(4, min(12, int((os.cpu_count() or 8) * 0.6)))   # for 24 scans with 12, 59 s with 6, 50 s with 24 on 20 processors)
+    if workers is None:
+        busy = max(1, min(scans_at_once, len(todo_paths)))
+        worker_count[0] = max(2, min(8, max(2, (os.cpu_count() or 8) - 2) // busy))
     with ThreadPoolExecutor(max_workers=scans_at_once) as scan_pool:   # (several scans at once)
         list(scan_pool.map(do_scan, paths))
     return problems
