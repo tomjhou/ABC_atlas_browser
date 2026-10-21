@@ -937,11 +937,13 @@ def czi_slide_thumbnail(path, max_px=300, colors=None):
     return gray, (gx0, gy0, k), (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
 
 
-def render_czi_previews(stack, sections, scenes, lock, on_done=None, stop=None, workers=6):
+def render_czi_previews(stack, sections, scenes, lock, on_done=None, stop=None, workers=None):
     """Make the previews of .czi sections (the scene each lies in, once per scene, into the dict `scenes`, guarded by `lock`), the slide scans in
     parallel: a scan is read by one thread at a time (see _czi_lock_for), so one thread per scan, up to `workers` scans at once, each doing
     that scan's sections in the order given. on_done(section, preview or None, error or None) is called as each is ready (from the threads);
     `stop`, an Event, ends the work early."""
+    if workers is None:       # most of the cores (two are left for the window and the rest), at most 8: each decodes a big picture
+        workers = max(2, min(8, (os.cpu_count() or 4) - 2))
     by_path = {}
     for s in sections:
         by_path.setdefault(s.source_path, []).append(s)

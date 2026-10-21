@@ -86,7 +86,8 @@ def histogram_percentile(h, q):
     return lo + frac * (hi - lo)
 
 
-PREVIEW_WORKERS = 6   # slide scans whose sections' pictures are made at the same time
+PREVIEW_WORKERS = max(2, min(8, (os.cpu_count() or 4) - 2))   # slide scans whose sections' pictures are made at the same time: most of the
+# cores, leaving two for the window and the other work, and at most 8 (each decodes a big picture, so memory and the drive limit it too)
 PREVIEW_MAX_PX = ns.PREVIEW_MAX_PX   # longest side of the cached preview of each section
 THUMB_MAX_PX = 1600     # longest side of the slide thumbnail as it is built (it is scaled to the left pane's width when shown)
 CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
