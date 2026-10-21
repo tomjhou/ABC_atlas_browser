@@ -2810,7 +2810,7 @@ class Aligner:
         tree.heading("#0", text="Name")
         tree.heading("what", text="What")
         tree.column("#0", width=round(330 * scale), stretch=True)
-        tree.column("what", width=round(230 * scale), stretch=False)
+        tree.column("what", width=round(420 * scale), stretch=False)
         ys = ttk.Scrollbar(left, orient=tk.VERTICAL, command=tree.yview)
         xs = ttk.Scrollbar(left, orient=tk.HORIZONTAL, command=tree.xview)
         tree.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
@@ -2856,8 +2856,32 @@ class Aligner:
                 return f"dataset {obj.shape} {kind}{tag}"
             return type(obj).__name__ + tag
 
+        paths_of = {}       # object address -> the tree items showing that object so far (the same object can be reached by several paths)
+        addr_of = {}        # tree item -> its object's address
+
+        def address(obj):
+            try:
+                return h5py.h5o.get_info(obj.id).addr
+            except Exception:
+                return None
+
+        def brief(path):
+            """A path for a note in the tree: the last two names, with a short form of long ones (the full path is in the details)."""
+            parts = [(x if len(x) <= 14 else x[:8] + "…") for x in path.strip("/").split("/")]
+            return ("…/" if len(parts) > 2 else "/") + "/".join(parts[-2:])
+
+        def ancestors(item):
+            """The items above `item` and itself, nearest first."""
+            out = []
+            while item:
+                out.append(item)
+                item = tree.parent(item)
+            return out
+
         def fill(item):
-            """Replace an item's placeholder child by the real children (done when the group is first opened)."""
+            """Replace an item's placeholder child by the real children (done when the group is first opened). A child that is one of the
+            items above it (the file links groups back to ones above them) is marked and not opened again; one that is an object shown
+            elsewhere already is marked with where."""
             kids = tree.get_children(item)
             if len(kids) == 1 and tree.set(kids[0], "what") == "":
                 tree.delete(kids[0])
@@ -2872,19 +2896,33 @@ class Aligner:
                 except Exception as e:
                     tree.insert(item, tk.END, iid=full, text=name, values=(f"unreadable: {e}",))
                     continue
-                tree.insert(item, tk.END, iid=full, text=name, values=(what(obj, link),))
-                if isinstance(obj, h5py.Group) and len(obj):
+                a = address(obj)
+                note, tag = "", ()
+                back = next((x for x in ancestors(item) if a is not None and addr_of.get(x) == a), None)
+                if back is not None:
+                    note, tag = f"   ↺ the same object as {brief(back)} (above): not opened again", ("cycle",)
+                elif a is not None and paths_of.get(a):
+                    note, tag = f"   = the same object as {brief(paths_of[a][0])}", ("again",)
+                tree.insert(item, tk.END, iid=full, text=name, values=(what(obj, link) + note,), tags=tag)
+                if a is not None:
+                    addr_of[full] = a
+                    paths_of.setdefault(a, []).append(full)
+                if isinstance(obj, h5py.Group) and len(obj) and back is None:
                     tree.insert(full, tk.END, values=("",))            # (a placeholder: makes the item expandable)
 
         def show(item):
             obj = f[item] if item != "/" else f
             lines = [f"Path:  {item}"]
             lines.append("Type:  " + (what(obj, None)))
-            try:
-                info = h5py.h5o.get_info(obj.id)
-                lines.append(f"Object address in the file: {info.addr}   (the same address under two paths is one object)")
-            except Exception:
-                pass
+            a = address(obj)
+            if a is not None:
+                lines.append(f"Object address in the file: {a}   (the same address under two paths is one object)")
+                others = [x for x in paths_of.get(a, []) if x != item]
+                if others:
+                    lines.append("Also reached by (of the paths opened so far):")
+                    lines.extend("   " + x for x in others[:12])
+                    if len(others) > 12:
+                        lines.append(f"   ... and {len(others) - 12} more")
             if isinstance(obj, h5py.Dataset):
                 lines.append(f"Shape: {obj.shape}   dtype: {obj.dtype}   chunks: {obj.chunks}   compression: {obj.compression}")
             attrs = dict(obj.attrs)
@@ -2918,7 +2956,11 @@ class Aligner:
             text.config(state="disabled")
 
         root_item = "/"
+        tree.tag_configure("cycle", foreground="#b05a00")
+        tree.tag_configure("again", foreground="#5a5a5a")
         tree.insert("", tk.END, iid=root_item, text="/", values=(what(f, None),), open=False)
+        addr_of[root_item] = address(f)
+        paths_of.setdefault(addr_of[root_item], []).append(root_item)
         tree.insert(root_item, tk.END, values=("",))
         fill(root_item)
         tree.item(root_item, open=True)
