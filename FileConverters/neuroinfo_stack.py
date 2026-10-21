@@ -602,18 +602,23 @@ def _find_neuroinfo_files(jpx_path, locate=None):
 
 
 def neuroinfo_check(jpx_path):
-    """Whether a JPX can be opened: what it needs beside it, without asking anything. {"state": "own"} (written by this tool: its alignment is
-    inside it), {"state": "found", "xml": path, "h5": path}, {"state": "missing", "missing": ["xml" and/or "h5"], "folder": folder}, or
+    """Whether a JPX can be opened: what it needs beside it, found from a listing of its folder alone (quick: nothing is read from the files;
+    which of several .xml / .h5 files fits is settled when the JPX is opened). {"state": "found"} when a .xml and a .h5 are there; else, if the
+    JPX holds its own alignment (written by this tool) {"state": "own"}; else {"state": "missing", "missing": ["xml" and/or "h5"], "folder"}.
     {"state": "error", "text": ...} when the check itself failed (nothing is claimed then)."""
     try:
-        if find_aligner_json(jpx_path) is not None:
+        folder = os.path.dirname(os.path.abspath(jpx_path))
+        names = [n.lower() for n in os.listdir(folder)]
+        has_xml = any(n.endswith(".xml") for n in names)
+        has_h5 = any(n.endswith(".h5") for n in names)
+        if has_xml and has_h5:
+            return {"state": "found"}
+        if find_aligner_json(jpx_path) is not None:       # (the slower look inside the JPX: only when something is missing)
             return {"state": "own"}
-        xml_path, h5_path = _find_neuroinfo_files(jpx_path, None)
-        return {"state": "found", "xml": xml_path, "h5": h5_path}
-    except FileNotFoundError as e:
-        text = str(e)
-        return {"state": "missing", "missing": ["xml"] if ".xml" in text.split("\n")[0] else ["h5"], "text": text,
-                "folder": os.path.dirname(os.path.abspath(jpx_path))}
+        stem = os.path.splitext(os.path.basename(jpx_path))[0]
+        missing = (["xml"] if not has_xml else []) + (["h5"] if not has_h5 else [])
+        return {"state": "missing", "missing": missing, "folder": folder,
+                "text": f"No {' or '.join({'xml': stem + '.xml', 'h5': 'case file (.h5)'}[k] for k in missing)} in {folder}"}
     except Exception as e:
         return {"state": "error", "text": f"{type(e).__name__}: {e}"}
 
