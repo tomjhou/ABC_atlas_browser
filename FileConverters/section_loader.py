@@ -2002,10 +2002,34 @@ class SectionLoader:
                 return
             self.jpx_stack, self.jpx_stack_path = res, path
             self.jpx_crops, self.jpx_inflight = {}, set()
+            self.start_prelocate(res)
             if self.stage == 2 and self.project.is_jpx:
                 self.jpx_ready()
 
         self.background(lambda: ns.open_stack(path, locate=ask, alignment=alignment), done)
+
+    def start_prelocate(self, stack):
+        """Locating the .czi sections on their slide scans is the slow part of opening the alignment tool, and it needs only the stack that
+        has just been read: it starts now, while the order is being chosen, so that by the time of Next most of it (often all) is done. The
+        alignment tool picks it up from stack.prelocate (waits for what is left, and shows the sections as they are located)."""
+        if getattr(stack, "prelocate", None) is not None or getattr(self, "reusing", False):
+            return                                   # (coming back from the alignment tool, which keeps its own located stack: nothing to do)
+        if not any(s.source_path.lower().endswith(".czi") and s.czi_origin is None for s in stack.sections):
+            return
+        pre = {"done": threading.Event(), "problems": {}, "located": [], "text": ""}
+        stack.prelocate = pre
+
+        def work():
+            ns.lower_thread_priority()
+            try:
+                problems = ns.calibrate_stack_czi(stack, progress=lambda i, n, text: pre.__setitem__("text", text),
+                                                  on_located=pre["located"].append)
+                pre["problems"] = {k: v for k, v in problems.items() if v}
+            except BaseException as e:               # (a failed install of the reader library, for one)
+                pre["problems"] = {"the .czi scans": str(e) or type(e).__name__}
+            pre["done"].set()
+
+        threading.Thread(target=work, daemon=True).start()
 
     def jpx_ready(self):
         """The JPX's stack is open: its sections go in the grid (in the project's order, if it has one) and their pictures are asked for."""
@@ -2152,6 +2176,7 @@ class SectionLoader:
 
     def resume(self, path, stage=2):
         """Open a saved project and go straight to one of the tabs (the alignment tool's "Back to step 1" comes here, to the order tab)."""
+        self.reusing = True
         self.open_project(path)
         if self.project.slides:
             self.show_stage(stage)

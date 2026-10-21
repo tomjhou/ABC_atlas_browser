@@ -1127,7 +1127,25 @@ class Aligner:
         def work():
             ns.lower_thread_priority()   # (the window stays responsive while the images load)
             frame_boxes = None
-            if any(s.source_path.lower().endswith(".czi") and s.czi_origin is None for s in todo):
+            pre = getattr(stack, "prelocate", None)
+            if pre is not None:
+                # the loader (step 3) started locating the sections while the order was being chosen: wait for what is left, showing the
+                # sections as they are located
+                stack.prelocate = None
+                seen = 0
+                while True:
+                    finished = pre["done"].wait(0.3)
+                    if self.stack is not stack:
+                        return
+                    while seen < len(pre["located"]):
+                        located(pre["located"][seen])
+                        seen += 1
+                    if finished:
+                        break
+                    if pre["text"]:
+                        self.msgs.put(("status", pre["text"]))
+                self.msgs.put(("czi_ready", (stack, dict(pre["problems"]))))
+            elif any(s.source_path.lower().endswith(".czi") and s.czi_origin is None for s in todo):
                 self.msgs.put(("status", "Preparing for load: starting the Zeiss .czi reader (installed first if it is missing)..."))
                 t_locate = time.time()
                 try:
