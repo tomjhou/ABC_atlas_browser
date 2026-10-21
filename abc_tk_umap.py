@@ -41,6 +41,7 @@ MAX_COLORED_CATEGORIES = 400
 LEVEL_NAMES = {"class": "Class", "subclass": "Subclass", "supertype": "Supertype", "cluster": "Cluster", "leiden": "Leiden"}
 TILE_PX = 230
 MIN_TILE_PX = 120
+LABEL_ZOOM_CAP = 5.0               # the group numbers grow with the zoom up to this, then stay the same size
 HOVER_HOLD_MS = 250                # the pointer must rest this long before the plots dim
 GROUP_HOLD_MS = 500                # ...and this long before the cell's group is marked
 DOT_MM = 0.03                      # a cell's dot in the section panels: 30 um across on the tissue
@@ -98,6 +99,7 @@ class PointCanvas:
         self.markers = {}                           # name -> [item, x, y] (x None: hidden)
         self.rects = []                             # [item, x0, y0, x1, y1]
         self.labels = []                            # [item, x, y]
+        self.label_size = 8                         # the group labels' font size: grows with the zoom up to LABEL_ZOOM_CAP, then stops
         self.scalebar = None                        # (line item, text item) once enabled: data units are mm
         self.on_motion = None                       # fn(cx, cy) ; fn(None, None) on leave
         self.on_view = None                         # fn() after a redraw
@@ -387,10 +389,20 @@ class PointCanvas:
         self.labels = []
 
     def add_label(self, text, x, y, color="black"):
-        item = self.canvas.create_text(0, 0, text=text, font=("Segoe UI", 8, "bold"), fill=color)
+        item = self.canvas.create_text(0, 0, text=text, font=("Segoe UI", self.label_size, "bold"), fill=color)
         self.labels.append([item, x, y])
 
+    def update_label_size(self):
+        zoom = min(self.scale / self.fit_scale(), LABEL_ZOOM_CAP)
+        size = int(round(8 * (1 + 0.75 * (zoom - 1))))
+        if size != self.label_size:
+            self.label_size = size
+            for it in self.labels:
+                self.canvas.itemconfig(it[0], font=("Segoe UI", size, "bold"))
+
     def reposition(self):
+        if self.labels:
+            self.update_label_size()
         if self.scalebar:
             self.place_scalebar()
         for m in self.markers.values():
