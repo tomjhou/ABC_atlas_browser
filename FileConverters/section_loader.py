@@ -411,7 +411,7 @@ class SectionLoader:
         mid.pack(fill=tk.BOTH, expand=True)
         cols = ("name", "scenes", "size", "pixel")
         self.slide_tree = ttk.Treeview(mid, columns=cols, show="headings", selectmode="extended", height=14)
-        for c, t, w, a in (("name", "File", 620, "w"), ("scenes", "Scenes", 80, "e"), ("size", "Size", 90, "e"), ("pixel", "Pixel (um)", 90, "e")):
+        for c, t, w, a in (("name", "File", 620, "w"), ("scenes", "Scenes", 90, "e"), ("size", "Size", 110, "e"), ("pixel", "Pixel (um)", 90, "e")):
             self.slide_tree.heading(c, text=t)
             self.slide_tree.column(c, width=w, anchor=a)
         sb = ttk.Scrollbar(mid, orient=tk.VERTICAL, command=self.slide_tree.yview)
@@ -452,8 +452,8 @@ class SectionLoader:
             info = self.infos.get(s.path)
             px = self.slide_px(s)
             self.slide_tree.insert("", tk.END, iid=str(i), values=(
-                s.path, (f"{info.scenes} sections" if sp.is_jpx(s.path) else info.scenes) if info else "...",
-                human_size(info.size_bytes) if info else "",
+                s.path, (f"{info.scenes} sections" if sp.is_jpx(s.path) else info.scenes) if info else "counting...",
+                human_size(info.size_bytes) if info else "determining...",     # (until the file has been read)
                 (f"{px:g}" if px else "unknown") if info else ""))
 
     def read_infos(self):
