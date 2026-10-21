@@ -69,6 +69,29 @@ def count_sections(path):
         return None
 
 
+def sections_text(path):
+    """What the recent-projects list shows as a project's number of sections: the number, or, for a JPX project that has no count yet (it was
+    added but never got as far as the order), why not when its NeuroInfo files are missing ("No casefile", "No xml"), else blank."""
+    n = count_sections(path)
+    if n is not None:
+        return n
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+        slides = doc["slides"]
+        if len(slides) != 1 or not is_jpx(slides[0]["path"]) or doc.get("alignment"):
+            return ""
+        jpx = slides[0]["path"]
+        if not os.path.isabs(jpx):
+            jpx = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(path)), jpx))
+        check = ns.neuroinfo_check(jpx)
+        if check.get("state") != "missing":
+            return ""
+        return {("h5",): "No casefile", ("xml",): "No xml"}.get(tuple(check["missing"]), "No xml or casefile")
+    except Exception:
+        return ""
+
+
 def add_recent_project(path):
     """Put a project file first in the recent list (once, whatever the letter case)."""
     key = os.path.normcase(os.path.abspath(path))

@@ -797,7 +797,7 @@ class SectionLoader:
         ttk.Label(dlg, text="Choose a project (double-click opens it):", padding=(10, 10, 10, 4)).pack(anchor="w")
         cols = ("name", "sections", "folder", "when")
         tree = ttk.Treeview(dlg, columns=cols, show="headings", selectmode="browse", height=min(max(len(paths), 4), 12))
-        for c, t, w, a in (("name", "Project", 280, "w"), ("sections", "Sections", 70, "e"), ("folder", "Folder", 400, "w"), ("when", "Last saved", 190, "w")):
+        for c, t, w, a in (("name", "Project", 280, "w"), ("sections", "Sections", 110, "e"), ("folder", "Folder", 400, "w"), ("when", "Last saved", 190, "w")):
             tree.heading(c, text=t)
             tree.column(c, width=w, anchor=a)
         # The window comes up at once, from the names alone: reading each project file for its date and section count can take a while (the files
@@ -810,10 +810,10 @@ class SectionLoader:
             for i, p in enumerate(paths):
                 try:
                     when = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(p)))
-                    n = sp.count_sections(p)
+                    n = sp.sections_text(p)
                 except OSError:
-                    when, n = "(missing)", None
-                found.put((i, "" if n is None else n, when))
+                    when, n = "(missing)", ""
+                found.put((i, n, when))
 
         threading.Thread(target=read_details, daemon=True).start()
 
