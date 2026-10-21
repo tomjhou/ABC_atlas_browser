@@ -800,14 +800,38 @@ class SectionLoader:
         for c, t, w, a in (("name", "Project", 280, "w"), ("sections", "Sections", 70, "e"), ("folder", "Folder", 400, "w"), ("when", "Last saved", 190, "w")):
             tree.heading(c, text=t)
             tree.column(c, width=w, anchor=a)
+        # The window comes up at once, from the names alone: reading each project file for its date and section count can take a while (the files
+        # are often on a network drive, and a big project is a big file), so that is filled in, row by row, by a thread.
         for i, p in enumerate(paths):
+            tree.insert("", tk.END, iid=str(i), values=(os.path.basename(p), "...", os.path.dirname(p), "..."))
+        found = queue.Queue()
+
+        def read_details():
+            for i, p in enumerate(paths):
+                try:
+                    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(p)))
+                    n = sp.count_sections(p)
+                except OSError:
+                    when, n = "(missing)", None
+                found.put((i, "" if n is None else n, when))
+
+        threading.Thread(target=read_details, daemon=True).start()
+
+        def show_details():
             try:
-                when = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(p)))
-                name = os.path.basename(p)
-            except OSError:
-                when, name = "(missing)", os.path.basename(p)
-            n = sp.count_sections(p)
-            tree.insert("", tk.END, iid=str(i), values=(name, "" if n is None else n, os.path.dirname(p), when))
+                while True:
+                    i, n, when = found.get_nowait()
+                    if tree.exists(str(i)):
+                        tree.set(str(i), "sections", n)
+                        tree.set(str(i), "when", when)
+            except queue.Empty:
+                pass
+            except tk.TclError:
+                return                                   # (the window was closed)
+            if dlg.winfo_exists():
+                dlg.after(100, show_details)
+
+        dlg.after(50, show_details)
         tree.pack(fill=tk.BOTH, expand=True, padx=10)
         if paths:
             tree.selection_set("0")
