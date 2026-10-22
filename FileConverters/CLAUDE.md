@@ -23,6 +23,18 @@
   A .czi section whose position on its scan is only the scan's shared origin has `czi_assumed`; that flag is saved in the alignment
   (`stack_json`), restored on load, the check (`ns.verify_czi_origins`) runs whenever any section still has it, and `export_dialog`
   refuses to export until none do (it asks "Export anyway?" only if the check can't run). `neuroinfo_dialogs.py` holds the "which NeuroInfo file?" dialog.
+  Outlines edited in the aligner are written back into the project's step-2 polygons (`sp.write_back_outlines`, called from `save_project_state`
+  for scan-based projects): the polygon a section came from is found by its `origin_key`, replaced by the section's outline in slide pixels
+  (rounded as the project file rounds), and `origin_key` and the window's `reuse_info` are renewed so the hidden window still stands for the
+  project. A section whose outline was deleted keeps its polygon. JPX projects have no step-2 polygons (their outlines come from NeuroInfo's files).
+  Step 1 on a .xml: `ns.read_reconstruction_xml`, `ns.find_jpx_for_xml` (the XML's recorded name) and `ns.find_case_file` (GUIDs) find the
+  JPX and case file; `SectionLoader.jpx_from_reconstruction_xml` then adds the JPX as usual with the XML/.h5 preset in `neuro_presets`.
+  Placeholders (NeuroInfo's blank frames that keep the spacing even): in reconstruction.xml a contour with an EMPTY GUID, in the .h5 a gap
+  ("Blank") in the OrderedSections chain, so `_load_neuroinfo` takes the order from the XML when it has one; they load as `Section.placeholder`
+  (no source, no outline, shown from the frame). One inserted in step 3 (right-click > "Insert placeholder before this section", JPX projects
+  only) is a section whose `frame` is `ns.PLACEHOLDER_FRAME_BASE` + n (kept in `project.jpx_order`, made again by `sp.apply_jpx_order`); export
+  writes a blank frame for it (`export_stack`), `write_jpx_like` can now add frames (header boxes copied, XMP entries added by
+  `patch_xmp_frames`), and the alignment JSON written into the file gets `frame` = the section's place (the frames of the file written).
 
 # jpx_aligner / neuroinfo_stack
 

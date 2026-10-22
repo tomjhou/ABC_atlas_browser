@@ -48,6 +48,7 @@ import neuroinfo_stack as ns
 import section_project as sp
 import neuroinfo_dialogs
 from section_order import OrderGrid, THUMB_W, THUMB_H
+from tooltip import Tooltip
 
 ns.ensure_packages({"PIL": "pillow"})
 
@@ -213,6 +214,13 @@ def decode_frame_reduced(jpx_path, frame_box, max_px):
     raise RuntimeError("unreachable")
 
 
+def blank_frame_preview(stack):
+    """The preview of a placeholder (a blank frame): nothing but zeros at the preview's size, the same kind of tuple as load_preview."""
+    k = max(1, math.ceil(max(stack.canvas_w, stack.canvas_h) / PREVIEW_MAX_PX))
+    pw, ph = max(1, round(stack.canvas_w / k)), max(1, round(stack.canvas_h / k))
+    return np.zeros((ph, pw, max(stack.channels, 1)), np.uint16), stack.canvas_w / pw, stack.canvas_h / ph
+
+
 def load_frame_preview(jpx_path, frame_box, index):
     """Downsampled copy of one frame of the JPX itself (the same kind of tuple as load_preview), cached on disk. Used for
     sections whose source image this tool cannot read: the frame is already on the stack canvas, so it is shown as it is."""
@@ -244,38 +252,6 @@ def load_frame_preview(jpx_path, frame_box, index):
     np.savez(tmp, img=img, kx=w / pw, ky=h / ph)
     os.replace(tmp, path)
     return img, w / pw, h / ph
-
-
-class Tooltip:
-    """A small note that appears when the pointer rests on a widget."""
-
-    def __init__(self, widget, text, delay=500):
-        self.widget, self.text, self.delay, self.tip, self.job = widget, text, delay, None, None
-        widget.bind("<Enter>", self.schedule, add="+")
-        widget.bind("<Leave>", self.hide, add="+")
-        widget.bind("<ButtonPress>", self.hide, add="+")
-
-    def schedule(self, event=None):
-        self.hide()
-        self.job = self.widget.after(self.delay, self.show)
-
-    def show(self):
-        self.job = None
-        self.tip = tk.Toplevel(self.widget)
-        self.tip.wm_overrideredirect(True)
-        tk.Label(self.tip, text=self.text, justify=tk.LEFT, background="#ffffe0", relief=tk.SOLID, borderwidth=1,
-                 wraplength=260, padx=4, pady=2).pack()
-        self.tip.update_idletasks()
-        x = min(self.widget.winfo_rootx(), self.widget.winfo_screenwidth() - self.tip.winfo_reqwidth() - 4)   # (kept on screen)
-        self.tip.wm_geometry(f"+{max(x, 0)}+{self.widget.winfo_rooty() + self.widget.winfo_height() + 4}")
-
-    def hide(self, event=None):
-        if self.job:
-            self.widget.after_cancel(self.job)
-            self.job = None
-        if self.tip:
-            self.tip.destroy()
-            self.tip = None
 
 
 def human_gb(n):
@@ -859,6 +835,9 @@ class Aligner:
             proj = self.project_obj or sp.Project.load(self.project_path)
             if proj.is_jpx:
                 proj.jpx_order = [s.frame for s in self.stack.sections]       # (the order made here is the project's now)
+            elif sp.write_back_outlines(proj, self.stack) and self.reuse_info is not None:
+                # (outlines edited here are the project's outlines now, so step 1 shows them; this window still stands for the project)
+                self.reuse_info = sp.reuse_info(proj, self.stack)
             proj.alignment = ns.stack_json(self.stack, self.project_path)
             proj.alignment_key = proj.fingerprint()
             proj.save(self.project_path)
@@ -993,7 +972,7 @@ class Aligner:
             self.var_status.set("")
             messagebox.showerror("Can't open", str(error) or type(error).__name__, parent=self.root)
             return
-        missing = [s.name for s in stack.sections if not s.source_path]
+        missing = [s.name for s in stack.sections if not s.source_path and not s.placeholder]
         if missing:
             if not messagebox.askokcancel(
                     "Source images not found",
@@ -1330,6 +1309,8 @@ class Aligner:
                     if not is_frame and s.source_path.lower().endswith(".czi"):
                         self.msgs.put(("status", f"Loading section {s.index + 1} of {len(stack.sections)}..."))
                         pv = czi_picture(s)
+                    elif s.placeholder:
+                        pv = blank_frame_preview(stack)          # (nothing to read: a blank frame, perhaps not in the JPX yet)
                     elif is_frame:
                         if frame_boxes is None:
                             t_boxes = time.time()
@@ -1522,6 +1503,15 @@ class Aligner:
 
     # ---------------------------------------------------------------- list / controls
 
+    def scene_note(self, s):
+        """" (scene N)" for a section whose scene on its slide scan is known (as in the section list), else nothing: it tells apart the
+        sections of one slide in a message."""
+        try:
+            scene = ns.czi_scene_if_known(s, self.stack) if self.stack is not None else None
+        except Exception:
+            scene = None
+        return f" (scene {scene + 1})" if scene is not None else ""
+
     def section_label(self, s):
         marks = ("*" if s.changed else " ") + ("~" if not s.edit.is_identity() else " ") + \
                 ("F" if s.edit.flip else " ")
@@ -1660,6 +1650,7 @@ class Aligner:
             text=f"Edit is relative to NeuroInfo's alignment\n(base: {base}).\n"
                  f"Net: rotation {-s.rotation_deg:+.2f}° (clockwise), {'mirrored' if s.mirrored else 'not mirrored'}"
                  + ("" if s.renderable else
+                    "\nPlaceholder: a blank frame that keeps the spacing even where a section is missing. Nothing to edit." if s.placeholder else
                     "\nSource image not found: can't edit." if not s.source_path else
                     "\nStill loading: can't edit yet." if self.loading_previews else
                     ("\nCouldn't be located on the slide scan" if s.source_path.lower().endswith(".czi")
@@ -2139,15 +2130,21 @@ class Aligner:
 
     def view_bounds(self):
         """The part of the plane the view may show, in canvas pixels (x0, y0, x1, y1): the canvas, and beyond it whatever
-        outlines hang over its edge (so that an overhang can be seen, and never blank space that is not needed)."""
+        outlines hang over its edge (so that an overhang can be seen, and never blank space that is not needed). Where an outline does
+        hang over, the view may go out a little further, to 105% of the outlines and canvas together, so that the vertices at the very
+        edge can be reached for editing; with none over the edge it is the canvas (100%)."""
         st = self.stack
-        x0, y0, x1, y1 = 0.0, 0.0, float(st.canvas_w), float(st.canvas_h)
+        cw, ch = float(st.canvas_w), float(st.canvas_h)
+        x0, y0, x1, y1 = 0.0, 0.0, cw, ch
         for sec in st.sections:
             P = sec.stack_points
             if len(P):
                 u, v = P[:, 0] / st.pixel_um, -P[:, 1] / st.pixel_um
                 x0, y0 = min(x0, float(u.min())), min(y0, float(v.min()))
                 x1, y1 = max(x1, float(u.max())), max(y1, float(v.max()))
+        if (x0, y0, x1, y1) != (0.0, 0.0, cw, ch):
+            dx, dy = 0.025 * (x1 - x0), 0.025 * (y1 - y0)
+            x0, y0, x1, y1 = x0 - dx, y0 - dy, x1 + dx, y1 + dy
         return x0, y0, x1, y1
 
     def fit_view(self):
@@ -2719,9 +2716,11 @@ class Aligner:
             if from_neuroinfo:
                 # a stack made from NeuroInfo's own files: the export is worth making even so, which the question says
                 text = ("No section has been edited since this file was opened, but this stack was made from NeuroInfo's own files "
-                        f"({st.case_file} and the reconstruction .xml), so an export is still worthwhile: it writes the sections' "
-                        "alignment, and where each lies on its slide scan, into the new JPX. When that file is opened again the "
-                        "positions on the scans need no checking, and the NeuroInfo files are not needed.\n\n"
+                        f"({st.case_file} and the reconstruction .xml), so an export is still worthwhile: it writes the alignment and each "
+                        "section's outline into the new JPX's metadata, together with where each section lies on its slide scan (which "
+                        "NeuroInfo's files do not record). Reopening it in this program is then faster, because the positions on the scans "
+                        "need no re-locating, and it no longer needs the .h5 and reconstruction .xml files. NeuroInfo can open the .jpx "
+                        "as an image stack.\n\n"
                         f"({same[0].upper() + same[1:]}.)\n\nExport?")
             else:
                 text = ("No section has been edited since this file was opened, so an export would be a copy "
@@ -2731,8 +2730,11 @@ class Aligner:
         bad = exp.out_of_canvas()
         if bad and not messagebox.askyesno(
                 "Sections past the canvas edge",
-                "These sections extend past the edge of the canvas, and the parts outside will be cut off:\n\n"
-                + "\n".join(f"{s.name}: {o:.0f} um" for s, o in bad) + "\n\nExport anyway?", parent=self.root):
+                "Some outlines extend past the edge of the canvas. Any part of a section's image out there will be cut off. "
+                "If only the outline hangs over and the image is inside the canvas, nothing is lost and you can export as it is; "
+                "otherwise move the section or edit its outline so it stays inside.\n\n"
+                + "\n".join(f"Section {s.index + 1}{self.scene_note(s)}: {o:.0f} um past the edge" for s, o in bad)
+                + "\n\nExport anyway?", parent=self.root):
             return
         missing = [s.name for s in todo if not s.source_path]
         if missing:
@@ -2856,7 +2858,7 @@ class Aligner:
         st = self.stack
         rows = []
         for s in st.sections:
-            slide = os.path.basename(s.source_path) if s.source_path else "(source image not found)"
+            slide = os.path.basename(s.source_path) if s.source_path else "(placeholder)" if s.placeholder else "(source image not found)"
             czi = s.source_path.lower().endswith(".czi")
             scene, where, slide_xy = "", "", ""
             if czi:

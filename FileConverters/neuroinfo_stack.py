@@ -329,6 +329,7 @@ class Section:
     xml_points: np.ndarray = None   # the outline exactly as reconstruction.xml has it (the stack's coordinates, um); None without one
     frame: int = -1            # which frame of the opened JPX is this section's (index is its position now, which the user can change)
     origin_key: str = ""       # for a section made in step 1: a code for the outline it was given there (see section_project.outline_key)
+    placeholder: bool = False  # a blank frame NeuroInfo inserted to keep the spacing even where a section is missing: no source, no outline
 
     def __post_init__(self):
         if self.frame < 0:
@@ -729,10 +730,14 @@ def _load_neuroinfo(jpx_path, locate=None):
     m = re.search(r'<scale x="([0-9.]+)"', xml)
     pixel_um = float(m.group(1)) if m else 0.575
     stack_outlines = {}
+    xml_order = []         # the GUIDs in the order of the frames; "" for a placeholder (a blank frame NeuroInfo put in: empty GUID)
     for block in re.findall(r"<contour .*?</contour>", xml, re.S):
-        guid = re.search(r'name="GUID"><s>([0-9A-Fa-f]+)</s>', block).group(1).upper()
-        stack_outlines[guid] = np.array(
-            [[float(x), float(y)] for x, y in re.findall(r'<point x="([-0-9.]+)" y="([-0-9.]+)"', block)])
+        found = re.search(r'name="GUID"><s>([0-9A-Fa-f]*)</s>', block)
+        guid = found.group(1).upper() if found else ""
+        xml_order.append(guid)
+        if guid:
+            stack_outlines[guid] = np.array(
+                [[float(x), float(y)] for x, y in re.findall(r'<point x="([-0-9.]+)" y="([-0-9.]+)"', block)])
 
     frames = [b for b in read_boxes(jpx_path) if b.kind == b"jp2c"]
     with open(jpx_path, "rb") as f:
@@ -747,7 +752,18 @@ def _load_neuroinfo(jpx_path, locate=None):
         while cur in chain:
             cur = chain[cur]
             order.append(cur)
+        if "" in xml_order:
+            # With placeholders the case file's chain has a gap ("Blank") where each one is, so the order is the XML's, which lists every
+            # frame, a placeholder as a contour with no GUID.
+            order = xml_order
+            unknown = [g for g in order if g and g not in bm["Contours"]]
+            if unknown:
+                raise ValueError(f"{len(unknown)} section(s) of {xml_name} are not in {os.path.basename(h5_path)} "
+                                 "(is that the case file of this reconstruction?)")
         for i, guid in enumerate(order):
+            if not guid:
+                stack.sections.append(placeholder_section(i))
+                continue
             c = bm["Contours"][guid]
             recorded = _s(c["ImageFile"].attrs["SlideFileName"])
             name = os.path.basename(recorded.replace("\\", "/"))
@@ -779,6 +795,22 @@ def _load_neuroinfo(jpx_path, locate=None):
     return stack
 
 
+PLACEHOLDER_FRAME_BASE = 1_000_000   # the "frame" of a placeholder inserted here (not a frame of the opened JPX; its blank frame is made when
+                                     # the stack is exported): this number and up, one for each, whatever the section's place
+
+
+def is_new_placeholder(section):
+    """A placeholder inserted in this program, whose blank frame is not in the opened JPX yet."""
+    return section.placeholder and section.frame >= PLACEHOLDER_FRAME_BASE
+
+
+def placeholder_section(index, frame=-1):
+    """The section standing for a placeholder frame: no source image and no outline (so the tool shows the frame as it is and offers no
+    editing), at the identity placement. `frame` is its frame of the JPX (default: its place), or a number from PLACEHOLDER_FRAME_BASE up
+    for one that is new."""
+    return Section(index, "Placeholder", "", np.zeros((0, 2)), np.eye(2), np.zeros(2), pivot_src=np.zeros(2), placeholder=True, frame=frame)
+
+
 def stack_from_json(doc, folder, jpx_path=""):
     """The Stack an alignment description (see stack_json) stands for. `folder` is where relative source paths are taken from; with
     no jpx_path the stack is in memory only (a project's: its sections are rendered from their source images)."""
@@ -796,7 +828,7 @@ def stack_from_json(doc, folder, jpx_path=""):
             pivot_src=d["pivot_src"] if d.get("pivot_src") is not None else (    # (no pivot recorded: the first versions' default)
                 np.array(d["case_points"], float).reshape(-1, 2).mean(0) if len(d["case_points"]) else None),
             czi_origin=tuple(d["czi_origin"]) if d.get("czi_origin") else None, origin_key=d.get("origin_key", ""),
-            frame=d.get("frame", -1), czi_assumed=bool(d.get("czi_assumed", False))))
+            frame=d.get("frame", -1), czi_assumed=bool(d.get("czi_assumed", False)), placeholder=bool(d.get("placeholder", False))))
     return stack
 
 
@@ -821,7 +853,7 @@ def open_stack(path, locate=None, alignment=None):
     if alignment is not None:
         stack = stack_from_json(alignment, os.path.dirname(os.path.abspath(path)), path)
         n_frames = len([b for b in read_boxes(path) if b.kind == b"jp2c"])
-        if any(s.frame >= n_frames for s in stack.sections):
+        if any(s.frame >= n_frames and not is_new_placeholder(s) for s in stack.sections):
             raise ValueError("The project's alignment is of another JPX (it names frames this one doesn't have).")
     else:
         doc = find_aligner_json(path)
@@ -861,6 +893,8 @@ def stack_json(stack, out_path):
             secs[-1]["czi_origin"] = [round(float(v), 4) for v in s.czi_origin]
         if s.czi_assumed:
             secs[-1]["czi_assumed"] = True        # (its position is the scan's shared one, not yet checked against the section's own frame)
+        if s.placeholder:
+            secs[-1]["placeholder"] = True
     # Version 2 only when needed (an outline was edited or removed, so the pivot is no longer the outline's centroid);
     # otherwise the file stays readable by the first version of this tool.
     needs_v2 = any(not len(s.case_points) or not np.allclose(s.pivot_src, s.case_points.mean(0), atol=1e-4)
@@ -2184,15 +2218,28 @@ def patch_xmp_spacing(payload, spacing_um):
     return payload[:16] + text.encode("utf-8")
 
 
+def patch_xmp_frames(payload, n_frames):
+    """The MBF XMP with an <rdf:li> for each of `n_frames` images: when it has fewer (frames were added), the last is repeated with its
+    xmp:Image number counted up."""
+    text = payload[16:].decode("utf-8", "replace")
+    items = list(re.finditer(r'<rdf:li> <rdf:Description xmp:Image="\d+".*?</rdf:li>', text, re.S))
+    if not items or len(items) >= n_frames:
+        return payload
+    last = items[-1]
+    more = "".join(" " + re.sub(r'xmp:Image="\d+"', f'xmp:Image="{k}"', last.group(0), count=1) for k in range(len(items), n_frames))
+    return payload[:16] + (text[:last.end()] + more + text[last.end():]).encode("utf-8")
+
+
 def write_jpx_like(template_path, codestreams, out_path, extra_payloads=(), pixel_um=None, z_spacing_um=None):
     """Copy template_path's boxes verbatim, replacing its jp2c codestreams in
     order with `codestreams` (bytes, or callables returning bytes), dropping
     any old aligner box and appending `extra_payloads` as uuid boxes. With fewer
     codestreams than the template has frames, the template's last frames (each
-    with its own jpch/jplh header boxes) are left out."""
+    with its own jpch/jplh header boxes) are left out; with more, frames are added
+    at the end (header boxes like the last frame's, and the XMP gets an entry for each)."""
     boxes = read_boxes(template_path)
     frames = [b for b in boxes if b.kind == b"jp2c"]
-    if len(codestreams) > len(frames) or not codestreams:
+    if not codestreams or not frames:
         raise ValueError(f"template has {len(frames)} frames, got {len(codestreams)} codestreams")
     tmp = out_path + ".partial"
     i = 0
@@ -2208,8 +2255,10 @@ def write_jpx_like(template_path, codestreams, out_path, extra_payloads=(), pixe
                     continue
                 if b.kind == b"uuid" and read_payload(src, b, 16) == ALIGNER_UUID:
                     continue
-                if (pixel_um is not None or z_spacing_um) and b.kind == b"uuid" and read_payload(src, b, 16) == XMP_UUID:
+                if (pixel_um is not None or z_spacing_um or len(codestreams) > len(frames)) and b.kind == b"uuid" \
+                        and read_payload(src, b, 16) == XMP_UUID:
                     xmp = read_payload(src, b)
+                    xmp = patch_xmp_frames(xmp, len(codestreams))                  # (an entry for each frame, also the added ones)
                     if pixel_um is not None:
                         xmp = patch_xmp_pixel_size(xmp, pixel_um)              # corrected pixel size
                     if z_spacing_um:
@@ -2218,6 +2267,12 @@ def write_jpx_like(template_path, codestreams, out_path, extra_payloads=(), pixe
                     continue
                 src.seek(b.offset)
                 dst.write(src.read(b.length))
+            heads = [b for b in boxes if b.kind in (b"jpch", b"jplh")][-2:]       # (the last frame's header boxes: copied for added frames)
+            for cs in codestreams[i:]:
+                for hb in heads:
+                    src.seek(hb.offset)
+                    dst.write(src.read(hb.length))
+                write_box(dst, b"jp2c", cs() if callable(cs) else cs)
             for payload in extra_payloads:
                 dst.write(box_bytes(b"uuid", payload))
         os.replace(tmp, out_path)
@@ -2371,7 +2426,7 @@ def export_stack(stack, out_path, quality_db=DEFAULT_QUALITY_DB, rerender_all=Fa
     missing = [s.name for s in todo if not s.source_path]
     if missing:
         raise FileNotFoundError("Source images not found: " + ", ".join(missing))
-    if fresh and len(todo) != len(stack.sections):
+    if fresh and len(todo) + sum(1 for s in stack.sections if s.placeholder) != len(stack.sections):
         raise ValueError("Some sections can't be rendered from their source images.")
     codestreams = []
     n_render = 0
@@ -2411,7 +2466,23 @@ def export_stack(stack, out_path, quality_db=DEFAULT_QUALITY_DB, rerender_all=Fa
     # each is taken as the file is written (a read of a file on a network share is slow, and held in memory for the whole stack they
     # would take as much as the file does).
     todo_ids = {id(s) for s in todo}
-    copied = [s for s in stack.sections if id(s) not in todo_ids]
+    # A placeholder made here (or in a stack made from scans) has no frame to copy: a blank one is written, made once for all of them.
+    blank_ids = {id(s) for s in stack.sections if s.placeholder and (fresh or is_new_placeholder(s))}
+    blank = {}
+    blank_lock = threading.Lock()
+
+    def blank_codestream():
+        with blank_lock:
+            if "cs" not in blank:
+                if stop_event is not None and stop_event.is_set():
+                    raise UserCanceled
+                t_blank = time.time()
+                blank["cs"] = encode_frame(np.zeros((stack.canvas_h, stack.canvas_w, max(stack.channels, 1)), np.uint16), quality_db,
+                                           max(2, os.cpu_count() or 4))
+                log(f"  blank frame for the placeholder(s): {len(blank['cs']) / 1e3:.0f} KB, {time.time() - t_blank:.1f} s")
+            return blank["cs"]
+
+    copied = [s for s in stack.sections if id(s) not in todo_ids and id(s) not in blank_ids]
     copy_position = {id(s): k for k, s in enumerate(copied)}
     prefetch = FramePrefetcher(stack.jpx_path, [frames[s.frame] for s in copied]) if copied else None
 
@@ -2436,6 +2507,9 @@ def export_stack(stack, out_path, quality_db=DEFAULT_QUALITY_DB, rerender_all=Fa
                 for s in stack.sections:
                     if stop_event is not None and stop_event.is_set():
                         raise UserCanceled
+                    if id(s) in blank_ids:
+                        codestreams.append(blank_codestream)
+                        continue
                     if id(s) not in todo_ids:
                         codestreams.append(copy_lazily(s))
                         continue
@@ -2446,6 +2520,8 @@ def export_stack(stack, out_path, quality_db=DEFAULT_QUALITY_DB, rerender_all=Fa
                     j.cancel()
                 raise
         doc = stack_json(stack, out_path)
+        for k, d in enumerate(doc["sections"]):
+            d["frame"] = k          # (in the file written the frames are the sections in order, whatever frames of the opened file they came from)
         extra = [ALIGNER_UUID + json.dumps(doc, separators=(",", ":")).encode("utf-8")]
         if fresh:
             write_jpx_new(codestreams, out_path, stack.canvas_w, stack.canvas_h, stack.channel_info, stack.pixel_um, extra_payloads=extra,

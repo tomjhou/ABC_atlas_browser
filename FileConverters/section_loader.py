@@ -30,8 +30,9 @@ import neuroinfo_dialogs
 import neuroinfo_stack as ns
 import section_project as sp
 from section_order import OrderGrid, THUMB_W, THUMB_H, CELL_PAD
+from tooltip import Tooltip
 
-STAGES = ("Load slides", "Detect outlines", "Order sections", "Align")
+STAGES = ("Load slides", "Detect outlines", "Order sections", "Edit outlines and alignment")
 ACCENT = "#1f5fa8"
 SELECT_COLOR, OUTLINE_COLOR, DRAW_COLOR = "#ff3030", "#ffd400", "#00e5ff"
 TINT = np.array([0, 190, 255], np.float32)
@@ -86,6 +87,8 @@ def jpx_crop(stack, path, frame, section, target_px=256):
     so no slide scan is needed): (the crop, H x W x channels as the frame holds it; the outline in it; um per picture pixel). Only the reduced
     picture the thumbnail needs is read from the frame (a few percent of it), and the result is kept on disk, so that the next time is
     instant. jpx_colorize makes the thumbnail of it, at whatever brightness is asked for."""
+    if getattr(section, "placeholder", False):      # (a blank frame NeuroInfo inserted: nothing to read; the thumbnail says what it is)
+        return np.zeros((40, 56, max(stack.channels, 1)), np.uint16), np.zeros((0, 2), np.float32), float(stack.pixel_um)
     st = os.stat(path)
     P = section.stack_points
     outline_hash = hashlib.sha1(np.round(P, 1).tobytes()).hexdigest()[:12]
@@ -163,6 +166,7 @@ class SectionLoader:
         self.jpx_by_frame = {}                             # frame -> its section
         self.jpx_crops, self.jpx_inflight = {}, set()      # frame -> (colour crop, outline in it, um per pixel) or False; frames being made
         self.bright_mode = "auto"                          # Auto / Full scale of a JPX's thumbnails (the alignment tool starts with the same)
+        self.jpx_target = 256                              # pixels the crops of a JPX's sections are read at (more for large thumbnails)
         self.stale_thumbs = set()                          # JPX thumbnails shown as they are until their new version (brightness, scale) is made
         self.jpx_pool, self.jpx_tick_id = None, None
         # ---- the strip of stages
@@ -395,7 +399,8 @@ class SectionLoader:
                 messagebox.showinfo("No slides", "Add at least one .czi slide scan or .jp2 section image first.", parent=self.root)
                 return
             if self.project.is_jpx:                  # (its sections come with outlines: straight on to the order)
-                self.save_slide_list()
+                if not self.save_slide_list():
+                    return
                 self.show_stage(2)
                 return
             unknown = [os.path.basename(s.path) for s in self.project.slides if s.path in self.infos and not self.slide_px(s)]
@@ -403,7 +408,8 @@ class SectionLoader:
                 messagebox.showinfo("Pixel size needed", "These files don't say what their pixel size is. Select them and use "
                                     "\"Set pixel size...\":\n\n" + "\n".join(unknown[:8]), parent=self.root)
                 return
-            self.save_slide_list()
+            if not self.save_slide_list():
+                return                               # (no name was given for the project file: stay, and nothing is lost)
             self.show_stage(1)
         elif self.stage == 1:
             self.leave_detect()
@@ -452,19 +458,20 @@ class SectionLoader:
         self.slide_tree.bind("<Button-3>", self.row_menu_open)
         side = ttk.Frame(mid, padding=(12, 0))
         side.pack(side=tk.LEFT, fill=tk.Y)
-        ttk.Button(side, text="Add images...", command=self.add_slides).pack(fill=tk.X)
         self.need_images = []              # the buttons that mean nothing until an image has been added (see refresh_slide_list)
-        for text, command, pad in (("Remove image", self.remove_slides, 6), ("Move up", lambda: self.move_slide(-1), 0),
-                                   ("Move down", lambda: self.move_slide(1), 6), ("Set pixel size...", self.set_pixel_size, 0)):
-            button = ttk.Button(side, text=text, command=command)
-            button.pack(fill=tk.X, pady=pad)
-            self.need_images.append(button)
-        ttk.Separator(side).pack(fill=tk.X, pady=10)
+        # the project buttons first, then those for the images in the list
         ttk.Button(side, text="Open a saved project...", command=self.open_project).pack(fill=tk.X)
         ttk.Button(side, text="Open recent projects...", command=self.open_recent_project).pack(fill=tk.X, pady=(6, 0))
         close_button = ttk.Button(side, text="Close project", command=self.close_project)
         close_button.pack(fill=tk.X, pady=(6, 0))
         self.need_images.append(close_button)
+        ttk.Separator(side).pack(fill=tk.X, pady=10)
+        ttk.Button(side, text="Add images...", command=self.add_slides).pack(fill=tk.X)
+        for text, command, pad in (("Remove image", self.remove_slides, 6), ("Move up", lambda: self.move_slide(-1), 0),
+                                   ("Move down", lambda: self.move_slide(1), 6), ("Set pixel size...", self.set_pixel_size, 0)):
+            button = ttk.Button(side, text=text, command=command)
+            button.pack(fill=tk.X, pady=pad)
+            self.need_images.append(button)
         return f
 
     def neuro_state(self, path):
@@ -707,11 +714,12 @@ class SectionLoader:
         """Write the project file (a new project's is named after the first image of the list as it is now). Done when going on from the
         first tab, so that what is done there takes effect only then."""
         if not self.project.slides:
-            return
+            return True
         try:
-            self.write_project(self.project)
+            return self.write_project(self.project)
         except OSError as e:
             self.var_status.set(f"Couldn't save the project: {e}")
+            return True                              # (an error is not a refusal: going on as before)
 
     def close_project(self):
         """Close the project and reset the interface: the list of images is emptied and the next image added starts a new project, whose
@@ -1036,6 +1044,9 @@ class SectionLoader:
         self.var_numbering = tk.StringVar(f, "rows")
         for value, text in (("rows", "Order by rows"), ("columns", "Order by columns"), ("scene", "Order by scene number")):
             ttk.Radiobutton(number_box, text=text, value=value, variable=self.var_numbering, command=self.on_numbering).pack(anchor="w")
+        # both buttons of the usual run in one: accept the detection for all the images, then merge the contours within scenes
+        self.btn_full_auto = ttk.Button(right, text="Auto detect outlines (can be edited later)", command=self.full_auto)
+        self.btn_full_auto.pack(fill=tk.X, pady=(0, 10))
         self.panel_threshold = ttk.Frame(right)
         self.panel_edit = ttk.Frame(right)
         p = self.panel_threshold
@@ -1157,6 +1168,12 @@ class SectionLoader:
         self.read_infos()
         self.cur = min(self.cur, max(len(self.project.slides) - 1, 0))
         self.goto_slide(self.cur, force=True)
+        # With several images, the first time step 2 opens for this list of images it shows them all at once (coming back from step 3 to
+        # work on one image does not take that away again).
+        signature = tuple(s.path for s in self.project.slides)
+        if len(signature) > 1 and signature != getattr(self, "grid_default_for", None):
+            self.grid_default_for = signature
+            self.set_grid_mode(True)
 
     def leave_detect(self):
         if self.grid_mode:
@@ -1241,30 +1258,62 @@ class SectionLoader:
         self.root.title(f"Load/detect/order sections - {name}")
 
     def write_project(self, proj):
-        """Save the project (to its own file, or a new one) and note it in the list of recent projects."""
-        created = not self.project.path                  # (a project's file is made the first time it is saved)
+        """Save the project (to its own file, or, the first time, to a new one whose name the user is asked for) and note it in the list of
+        recent projects. False if the user declined to name a new file (nothing is saved then), else True."""
         path = self.save_path()
+        if path is None:
+            return False
         proj.save(path)
         sp.add_recent_project(path)
         self.update_title()
-        if created:
-            messagebox.showinfo(
-                "Project file created",
-                f"A project file was made for this work:\n\n{path}\n\nIt keeps the outlines, the order and the alignment, so that you "
-                f"can come back to them: open it later with \"Open a saved project\" or \"Open recent projects\", or add the same JPX again "
-                f"and choose to open its project.", parent=self.root)
+        return True
 
     def save_path(self):
-        """Where the project is saved: the file it was opened from, else a new name that doesn't take the place of another project's
-        file (a project's name comes from its first image, so two projects can start alike)."""
+        """Where the project is saved: the file it was opened from, else a new file, named in a save dialog that offers the usual name (the
+        first image's, or with a number if that is taken by another project, which is left as it is). The file stays in the images' folder
+        (a project's paths are relative to it) and its name ends in _project.json, which is how project files are told from other .json
+        files. None if the dialog was cancelled."""
         if self.project.path:
             return self.project.path
-        path = self.project.new_path()
-        taken = path != self.project.default_path()
-        self.var_status.set(f"Project file: {os.path.basename(path)}" + (
-            " (the usual name belongs to another project, which was left as it is)" if taken else ""))
-        print(f"Project file: {path}", flush=True)
-        return path
+        default = self.project.new_path()
+        folder = os.path.dirname(default)
+        initial = os.path.basename(default)
+        # said once, just before the first dialog, so that the user knows what the file is for when the dialog comes up
+        messagebox.showinfo(
+            "Save the project file",
+            "You are about to be shown a dialog to choose where to create a new project file.\n\n"
+            "This project file will record the images you chose, the outlines found on them, the order of the sections and, "
+            "later, their alignment. It is written next to the images and updated as you work, so you can close the program and "
+            "come back to where you left off.\n\n"
+            "Open it again with \"Open a saved project\" or \"Open recent projects\" in step 1 (for a JPX, adding the same JPX again "
+            "offers its project too). The images themselves are not changed or copied.\n\n"
+            "The project file must be placed in the images' folder. Its name will end in _project.json.",
+            parent=self.root)
+        while True:
+            chosen = filedialog.asksaveasfilename(
+                parent=self.root, title="Save the project file", initialdir=folder, initialfile=initial,
+                defaultextension=".json", filetypes=[("Section projects", "*" + sp.PROJECT_SUFFIX), ("All files", "*.*")])
+            if not chosen:
+                self.var_status.set("The project file was not saved.")
+                return None
+            chosen = os.path.normpath(chosen)
+            name = os.path.basename(chosen)
+            if not name.lower().endswith(sp.PROJECT_SUFFIX):
+                stem = name[:-5] if name.lower().endswith(".json") else name
+                name = stem + sp.PROJECT_SUFFIX
+                chosen = os.path.join(os.path.dirname(chosen), name)
+            if os.path.normcase(os.path.dirname(os.path.abspath(chosen))) != os.path.normcase(os.path.abspath(folder)):
+                messagebox.showinfo("Project file folder", f"The project file has to be in the folder of its images (its paths are relative "
+                                    f"to it, so that the project can be moved):\n\n{folder}\n\nYou can change its name.", parent=self.root)
+                initial = os.path.basename(chosen)
+                continue
+            if chosen != default and os.path.exists(chosen) and not messagebox.askyesno(
+                    "Replace the project file?", f"{name} already exists and will be replaced.\n\nReplace it?", parent=self.root):
+                initial = name
+                continue
+            self.var_status.set(f"Project file: {name}")
+            print(f"Project file: {chosen}", flush=True)
+            return chosen
 
     def sync_project(self, save=True):
         """Write the editor's outlines of every slide visited back into the project, and (unless save is False) save it."""
@@ -1272,7 +1321,7 @@ class SectionLoader:
             s = self.project.slides[i]
             if s.path in self.ov:
                 s.polygons = [self.to_slide(p, s.path) for p in polys]
-        if save and self.project.slides and any(s.polygons for s in self.project.slides):
+        if save and self.project.slides and any(s.polygons for s in self.project.slides) and self.project.path:
             try:
                 self.write_project(self.project)
             except OSError as e:
@@ -1454,28 +1503,21 @@ class SectionLoader:
         else:
             self.accept()
 
-    def accept_all(self):
+    def accept_all(self, then=None, quiet=False):
         """Accept the detection for every image not accepted yet: each with its own brightness threshold (the automatic one where it
-        hasn't been set), and the smoothing, padding and smallest region of the image on show."""
+        hasn't been set), and the smoothing, padding and smallest region of the image on show. Images already accepted stay as they are
+        (and any can still be edited), so there is no question to answer. `then` is called when it is done (also when there was nothing
+        to accept, with `quiet` saying nothing about that)."""
         slides = self.project.slides
         targets = [i for i, s in enumerate(slides) if not s.accepted]
         if not targets:
-            messagebox.showinfo("Accept all", "Every image has been accepted already.", parent=self.root)
+            if not quiet:
+                messagebox.showinfo("Accept all", "Every image has been accepted already.", parent=self.root)
+            if then:
+                then()
             return
         cur = self.slide()
         smooth, pad, min_mm2 = cur.smooth, cur.pad, self.min_area_mm2()
-        if self.project.shared:
-            how = (f"All of them use the same settings, those now displayed: brightness threshold {cur.threshold}, smoothing {smooth} px, "
-                   f"padding {pad} px and smallest region {min_mm2:.2f} mm².")
-        else:
-            how = ("Each uses its own brightness threshold (the automatic one if you haven't set it), with the smoothing, "
-                   "padding and smallest region now displayed in the panel.")
-        if not messagebox.askyesno(
-                "Accept detection for all images",
-                f"Accept the detection for the {len(targets)} image(s) that aren't accepted yet?\n\n" + how
-                + " Images already accepted stay as they are, and you can still edit any of them.",
-                parent=self.root):
-            return
         numbering = self.project.numbering
         jobs = [(i, slides[i].path, slides[i].threshold, self.slide_px(slides[i]) or 0.65, self.ov.get(slides[i].path)) for i in targets]
         self.var_status.set(f"Finding the sections of {len(targets)} images...")
@@ -1512,8 +1554,16 @@ class SectionLoader:
                 self.start_grid()
             self.var_status.set(f"Accepted the detection for {len(res)} image(s): "
                                 f"{sum(len(slides[i].polygons) for i, *_ in res)} outlines in all.")
+            if then:
+                then()
 
         self.background(work, done)
+
+    def full_auto(self):
+        """The Full auto button: "Accept detection for all images", then "Merge contours within scenes" (for all the images), in that order."""
+        if not self.project.slides or self.busy:
+            return
+        self.accept_all(then=lambda: self.merge_all_within_scenes(everything=True, quiet=True), quiet=True)
 
     def on_numbering(self):
         """The outlines of every accepted image are numbered anew in the order chosen; the order of the sections (the third tab) starts
@@ -1546,6 +1596,27 @@ class SectionLoader:
         return sp.sort_by_scene(polys, boxes, self.to_slide, self.project.numbering)[0]
 
     def back_to_threshold(self):
+        if self.grid_mode:
+            # all the images are shown: they all go back to finding the sections (each keeps its brightness threshold and the other settings)
+            slides = self.project.slides
+            if any(s.accepted or s.polygons for s in slides) and not messagebox.askyesno(
+                    "Change detect parameters",
+                    f"Finding the sections again replaces the outlines of ALL {len(slides)} images, including any you have edited, and the "
+                    "order of the sections made from them. Go on?", parent=self.root):
+                return
+            for i, s in enumerate(slides):
+                s.accepted = False
+                s.polygons = []
+                self.polys.pop(i, None)
+                self.undo[i] = []
+            self.project.order = []
+            self.order_key = None
+            self.selected = set()
+            self.sync_project()
+            self.set_mode("threshold")
+            self.start_grid()                        # (the grid shows the blue preview of each image again)
+            self.var_status.set("All the images are back to finding the sections.")
+            return
         if self.polys.get(self.cur) and not messagebox.askyesno(
                 "Change detect parameters", "Finding the sections again replaces the outlines of this image, including any you have edited. Go on?",
                 parent=self.root):
@@ -1592,13 +1663,15 @@ class SectionLoader:
         self.sync_project()
         self.redraw()
 
-    def merge_all_within_scenes(self):
+    def merge_all_within_scenes(self, everything=False, quiet=False):
         """Merge all the outlines that lie in one scene into a single outline (the fragments of a section: two hemispheres, a piece
-        broken off), in the image on show, or in every image while all of them are shown on the grid. Outlines are counted in the scene
-        their centre is in."""
+        broken off), in the image on show, or in every image while all of them are shown on the grid (or when `everything` is asked: the
+        Full auto button). Outlines are counted in the scene their centre is in. With `quiet` no dialog is shown: there is no question about
+        what will be merged, and nothing is said when there is nothing to merge (the status line reports what was done)."""
         slides = self.project.slides
         self.sync_project(save=False)
-        shown = range(len(slides)) if self.grid_mode else [self.cur]
+        many = self.grid_mode or everything
+        shown = range(len(slides)) if many else [self.cur]
         plan = []
         for i in shown:
             s = slides[i]
@@ -1610,8 +1683,9 @@ class SectionLoader:
             if n:
                 plan.append((i, merged, n, len(s.polygons) - len(merged), groups))
         if not plan:
-            messagebox.showinfo("Merge contours within scenes", "No scene of " + ("any image shown" if self.grid_mode else "this image")
-                                + " has more than one outline.", parent=self.root)
+            if not quiet:
+                messagebox.showinfo("Merge contours within scenes", "No scene of " + ("any image shown" if many else "this image")
+                                    + " has more than one outline.", parent=self.root)
             return
         total_scenes = sum(n for _, _, n, _, _ in plan)
         total_outlines = sum(d for _, _, _, d, _ in plan)
@@ -1619,13 +1693,13 @@ class SectionLoader:
         numbers = lambda idx: ", ".join(str(k + 1) for k in idx[:-1]) + (" and " if len(idx) > 1 else "") + str(idx[-1] + 1)
         lines = []
         for i, _, _, _, groups in plan:
-            if self.grid_mode:
+            if many:
                 lines.append(f"{os.path.basename(slides[i].path)}:")
-            lines += [("   " if self.grid_mode else "") + f"scene {sc + 1}: outlines {numbers(idx)}" for sc, idx in groups]
+            lines += [("   " if many else "") + f"scene {sc + 1}: outlines {numbers(idx)}" for sc, idx in groups]
         listing = "\n".join(lines[:16]) + (f"\n... and {len(lines) - 16} more line(s)" if len(lines) > 16 else "")
-        where = f"In {len(plan)} image(s)," if self.grid_mode else "In this image,"
-        undo_note = "Only the image on the panel can be undone afterwards. " if self.grid_mode else "Undo goes back. "
-        if not messagebox.askyesno(
+        where = f"In {len(plan)} image(s)," if many else "In this image,"
+        undo_note = "Only the image on the panel can be undone afterwards. " if many else "Undo goes back. "
+        if not quiet and not messagebox.askyesno(          # (quiet, the Full auto button: no details to read; the status line says what was done)
                 "Merge contours within scenes",
                 f"{where} {total_scenes} scene(s) have more than one outline. Merging each scene's outlines into one "
                 f"takes away {total_outlines} outline(s):\n\n{listing}\n\nFragments are joined along their closest points, so a small piece far "
@@ -2047,7 +2121,9 @@ class SectionLoader:
         self.var_spacing = tk.StringVar(f, "")
         ttk.Entry(top, textvariable=self.var_spacing, width=7).pack(side=tk.RIGHT, padx=(4, 18))
         ttk.Label(top, text="Distance between adjacent sections (\u00b5m):").pack(side=tk.RIGHT)
-        ttk.Button(top, text="Reset order", command=self.reset_order).pack(side=tk.RIGHT, padx=8)
+        reset = ttk.Button(top, text="Reset order", command=self.reset_order)
+        reset.pack(side=tk.RIGHT, padx=8)
+        Tooltip(reset, self.reset_order_help, wraplength=340)
         self.var_fit_thumbs = tk.BooleanVar(f, True)
         ttk.Checkbutton(top, text="Scale sections to fit thumbnails", variable=self.var_fit_thumbs,
                         command=self.on_fit_thumbs).pack(side=tk.RIGHT, padx=8)
@@ -2062,16 +2138,26 @@ class SectionLoader:
             b = ttk.Radiobutton(bright, text=text, value=value, variable=self.var_bright, style="Toolbutton", command=self.on_bright)
             b.pack(side=tk.LEFT, padx=1)
             self.bright_buttons.append(b)
+        # the size of the thumbnails: medium is the usual size, small half of it, large twice
+        self.var_thumb_size = tk.StringVar(f, "medium")
+        sizes = ttk.Frame(top)
+        sizes.pack(side=tk.RIGHT, padx=8)
+        ttk.Label(sizes, text="Thumbnails:").pack(side=tk.LEFT, padx=(0, 4))
+        for text, value in (("Small", "small"), ("Medium", "medium"), ("Large", "large")):
+            ttk.Radiobutton(sizes, text=text, value=value, variable=self.var_thumb_size, style="Toolbutton",
+                            command=self.on_thumb_size).pack(side=tk.LEFT, padx=1)
         help_label.pack(side=tk.LEFT)      # (packed last: if the window is narrow it is the help text that is cut, not the buttons)
 
         def caption(key, i):
             if self.project.is_jpx:                  # (key: (0, frame): #, the section's place in the JPX as it was)
                 sec = self.jpx_by_frame.get(key[1])
+                if sec is not None and sec.placeholder:      # (one NeuroInfo made is a frame of the JPX; one made here is new)
+                    return f"{i + 1}   placeholder", "new" if ns.is_new_placeholder(sec) else f"#{key[1] + 1}"
                 return f"{i + 1}   {os.path.splitext(sec.name)[0][-9:] if sec else ''}", f"#{key[1] + 1}"
             slide = self.project.slides[key[0]]
             return f"{i + 1}   {os.path.splitext(os.path.basename(slide.path))[0][-9:]}", f"#{key[1] + 1}"   # (#: its outline's number in tab 2)
 
-        self.grid = OrderGrid(f, caption, on_double=self.order_double, enabled=lambda: self.stage == 2,
+        self.grid = OrderGrid(f, caption, on_double=self.order_double, enabled=lambda: self.stage == 2, on_context=self.order_context,
                               after_draw=lambda: self.var_order_text.set(f"{len(self.grid.order)} section(s). Drag a picture to reorder."))
         self.grid.frame.pack(fill=tk.BOTH, expand=True)
         return f
@@ -2141,6 +2227,25 @@ class SectionLoader:
         scans, whose thumbnails have no such setting."""
         return self.bright_mode if self.project.is_jpx else None
 
+    def on_thumb_size(self):
+        """Small / Medium / Large thumbnails: half, one and two times the usual size. A JPX's pictures are read again only when they must be
+        sharper (large); the thumbnails on screen stay until each is replaced by one of the new size."""
+        scale = {"small": 0.5, "medium": 1.0, "large": 2.0}[self.var_thumb_size.get()]
+        if scale == self.grid.scale:
+            return
+        self.grid.set_scale(scale)
+        if self.project.is_jpx:
+            target = 512 if scale > 1.0 else 256
+            if target != self.jpx_target:
+                self.jpx_target = target
+                self.jpx_crops = {}                  # (a picture read for the other size is not wanted; one still arriving is ignored)
+            self.stale_thumbs = set(self.thumbs)
+            self.draw_order()
+            return
+        self.thumbs = {}
+        self.build_thumbs()
+        self.draw_order()
+
     def on_fit_thumbs(self):
         """"Scale sections to fit thumbnails" changed: the thumbnails are made again."""
         if self.project.is_jpx:
@@ -2169,7 +2274,7 @@ class SectionLoader:
             if b[0] <= a[0] or b[1] <= a[1]:
                 continue
             items.append(((si, pi), a, b, poly, k * (self.slide_px(s) or 0.65)))
-        fits = {key: min(THUMB_W / (b[0] - a[0]), THUMB_H / (b[1] - a[1])) for key, a, b, _, _ in items}
+        fits = {key: min(self.grid.tw / (b[0] - a[0]), self.grid.th / (b[1] - a[1])) for key, a, b, _, _ in items}
         # one scale for all, in thumbnail pixels per um: the smallest of those that make each section fit
         common = min((fits[key] / u for key, _, _, _, u in items), default=1.0)
         for key, a, b, poly, u in items:
@@ -2289,6 +2394,9 @@ class SectionLoader:
     def jpx_ready(self):
         """The JPX's stack is open: its sections go in the grid (in the project's order, if it has one) and their pictures are asked for."""
         proj, stack = self.project, self.jpx_stack
+        for f in proj.jpx_order:       # (placeholders inserted before: new blank frames, which the JPX does not have yet)
+            if f >= ns.PLACEHOLDER_FRAME_BASE and not any(s.frame == f for s in stack.sections):
+                stack.sections.append(ns.placeholder_section(len(stack.sections), frame=f))
         self.jpx_by_frame = {s.frame: s for s in stack.sections}
         order = [f for f in proj.jpx_order if f in self.jpx_by_frame]
         pre = getattr(stack, "prelocate", None)
@@ -2334,21 +2442,24 @@ class SectionLoader:
             self.jpx_pool = ThreadPoolExecutor(3)
         stack, path, section = self.jpx_stack, self.jpx_stack_path, self.jpx_by_frame[frame]
         self.jpx_inflight.add(frame)
+        target = self.jpx_target
 
         def work():
             ns.lower_thread_priority()
             try:
-                data = jpx_crop(stack, path, frame, section)
+                data = jpx_crop(stack, path, frame, section, target)
             except Exception as e:
                 data = e
-            self.msgs.put(("jpxcrop", (stack, frame, data)))
+            self.msgs.put(("jpxcrop", (stack, frame, data, target)))
 
         self.jpx_pool.submit(work)
 
-    def on_jpx_crop(self, stack, frame, data):
+    def on_jpx_crop(self, stack, frame, data, target=None):
         if stack is not self.jpx_stack:
             return                                   # (a picture of a stack that has been closed)
         self.jpx_inflight.discard(frame)
+        if target is not None and target != self.jpx_target:
+            return                                   # (read for another thumbnail size: it will be asked for again)
         if isinstance(data, BaseException):
             print(f"Couldn't read the picture of section {frame + 1}: {type(data).__name__}: {data}", flush=True)
             self.jpx_crops[frame] = False
@@ -2367,17 +2478,54 @@ class SectionLoader:
         rgb = jpx_colorize(raw, self.jpx_stack, self.var_bright.get())
         h, w = rgb.shape[:2]
         if self.var_fit_thumbs.get():
-            f = min(THUMB_W / w, THUMB_H / h)
+            f = min(self.grid.tw / w, self.grid.th / h)
         else:
-            f = min((min(THUMB_W / c[0].shape[1], THUMB_H / c[0].shape[0]) / c[2] for c in self.jpx_crops.values() if c), default=1.0) * um
+            f = min((min(self.grid.tw / c[0].shape[1], self.grid.th / c[0].shape[0]) / c[2] for c in self.jpx_crops.values() if c and len(c[1])),
+                    default=1.0) * um
         img = cv2.resize(rgb, (max(int(w * f), 1), max(int(h * f), 1)), interpolation=cv2.INTER_AREA)
-        cv2.polylines(img, [(poly * f).astype(np.int32)], True, (255, 212, 0), 1, cv2.LINE_AA)
+        section = self.jpx_by_frame.get(key[1])
+        if section is not None and getattr(section, "placeholder", False):
+            img = np.full((self.grid.th, self.grid.tw, 3), 58, np.uint8)           # (a grey box saying what it is)
+            scale = max(self.grid.tw / 190, 0.4)
+            (tw_, th_), _ = cv2.getTextSize("Placeholder", cv2.FONT_HERSHEY_SIMPLEX, 0.6 * scale, 1)
+            cv2.putText(img, "Placeholder", ((img.shape[1] - tw_) // 2, (img.shape[0] + th_) // 2), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6 * scale, (200, 200, 200), 1, cv2.LINE_AA)
+        elif len(poly):
+            cv2.polylines(img, [(poly * f).astype(np.int32)], True, (255, 212, 0), 1, cv2.LINE_AA)
         self.thumbs[key] = ImageTk.PhotoImage(Image.fromarray(img), master=self.root)
         self.stale_thumbs.discard(key)
         return True
 
     def draw_order(self):
         self.grid.draw()
+
+    def order_context(self, key, i, event):
+        """Right-click on a thumbnail: a menu with the one thing to do there, inserting a placeholder before it."""
+        menu = tk.Menu(self.root, tearoff=0)
+        if self.project.is_jpx and self.jpx_stack is not None:
+            menu.add_command(label="Insert placeholder before this section", command=lambda: self.insert_placeholder(i))
+        else:
+            menu.add_command(label="Insert placeholder before this section (JPX projects only)", state="disabled")
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def insert_placeholder(self, position):
+        """A blank frame (NeuroInfo's "placeholder", which keeps the spacing even where a section is missing) before the section at
+        `position`. It is a section of the stack with no image and no outline; its blank frame is written when the stack is exported."""
+        stack = self.jpx_stack
+        if stack is None or not 0 <= position <= len(self.order):
+            return
+        used = [s.frame for s in stack.sections if s.frame >= ns.PLACEHOLDER_FRAME_BASE]
+        frame = max(used + [ns.PLACEHOLDER_FRAME_BASE - 1]) + 1
+        section = ns.placeholder_section(len(stack.sections), frame=frame)
+        stack.sections.append(section)
+        self.jpx_by_frame[frame] = section
+        self.order.insert(position, (0, frame))
+        self.grid.selected = (0, frame)
+        self.draw_order()
+        self.var_status.set(f"Placeholder inserted before section {position + 2}: its blank frame is written when the stack is exported.")
 
     def order_double(self, key, i):
         """Double-click on a thumbnail: back to the outlines tab, at that section's image with its outline selected."""
@@ -2395,8 +2543,25 @@ class SectionLoader:
     def reverse_order(self):
         self.grid.reverse()
 
+    def reset_order_help(self):
+        """What Reset order does, for its tool tip (it depends on the kind of project and, for scans, on how step 2 numbers the outlines)."""
+        if self.project.is_jpx:
+            return ("Puts the sections back in the order of the frames in the JPX file, as it was when the file was opened. "
+                    "Any order made by dragging is lost, and so are the placeholders inserted here.")
+        how = {"rows": "across the image, then down (by rows)", "columns": "down the image, then across (by columns)",
+               "scene": "by scene number, the order of the scenes in the .czi"}.get(self.project.numbering, self.project.numbering)
+        return ("Puts the sections back in the order they were numbered in step 2: the images in the order of the list in step 1, and "
+                f"within each image the outlines in the order chosen under \"Number the outlines\" in step 2, now: {how}. "
+                "Any order made by dragging is lost.")
+
     def reset_order(self):
         if self.project.is_jpx:
+            if self.jpx_stack is not None:        # (placeholders inserted here are not in the JPX: they go)
+                self.jpx_stack.sections[:] = [s for s in self.jpx_stack.sections if not ns.is_new_placeholder(s)]
+                for k, s in enumerate(self.jpx_stack.sections):
+                    s.index = k
+                self.jpx_by_frame = {s.frame: s for s in self.jpx_stack.sections}
+            self.grid.selected = None
             self.order = [(0, f) for f in sorted(self.jpx_by_frame)]       # (the JPX's own order)
         else:
             self.order = self.project.default_order()
@@ -2413,7 +2578,8 @@ class SectionLoader:
         proj.jpx_order = [f for _, f in self.order]
         proj.jpx_sections = len(proj.jpx_order)
         try:
-            self.write_project(proj)
+            if not self.write_project(proj):
+                return
         except OSError as e:
             messagebox.showwarning("Project not saved", f"Couldn't save the project file: {e}", parent=self.root)
         self.var_status.set("Preparing the sections...")
@@ -2472,7 +2638,8 @@ class SectionLoader:
         proj.order = list(self.order)
         self.order_key = proj.polygons_key()
         try:
-            self.write_project(proj)
+            if not self.write_project(proj):
+                return
         except OSError as e:
             messagebox.showwarning("Project not saved", f"Couldn't save the project file: {e}", parent=self.root)
         self.var_status.set("Preparing the sections...")

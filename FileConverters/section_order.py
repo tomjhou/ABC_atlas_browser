@@ -16,12 +16,15 @@ ACCENT = "#1f5fa8"
 
 
 class OrderGrid:
-    def __init__(self, parent, caption, on_double=None, enabled=None, after_draw=None, accent=ACCENT):
+    def __init__(self, parent, caption, on_double=None, enabled=None, after_draw=None, accent=ACCENT, on_context=None):
         """caption(key, position) -> (text at the left, text at the right) under a thumbnail; on_double(key, position) is called on a
         double-click; enabled() -> False stops it drawing (for a page that is not shown); after_draw() is called after each drawing."""
         self.caption, self.on_double, self.enabled, self.after_draw, self.accent = caption, on_double, enabled, after_draw, accent
+        self.on_context = on_context     # on_context(key, position, event) on a right-click on a thumbnail (which is selected first)
         self.order = []                    # the keys, in order
         self.thumbs = {}                   # key -> PhotoImage
+        self.selected = None               # the key of the thumbnail last clicked (drawn with a blue outline), or None
+        self.set_scale(1.0)                # the size of the thumbnails: THUMB_W x THUMB_H times this
         self.drag = None
         self.frame = ttk.Frame(parent)
         self.canvas = tk.Canvas(self.frame, bg="white", highlightthickness=0)
@@ -35,12 +38,21 @@ class OrderGrid:
         self.canvas.bind("<B1-Motion>", self.move)
         self.canvas.bind("<ButtonRelease-1>", self.release)
         self.canvas.bind("<Double-Button-1>", self.double)
+        self.canvas.bind("<Button-3>", self.context)
 
     # ------------------------------------------------------------------ geometry
 
+    def set_scale(self, scale):
+        """Make the thumbnails `scale` times the usual size (the caller makes the pictures again at the new size, then draws). In a narrow
+        cell the two captions go on two lines, one under the other."""
+        self.scale = scale
+        self.tw, self.th = max(round(THUMB_W * scale), 40), max(round(THUMB_H * scale), 30)
+        self.two_line = self.tw < 150
+        self.caption_h = CAPTION_H + (14 if self.two_line else 0)
+
     def cell_geometry(self):
         w = max(self.canvas.winfo_width(), 300)
-        cw, chh = THUMB_W + CELL_PAD, THUMB_H + CAPTION_H + CELL_PAD
+        cw, chh = self.tw + CELL_PAD, self.th + self.caption_h + CELL_PAD
         cols = max(1, (w - CELL_PAD) // cw)
         return cols, cw, chh
 
@@ -63,7 +75,7 @@ class OrderGrid:
         col = int(min(max((x - CELL_PAD) // cw, 0), cols - 1))
         row = int(max((y - CELL_PAD) // chh, 0))
         i = row * cols + col
-        cx = CELL_PAD + col * cw + THUMB_W / 2
+        cx = CELL_PAD + col * cw + self.tw / 2
         if x > cx:
             i += 1
         return min(i, len(self.order))
@@ -82,33 +94,48 @@ class OrderGrid:
             if self.drag and self.drag["moved"] and i == self.drag["index"]:
                 continue
             x, y = self.cell_origin(i)
-            c.create_rectangle(x, y, x + THUMB_W, y + THUMB_H, outline="#c0c0c0", fill="#101010")
+            c.create_rectangle(x, y, x + self.tw, y + self.th, outline="#c0c0c0", fill="#101010")
             ph = self.thumbs.get(key)
             if ph:
-                c.create_image(x + THUMB_W / 2, y + THUMB_H / 2, image=ph)
+                c.create_image(x + self.tw / 2, y + self.th / 2, image=ph)
+            if key == self.selected:
+                c.create_rectangle(x - 1, y - 1, x + self.tw + 1, y + self.th + 1, outline=self.accent, width=3)
             left, right = self.caption(key, i)
-            c.create_text(x + 2, y + THUMB_H + 2, anchor="nw", fill="black", font=("Segoe UI", 9), text=left)
-            c.create_text(x + THUMB_W - 2, y + THUMB_H + 2, anchor="ne", fill=self.accent, font=("Segoe UI", 9, "bold"), text=right)
+            c.create_text(x + 2, y + self.th + 2, anchor="nw", fill="black", font=("Segoe UI", 9), text=left)
+            if self.two_line:
+                c.create_text(x + 2, y + self.th + 16, anchor="nw", fill=self.accent, font=("Segoe UI", 9, "bold"), text=right)
+            else:
+                c.create_text(x + self.tw - 2, y + self.th + 2, anchor="ne", fill=self.accent, font=("Segoe UI", 9, "bold"), text=right)
         if self.drag and self.drag["moved"]:
             g = self.drag["slot"]
             x, y = self.cell_origin(g)
             if g == len(self.order) and g % cols == 0 and g:
                 x, y = self.cell_origin(g - 1)
                 x += cw
-            c.create_rectangle(x - 6, y, x - 3, y + THUMB_H, fill=self.accent, outline="")
+            c.create_rectangle(x - 6, y, x - 3, y + self.th, fill=self.accent, outline="")
             ph = self.thumbs.get(self.order[self.drag["index"]])
             if ph:
                 c.create_image(self.drag["x"], self.drag["y"], image=ph)
+            c.create_rectangle(self.drag["x"] - self.tw / 2, self.drag["y"] - self.th / 2, self.drag["x"] + self.tw / 2,
+                               self.drag["y"] + self.th / 2, outline=self.accent, width=3)      # (the one being dragged is selected)
         if self.after_draw:
             self.after_draw()
 
     # ------------------------------------------------------------------ mouse
 
     def press(self, e):
+        """Clicking a thumbnail selects it (the blue outline stays, also after dragging it, until another is clicked); clicking where there
+        is none takes the selection away."""
         i = self.index_at(e.x, e.y)
-        if i is not None:
-            y = self.canvas.canvasy(e.y)
-            self.drag = {"index": i, "x0": e.x, "y0": y, "x": e.x, "y": y, "wy": e.y, "moved": False, "slot": i, "job": None}
+        if i is None:
+            if self.selected is not None:
+                self.selected = None
+                self.draw()
+            return
+        self.selected = self.order[i]
+        y = self.canvas.canvasy(e.y)
+        self.drag = {"index": i, "x0": e.x, "y0": y, "x": e.x, "y": y, "wy": e.y, "moved": False, "slot": i, "job": None}
+        self.draw()
 
     def move(self, e):
         d = self.drag
@@ -145,6 +172,14 @@ class OrderGrid:
             slot = d["slot"] - (1 if d["slot"] > d["index"] else 0)
             self.order.insert(slot, item)
         self.draw()
+
+    def context(self, e):
+        i = self.index_at(e.x, e.y)
+        if i is None or self.on_context is None:
+            return
+        self.selected = self.order[i]
+        self.draw()
+        self.on_context(self.order[i], i, e)
 
     def double(self, e):
         i = self.index_at(e.x, e.y)

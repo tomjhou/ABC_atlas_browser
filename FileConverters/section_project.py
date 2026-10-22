@@ -749,8 +749,12 @@ def apply_jpx_order(stack, frames):
     if not frames:
         return
     named = set(frames)
+    for f in frames:                 # (a placeholder inserted in step 3: a new, blank frame, not in the JPX yet)
+        if f >= ns.PLACEHOLDER_FRAME_BASE and not any(s.frame == f for s in stack.sections):
+            stack.sections.append(ns.placeholder_section(len(stack.sections), frame=f))
     by_frame = {s.frame: s for s in stack.sections}
-    stack.sections[:] = [by_frame[f] for f in frames if f in by_frame] + [s for s in stack.sections if s.frame not in named]
+    stack.sections[:] = [by_frame[f] for f in frames if f in by_frame] + [
+        s for s in stack.sections if s.frame not in named and not ns.is_new_placeholder(s)]    # (a placeholder taken out of the order is gone)
     for i, s in enumerate(stack.sections):
         s.index = i
 
@@ -763,6 +767,52 @@ def open_jpx_stack(project, locate=None):
     if project.z_spacing_um > 0:
         stack.z_spacing_um = project.z_spacing_um
     return stack
+
+
+_pixel_um_of_file = {}     # slide path -> the file's own pixel size (read once)
+
+
+def slide_pixel_um(slide):
+    """The pixel size (um) step 1 uses for a slide: the one set for it, else the file's own (0 if unknown)."""
+    if slide.pixel_um:
+        return float(slide.pixel_um)
+    if slide.path not in _pixel_um_of_file:
+        _pixel_um_of_file[slide.path] = float(slide_info(slide.path).pixel_um or 0.0)
+    return _pixel_um_of_file[slide.path]
+
+
+def write_back_outlines(project, stack):
+    """Outlines edited in the alignment tool become the project's own outlines, so that step 1 shows them too (there is then one version of
+    each outline, the current one). Each section of a scan-based project came from one of the project's polygons, which its `origin_key`
+    names; where the section's outline is no longer that polygon (converted to um as build_stack does), the polygon is replaced by the
+    section's outline in slide pixels (rounded as the project file rounds them), and the section's origin_key becomes the new polygon's.
+    A section whose outline was deleted keeps its polygon (a polygon is what makes a section). Returns how many polygons were replaced;
+    the caller then saves the project (its alignment_key must be made again: the fingerprint changes with the outlines)."""
+    if project.is_jpx:
+        return 0
+    by_key = {}
+    for slide in project.slides:
+        for pi, poly in enumerate(slide.polygons):
+            by_key.setdefault(outline_key(poly), (slide, pi))
+    replaced = 0
+    for sec in stack.sections:
+        hit = by_key.get(sec.origin_key) if sec.origin_key else None
+        P = np.asarray(sec.case_points, float).reshape(-1, 2)
+        if hit is None or len(P) < 3:
+            continue
+        slide, pi = hit
+        k = slide_pixel_um(slide)
+        if k <= 0:
+            continue
+        old = np.asarray(slide.polygons[pi], float)
+        was = np.column_stack([old[:, 0] * k, -old[:, 1] * k])           # (what build_stack made of the polygon)
+        if was.shape == P.shape and np.allclose(was, P, atol=1e-3):
+            continue
+        new = np.round(np.column_stack([P[:, 0] / k, -P[:, 1] / k]), 2)
+        slide.polygons[pi] = new
+        sec.origin_key = outline_key(new)
+        replaced += 1
+    return replaced
 
 
 def reuse_info(project, stack):
@@ -783,7 +833,9 @@ def reuse_order(info, project, live_stack, new_stack):
         if info.get("jpx") != os.path.abspath(project.jpx_path):
             return None
         by_frame = {s.frame: s for s in live_stack.sections}
-        return [by_frame[f] for f in project.jpx_order if f in by_frame] or list(live_stack.sections)
+        if any(f not in by_frame for f in project.jpx_order):
+            return None                  # (a placeholder inserted since: this window's stack lacks it, so it is made again)
+        return [by_frame[f] for f in project.jpx_order] or list(live_stack.sections)
     if "snap" not in info or abs(new_stack.pixel_um - info["pixel_um"]) > 1e-9:
         return None
     snap, keys = info["snap"], info["keys"]
