@@ -43,12 +43,13 @@ TILE_PX = 230
 MIN_TILE_PX = 50
 TILE_COLUMNS = {"Very small": 5, "Small": 3, "Medium": 2, "Large": 1}     # the section panels' size choices: how many fit across the pane (a fifth, a third, a half, all of its width)
 DEFAULT_TILE_SIZE = "Medium"
-DOT_SIZES = {"Small": 0.5, "Medium": 1.0, "Large": 2.0}      # the section panels' dot size choices: times DOT_MM
+DOT_SIZES = {"Small": 0.5, "Medium": 1.0, "Large": 1.5}      # the section panels' dot size choices: times DOT_MM (15, 30 and 60 um)
+OTHER_CELLS_DOT_RATIO = 0.5       # the dots of the cells of the other kind (e.g. the non-neurons of a neuron run), relative to the others'
 DEFAULT_DOT_SIZE = "Medium"
 LABEL_ZOOM_CAP = 5.0               # the group numbers grow with the zoom up to this, then stay the same size
 HOVER_HOLD_MS = 250                # the pointer must rest this long before the plots dim
 GROUP_HOLD_MS = 500                # ...and this long before the cell's group is marked
-DOT_MM = 0.03                      # a cell's dot in the section panels: 30 um across on the tissue
+DOT_MM = 0.04                      # a cell's dot in the section panels: 30 um across on the tissue
 BIG_DOT_PX = 40                    # dots wider than this are drawn one by one as circles (the maximum filter gets slow)
 SCALEBAR_UM = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000)
 HOVER_RADIUS_PX = 9
@@ -607,15 +608,24 @@ class UmapWindow(ExportsMixin):
         side.pack_propagate(False)
         self.build_side(side)
         pw.add(side, weight=0)
+        self.side_pane = side
         self.build_tiles()
         self.root.after(400, self.fit_left_pane)
 
-    def fit_left_pane(self):
+    def fit_left_pane(self, again=True):
         """Once, at the start: the section pane gets about a third of the window (the panels fill whatever width it has)."""
         if not self.root.winfo_viewable():
             return
         total = self.pw.winfo_width()
-        self.pw.sashpos(0, int(min(max(total * 0.33, 520), total * 0.5)))
+        side_w = int(self.side_pane.cget("width")) or 420
+        if not again and self.side_pane.winfo_width() >= side_w - 5:
+            return                                                      # (the second look: nothing to put right)
+        edge = total - side_w                                           # (the side panel keeps its own width, at the right)
+        want = min(max(total * 0.33, 520), total * 0.5, edge - 300)     # (and the UMAP keeps at least 300)
+        self.pw.sashpos(0, int(want))
+        self.pw.sashpos(1, int(edge))
+        if again:                                                       # (once more after the window has settled)
+            self.root.after(600, lambda: self.fit_left_pane(False))
 
     def build_side(self, f):
         self.color_label = ttk.Label(f, text="Color by", font=("Segoe UI", 13, "bold"))
@@ -906,22 +916,34 @@ class UmapWindow(ExportsMixin):
             self.tile_job = self.root.after(1, self.tile_step)
 
     def build_tile(self, t):
+        """The section's dots, back to front: the cells of the other kind (half size), then the gray cells of the run's kind (those of the
+        whole section, then the run's own), and last all the colored ones, so a colored cell is never hidden by a gray one."""
         t["dirty"] = False
         idx = self.run_idx[t["label"]]
         layers = []
         bgl = self.tile_fn(t["label"])
+        sources = []                     # (x, y, rgb) of the run's kind, the section's cells first
         if bgl is not None:
             x, y, rgb, w = bgl
             if self.bg_under is not None and self.bg["levels"].get("class") is not None:
                 # the cells of the other kind (non-neurons in a neuron run) go underneath, so they never cover the ones being looked at
                 ids = core.extract_leading_numeric_id(pd.Series(self.bg["levels"]["class"][w])).to_numpy()
                 non_neuron = np.isin(ids, list(core.NON_NEURON_CLASS_IDS))
-                o = np.argsort(~non_neuron if self.bg_under == "nonneuron" else non_neuron, kind="stable")
-                x, y, rgb = x[o], y[o], rgb[o]
-            layers.append({"x": x, "y": y, "rgb": rgb, "size_mm": DOT_MM})
+                other = non_neuron if self.bg_under == "nonneuron" else ~non_neuron
+                layers.append({"x": x[other], "y": y[other], "rgb": rgb[other], "size_mm": DOT_MM * OTHER_CELLS_DOT_RATIO})
+                x, y, rgb = x[~other], y[~other], rgb[~other]
+            sources.append((x, y, rgb))
         # the run's own cells of this section, in drawing order (lowest first)
         sel = idx[np.argsort(self.rank_run[idx], kind="stable")]
-        layers.append({"x": self.cx[sel], "y": self.cy[sel], "rgb": self.rgb_run[sel], "size_mm": DOT_MM})
+        sources.append((self.cx[sel], self.cy[sel], self.rgb_run[sel]))
+        grays = []
+        for x, y, rgb in sources:
+            gray = (rgb == GREY).all(axis=1) | (rgb == LIGHT_GREY).all(axis=1)
+            grays.append((x, y, rgb, gray))
+        for x, y, rgb, gray in grays:
+            layers.append({"x": x[gray], "y": y[gray], "rgb": rgb[gray], "size_mm": DOT_MM})
+        for x, y, rgb, gray in grays:
+            layers.append({"x": x[~gray], "y": y[~gray], "rgb": rgb[~gray], "size_mm": DOT_MM})
         t["pc"].set_layers(layers)
 
     def color_all(self):

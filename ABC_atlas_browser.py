@@ -10787,6 +10787,29 @@ def prompt_roi_run_label():
     return label
 
 
+def regenerate_selection(run_folder, section_series):
+    """The section/ROI selection of a saved run, so a new run (another cell type) can be made without the picker. Returns
+    (selected_sections, sections_suffix, rois, label) like the picker's result plus the run's own label (the part of its folder name after
+    the ROI hash, '' if none): selected_sections is None for every section, else the whole-section picks (with ROIs: the ones that have
+    no ROI of their own)."""
+    run_folder = Path(run_folder)
+    label = ''
+    m = re.search(r'_rois\d+-[0-9a-f]{8}(?:_(?!sub\d+$)(?P<label>.*?))?(?:_sub\d+)?$', run_folder.name)
+    if m and m.group('label'):
+        label = m.group('label')
+    roi_csv = run_folder / 'roi_coords.csv'
+    rois, whole = (load_rois_csv(roi_csv) if roi_csv.exists() else ([], []))
+    if rois:
+        return (whole or None), 'sections', rois, label
+    if '_allsections' in run_folder.name:
+        return None, 'allsections', [], label
+    # sections only: the sections the run's cells are in
+    ids = pd.read_csv(run_folder / 'umap_coords.csv', index_col=0, usecols=[0], converters={0: str}).index
+    sections = sorted_sections_descending(section_series.reindex(ids).dropna().unique().tolist())
+    tokens = '-'.join(sanitize_section_token(x) for x in sections)
+    return sections, f'sections-{tokens}', [], label
+
+
 def confirm_overwrite(path):
     """If `path` already exists, ask the user whether to overwrite it.
     Returns True if the caller should proceed with writing the file."""
@@ -18684,12 +18707,20 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
     # ---------------------------------------------------------------------------
     # Section subset selection
     # ---------------------------------------------------------------------------
+    regenerate_label = None
     try:
-        print("Attempting to open the clickable section-thumbnail picker...")
-        selected_sections, sections_suffix, rois, imputed_adata_from_picker = prompt_section_selection_gui(
-            adata, abc_cache, section_series, out_folder=out_folder, cell_type_selection=cell_type_selection,
-            imputed_state=imputed_state,
-        )
+        if startup_action == 'regenerate':
+            # a new run for another cell type, from the sections and ROIs of the run chosen on the launcher: no picker
+            selected_sections, sections_suffix, rois, regenerate_label = regenerate_selection(load_existing_folder, section_series)
+            imputed_adata_from_picker = None
+            print(f"Regenerating {Path(load_existing_folder).name} as {cell_type_selection}: "
+                  f"{len(rois)} ROI(s), sections {'all' if selected_sections is None else len(selected_sections)}.")
+        else:
+            print("Attempting to open the clickable section-thumbnail picker...")
+            selected_sections, sections_suffix, rois, imputed_adata_from_picker = prompt_section_selection_gui(
+                adata, abc_cache, section_series, out_folder=out_folder, cell_type_selection=cell_type_selection,
+                imputed_state=imputed_state,
+            )
     except UserCancelledSelection:
         print("Section/ROI selection cancelled; returning to the startup panel.")
         return
@@ -18732,7 +18763,7 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         region_suffix = f'_rois{len(rois)}-{roi_hash}'
         log_status(f"Using {len(rois)} ROI(s) across {len(roi_sections)} section(s) "
                    "(overrides whole-section selection above).")
-        run_label = prompt_roi_run_label()
+        run_label = regenerate_label if startup_action == 'regenerate' else prompt_roi_run_label()
         if run_label:
             region_suffix += f'_{run_label}'
             log_status(f"Adding label '{run_label}' to this run's folder name.")

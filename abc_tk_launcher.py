@@ -5,8 +5,8 @@ viewer launcher, the settings window), so this file has no start-up side effects
 
     outcome = prompt_startup_panel_tk(out_folder, abc_cache, helpers)
 
-`outcome` is (action, cell_type_selection, load_folder, out_folder) with action 'new_run' or 'load_existing', or None if the window was
-closed or Exit was clicked.
+`outcome` is (action, cell_type_selection, load_folder, out_folder) with action 'new_run', 'load_existing' or 'regenerate' (a new run made
+from the ROIs of the run in load_folder, for the chosen cell type), or None if the window was closed or Exit was clicked.
 """
 import os
 import tkinter as tk
@@ -15,7 +15,49 @@ from tkinter import filedialog, messagebox, ttk
 
 CELL_TYPES = ("Neurons", "NonNeurons", "All")
 ACCENT = "#1f5fa8"
+RUN_PREFIXES = (("umap_nonneurons_", "NonNeurons"), ("umap_neurons_", "Neurons"), ("umap_all_", "All"))      # (a run folder's name starts with its cell type)
 RECOVERABLE = {"ROI coordinates", "Processed AnnData"}      # (cached files of a run that can be made again: not required to load it)
+
+
+def run_cell_type(folder):
+    """The cell type ("Neurons" | "NonNeurons" | "All") a run folder was made for, from its name; None if the name doesn't say."""
+    name = Path(folder).name.lower()
+    for prefix, cell_type in RUN_PREFIXES:
+        if name.startswith(prefix):
+            return cell_type
+    return None
+
+
+def ask_cell_type_mismatch(parent, folder, run_type, chosen_type):
+    """The run was made for another cell type than the one checked. Returns "load" | "regenerate" | "cancel"."""
+    top = tk.Toplevel(parent)
+    top.title("Cell type mismatch")
+    top.transient(parent)
+    top.resizable(False, False)
+    answer = {"value": "cancel"}
+    f = ttk.Frame(top, padding=20)
+    f.pack()
+    ttk.Label(f, text=f"This run was made for {run_type}, but {chosen_type} is checked on the launcher.", font=("Segoe UI", 11, "bold"),
+              wraplength=470, justify=tk.LEFT).pack(anchor="w")
+    ttk.Label(f, text=f"{Path(folder).name}", foreground="gray30", wraplength=470, justify=tk.LEFT).pack(anchor="w", pady=(4, 10))
+    ttk.Label(f, text=f"Load anyway shows the run as it is ({run_type}). Regenerate makes a new run for {chosen_type} from the same ROI outlines "
+                      "(the old run is kept).", wraplength=470, justify=tk.LEFT).pack(anchor="w")
+    row = ttk.Frame(f)
+    row.pack(fill=tk.X, pady=(16, 0))
+
+    def choose(value):
+        answer["value"] = value
+        top.destroy()
+
+    ttk.Button(row, text=f"Regenerate as {chosen_type}", command=lambda: choose("regenerate")).pack(side=tk.LEFT)
+    ttk.Button(row, text="Cancel", command=lambda: choose("cancel")).pack(side=tk.RIGHT)
+    ttk.Button(row, text="Load anyway", command=lambda: choose("load")).pack(side=tk.RIGHT, padx=(0, 8))
+    top.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
+    top.update_idletasks()
+    top.geometry(f"+{parent.winfo_rootx() + 40}+{parent.winfo_rooty() + 60}")
+    top.grab_set()
+    parent.wait_window(top)
+    return answer["value"]
 
 
 def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
@@ -101,8 +143,16 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
         if missing:
             messagebox.showerror("Missing cached files", "This folder is missing required cached file(s):\n\n" + "\n".join(missing), parent=root)
             return                                          # (stay here, so another folder can be picked)
+        action = "load_existing"
+        run_type = run_cell_type(chosen_path)
+        if run_type is not None and run_type != cell_type.get():
+            choice = ask_cell_type_mismatch(root, chosen_path, run_type, cell_type.get())
+            if choice == "cancel":
+                return
+            if choice == "regenerate":
+                action = "regenerate"
         helpers["remember_recent_output_folder"](folder)
-        result["outcome"] = ("load_existing", cell_type.get(), chosen_path, folder)
+        result["outcome"] = (action, cell_type.get(), chosen_path, folder)
         root.destroy()
 
     def viewer3d():
