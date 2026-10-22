@@ -1030,7 +1030,7 @@ class SectionLoader:
         for key, fn in (("<Key-c>", lambda e: self.close_polygon()), ("<Key-C>", lambda e: self.close_polygon()),
                         ("<Key-m>", lambda e: self.merge_key()), ("<Key-M>", lambda e: self.merge_key()),
                         ("<Delete>", lambda e: self.delete_selected()), ("<Escape>", lambda e: self.cancel_draw()),
-                        ("<Control-z>", lambda e: self.undo_last())):
+                        ("<Control-z>", lambda e: self.undo_any(e))):
             self.root.bind(key, fn)
         # ---- the controls
         right = ttk.Frame(f, padding=12, width=330)
@@ -2113,6 +2113,7 @@ class SectionLoader:
 
     def build_order(self):
         f = ttk.Frame(self.body)
+        self.order_history = []                       # the orders of the sections before each change, for Undo (see push_order_history)
         top = ttk.Frame(f, padding=(12, 8))
         top.pack(fill=tk.X)
         self.var_order_text = tk.StringVar(f, "")
@@ -2124,6 +2125,10 @@ class SectionLoader:
         reset = ttk.Button(top, text="Reset order", command=self.reset_order)
         reset.pack(side=tk.RIGHT, padx=8)
         Tooltip(reset, self.reset_order_help, wraplength=340)
+        self.btn_undo_order = ttk.Button(top, text="Undo", command=self.undo_order, state="disabled")
+        self.btn_undo_order.pack(side=tk.RIGHT)
+        Tooltip(self.btn_undo_order, "Undoes the last change of the order: a move, a deleted section, an inserted placeholder, Reverse order "
+                                     "or Reset order (Ctrl+Z does the same).", wraplength=300)
         self.var_fit_thumbs = tk.BooleanVar(f, True)
         ttk.Checkbutton(top, text="Scale sections to fit thumbnails", variable=self.var_fit_thumbs,
                         command=self.on_fit_thumbs).pack(side=tk.RIGHT, padx=8)
@@ -2157,7 +2162,7 @@ class SectionLoader:
             slide = self.project.slides[key[0]]
             return f"{i + 1}   {os.path.splitext(os.path.basename(slide.path))[0][-9:]}", f"#{key[1] + 1}"   # (#: its outline's number in tab 2)
 
-        self.grid = OrderGrid(f, caption, on_double=self.order_double, enabled=lambda: self.stage == 2, on_context=self.order_context,
+        self.grid = OrderGrid(f, caption, on_double=self.order_double, enabled=lambda: self.stage == 2, on_context=self.order_context, before_change=self.push_order_history,
                               after_draw=lambda: self.var_order_text.set(f"{len(self.grid.order)} section(s). Drag a picture to reorder."))
         self.grid.frame.pack(fill=tk.BOTH, expand=True)
         return f
@@ -2182,6 +2187,8 @@ class SectionLoader:
 
     def enter_order(self):
         proj = self.project
+        self.order_history = []
+        self.update_undo_button()
         if proj.is_jpx:
             self.enter_order_jpx()
             return
@@ -2403,8 +2410,11 @@ class SectionLoader:
         if pre is not None:
             pre["frames"] = list(order) or None      # (the pictures are made ahead in this order: see start_prelocate)
         named = set(order)
-        order += [s.frame for s in stack.sections if s.frame not in named]
+        if not proj.jpx_order:        # (a saved order names the sections there are: any it leaves out were deleted)
+            order += [s.frame for s in stack.sections if s.frame not in named]
         self.order = [(0, f) for f in order]
+        self.order_history = []
+        self.update_undo_button()
         if proj.z_spacing_um <= 0 and stack.z_spacing_um > 0:
             self.var_spacing.set(f"{stack.z_spacing_um:g}")
         self.draw_order()
@@ -2500,8 +2510,9 @@ class SectionLoader:
         self.grid.draw()
 
     def order_context(self, key, i, event):
-        """Right-click on a thumbnail: a menu with the one thing to do there, inserting a placeholder before it."""
+        """Right-click on a thumbnail: a menu of what can be done with that section: delete it, or (JPX projects) insert a placeholder before it."""
         menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Delete section", command=lambda: self.delete_section(i))
         if self.project.is_jpx and self.jpx_stack is not None:
             menu.add_command(label="Insert placeholder before this section", command=lambda: self.insert_placeholder(i))
         else:
@@ -2510,6 +2521,56 @@ class SectionLoader:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
+    def push_order_history(self, snapshot=None):
+        """Remember the order as it is (or `snapshot`) before a change, so that Undo can bring it back."""
+        self.order_history.append(list(self.order if snapshot is None else snapshot))
+        del self.order_history[:-200]
+        self.update_undo_button()
+
+    def update_undo_button(self):
+        button = getattr(self, "btn_undo_order", None)
+        if button is not None:
+            button.state(["!disabled"] if self.order_history else ["disabled"])
+
+    def undo_order(self):
+        """Undo: the order as it was before the last change (a move, a deleted section, a placeholder, Reverse, Reset)."""
+        if not self.order_history:
+            return
+        snapshot = self.order_history.pop()
+        if self.project.is_jpx and self.jpx_stack is not None:
+            for key in snapshot:        # (a placeholder that Reset order took away comes back)
+                if key[1] >= ns.PLACEHOLDER_FRAME_BASE and not any(s.frame == key[1] for s in self.jpx_stack.sections):
+                    self.jpx_stack.sections.append(ns.placeholder_section(len(self.jpx_stack.sections), frame=key[1]))
+            self.jpx_by_frame = {s.frame: s for s in self.jpx_stack.sections}
+        self.order = snapshot
+        self.grid.selected = None
+        self.update_undo_button()
+        self.draw_order()
+        self.var_status.set("Undone.")
+
+    def undo_any(self, event=None):
+        """Ctrl+Z: undoes the last change of the order in step 3, of the outlines in step 2."""
+        if event is not None and isinstance(event.widget, (tk.Entry, ttk.Entry)):
+            return
+        if self.stage == 2:
+            self.undo_order()
+        else:
+            self.undo_last()
+
+    def delete_section(self, position):
+        """Take the section at `position` out of the order: it is not in the stack that goes on to the alignment tool (Undo, or Reset order,
+        brings it back; its outline or frame is not touched)."""
+        if not 0 <= position < len(self.order):
+            return
+        if len(self.order) <= 1:
+            messagebox.showinfo("Delete section", "At least one section has to stay.", parent=self.root)
+            return
+        self.push_order_history()
+        self.order.pop(position)
+        self.grid.selected = None
+        self.draw_order()
+        self.var_status.set(f"Deleted section {position + 1}; the sections after it moved up. Undo brings it back.")
 
     def insert_placeholder(self, position):
         """A blank frame (NeuroInfo's "placeholder", which keeps the spacing even where a section is missing) before the section at
@@ -2522,6 +2583,7 @@ class SectionLoader:
         section = ns.placeholder_section(len(stack.sections), frame=frame)
         stack.sections.append(section)
         self.jpx_by_frame[frame] = section
+        self.push_order_history()
         self.order.insert(position, (0, frame))
         self.grid.selected = (0, frame)
         self.draw_order()
@@ -2555,6 +2617,7 @@ class SectionLoader:
                 "Any order made by dragging is lost.")
 
     def reset_order(self):
+        self.push_order_history()
         if self.project.is_jpx:
             if self.jpx_stack is not None:        # (placeholders inserted here are not in the JPX: they go)
                 self.jpx_stack.sections[:] = [s for s in self.jpx_stack.sections if not ns.is_new_placeholder(s)]

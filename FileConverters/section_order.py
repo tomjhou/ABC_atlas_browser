@@ -16,11 +16,13 @@ ACCENT = "#1f5fa8"
 
 
 class OrderGrid:
-    def __init__(self, parent, caption, on_double=None, enabled=None, after_draw=None, accent=ACCENT, on_context=None):
+    def __init__(self, parent, caption, on_double=None, enabled=None, after_draw=None, accent=ACCENT, on_context=None,
+                 before_change=None):
         """caption(key, position) -> (text at the left, text at the right) under a thumbnail; on_double(key, position) is called on a
         double-click; enabled() -> False stops it drawing (for a page that is not shown); after_draw() is called after each drawing."""
         self.caption, self.on_double, self.enabled, self.after_draw, self.accent = caption, on_double, enabled, after_draw, accent
         self.on_context = on_context     # on_context(key, position, event) on a right-click on a thumbnail (which is selected first)
+        self.before_change = before_change   # before_change(order before) just before dragging or Reverse changes the order (for an Undo)
         self.order = []                    # the keys, in order
         self.thumbs = {}                   # key -> PhotoImage
         self.selected = None               # the key of the thumbnail last clicked (drawn with a blue outline), or None
@@ -168,6 +170,8 @@ class OrderGrid:
     def release(self, e):
         d, self.drag = self.drag, None
         if d and d["moved"]:
+            if self.before_change:
+                self.before_change(list(self.order))
             item = self.order.pop(d["index"])
             slot = d["slot"] - (1 if d["slot"] > d["index"] else 0)
             self.order.insert(slot, item)
@@ -192,5 +196,7 @@ class OrderGrid:
     # ------------------------------------------------------------------ whole-order changes
 
     def reverse(self):
+        if self.before_change:
+            self.before_change(list(self.order))
         self.order.reverse()
         self.draw()

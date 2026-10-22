@@ -543,8 +543,13 @@ class Aligner:
     def build_right(self, right):
         # "Back" at the bottom right, above the status bar, where step 3's Back button is; the brightness buttons and sliders at the top
         # right, as in step 3. (Packed first at the bottom, so that the panels above fill from the top.)
+        # "Step 5: Export JPX" at the very right of that row, as step 3's Next button is: the bottom right button goes on.
         back_row = ttk.Frame(right)
         back_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+        self.export_button = ttk.Button(back_row, text="Step 5: Export JPX", command=self.export_dialog)
+        self.export_button.pack(side=tk.RIGHT, padx=(6, 0))
+        Tooltip(self.export_button, "Write the sections, as they are placed now, to a new JPX file (File > Export JPX, Ctrl+S). "
+                                    "The settings for it are in the Export settings box above.")
         self.back_button = ttk.Button(back_row, text="Back to step 3, order sections", command=self.go_back_to_ordering)
         self.back_button.pack(side=tk.RIGHT)
         self.back_button.state(["disabled"])   # (until a stack that came from the section loader is shown)
@@ -582,7 +587,13 @@ class Aligner:
         bf2 = ttk.Frame(f)
         bf2.grid(row=6, column=0, columnspan=4, pady=(4, 0))
         ttk.Button(bf2, text="Flip left-right (F)", command=self.flip).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bf2, text="Reset", command=self.reset_section).pack(side=tk.LEFT, padx=2)
+        reset_button = ttk.Button(bf2, text="Reset", command=self.reset_section)
+        reset_button.pack(side=tk.LEFT, padx=2)
+        Tooltip(reset_button, "Removes this section's rotation, shift and flip, so it goes back to its original alignment: the one NeuroInfo "
+                              "gave it (recovered from its case file and reconstruction .xml), or, for sections made from slide scans in "
+                              "steps 1-3, the unrotated placement at the middle of the canvas. If the file you opened was exported from here "
+                              "with edits, this goes back past them too. It does not change the outline (that has its own Undo). "
+                              "Undo brings the edits back.", wraplength=320)
         # (wrapped, so that a long note cannot widen the panel at the expense of the picture)
         self.label_detail = ttk.Label(f, text="", foreground="gray30", justify=tk.LEFT,
                                       wraplength=round(250 * self.root.winfo_fpixels("1i") / 96))
@@ -608,7 +619,7 @@ class Aligner:
         ttk.Checkbutton(f, text="Crosshair at the centre of the canvas", variable=self.var_crosshair,
                         command=self.redraw).pack(anchor="w")
 
-        f = self.export_frame = ttk.LabelFrame(right, text="Export", padding=6)
+        f = self.export_frame = ttk.LabelFrame(right, text="Export settings", padding=6)
         f.pack(fill=tk.X, pady=(0, 6))
         # (the quality choice is for advanced mode only; the default is the sensible one. Whether unchanged sections are rendered again
         # is in the File > Options menu)
@@ -625,8 +636,6 @@ class Aligner:
         ttk.Label(self.fit_row, text="%").pack(side=tk.LEFT)
         self.fit_row.grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
         self.fit_row.grid_remove()
-        ttk.Button(f, text="Export JPX...", command=self.export_dialog).grid(row=4, column=0, columnspan=2,
-                                                                              pady=(6, 0), sticky="ew")
 
         self.apply_advanced_mode()   # (all the widgets it shows or hides exist now)
 
@@ -3963,7 +3972,8 @@ class Aligner:
         self.project_obj = None                  # (the loader has written the project file since: it is read afresh when saving)
         keep = self.stack.sections[self.cur] if self.stack.sections else None
         named = {id(s) for s in sections}
-        self.stack.sections[:] = list(sections) + [s for s in self.stack.sections if id(s) not in named]
+        self.stack.deleted += sum(1 for s in self.stack.sections if id(s) not in named and not ns.is_new_placeholder(s))   # (deleted in step 3)
+        self.stack.sections[:] = list(sections)
         self.renumber()
         if spacing > 0:
             self.stack.z_spacing_um = spacing

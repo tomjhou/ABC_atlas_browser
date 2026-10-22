@@ -753,8 +753,9 @@ def apply_jpx_order(stack, frames):
         if f >= ns.PLACEHOLDER_FRAME_BASE and not any(s.frame == f for s in stack.sections):
             stack.sections.append(ns.placeholder_section(len(stack.sections), frame=f))
     by_frame = {s.frame: s for s in stack.sections}
-    stack.sections[:] = [by_frame[f] for f in frames if f in by_frame] + [
-        s for s in stack.sections if s.frame not in named and not ns.is_new_placeholder(s)]    # (a placeholder taken out of the order is gone)
+    # The frames named are the sections: one not named was deleted (in step 3), and a placeholder not named is gone.
+    stack.deleted += sum(1 for s in stack.sections if s.frame not in named and not ns.is_new_placeholder(s))
+    stack.sections[:] = [by_frame[f] for f in frames if f in by_frame]
     for i, s in enumerate(stack.sections):
         s.index = i
 
