@@ -31,6 +31,8 @@ automatically if missing).
 """
 
 import copy
+import faulthandler
+import gc
 import hashlib
 import json
 import math
@@ -293,9 +295,55 @@ def shade(color, weight):
     return "#%02x%02x%02x" % (round(r * weight), round(g * weight), round(b * weight))
 
 
+CRASH_LOG = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "JhouLab", "jpx_aligner_crash.log")
+_crash_file = None
+
+
+def install_crash_log():
+    """Keep a record of what goes wrong, in CRASH_LOG, for when the console window closes with the program: every uncaught error (in
+    any thread) with its traceback, and, if the process itself dies (a fault in the image decoders, say), the Python stack of every
+    thread at that moment (faulthandler). The file is added to, with the time of each start."""
+    global _crash_file
+    if _crash_file is not None:
+        return
+    try:
+        os.makedirs(os.path.dirname(CRASH_LOG), exist_ok=True)
+        if os.path.exists(CRASH_LOG) and os.path.getsize(CRASH_LOG) > 1_000_000:
+            os.replace(CRASH_LOG, CRASH_LOG + ".old")
+        _crash_file = open(CRASH_LOG, "a", buffering=1, encoding="utf-8")
+        _crash_file.write(f"\n===== started {time.strftime('%Y-%m-%d %H:%M:%S')} (pid {os.getpid()}) =====\n")
+        faulthandler.enable(file=_crash_file, all_threads=True)
+    except Exception:
+        return
+    import traceback
+    old_hook, old_thread_hook = sys.excepthook, threading.excepthook
+
+    def record(kind, exc_type, exc, tb):
+        try:
+            _crash_file.write(f"--- {time.strftime('%H:%M:%S')} uncaught error ({kind}) ---\n")
+            _crash_file.write("".join(traceback.format_exception(exc_type, exc, tb)))
+        except Exception:
+            pass
+
+    def hook(exc_type, exc, tb):
+        record("main thread", exc_type, exc, tb)
+        old_hook(exc_type, exc, tb)
+
+    def thread_hook(args):
+        record(f"thread {getattr(args.thread, 'name', '?')}", args.exc_type, args.exc_value, args.exc_traceback)
+        old_thread_hook(args)
+    sys.excepthook, threading.excepthook = hook, thread_hook
+
+
 class Aligner:
     def __init__(self, path=None):
+        install_crash_log()
         self.root = tk.Tk()
+        # Tk variables and images must be freed on the Tk thread: a worker thread that happens to trigger the cyclic garbage collector
+        # frees the leftovers of a closed window (its variables) there, which fails ("main thread is not in main loop"). So the
+        # collector is run from the poll below, on the Tk thread, and not by itself.
+        gc.disable()
+        self.gc_ticks = 0
         self.root.title("JPX aligner")
         self.root.geometry("1500x950")
         self.stack = None
@@ -1076,7 +1124,9 @@ class Aligner:
             czi_paths.remove(first_scan)
             czi_paths.insert(0, first_scan)      # (the overview of the current section's scan first: its section is shown before the rest)
         early = getattr(stack, "prelocate", None)         # (the loader may have made some of the pictures already: see start_prelocate)
+        marks = {}   # seconds after the start at which each phase of the loading was done, for the "Loaded ..." line
         thumbs_done = threading.Event()
+        thumb_ready = {path: threading.Event() for path in czi_paths}      # (each scan's overview picture is made, or could not be)
         if czi_paths:
             max_px = THUMB_MAX_PX   # (large; the picture is scaled to the left pane's width as it is drawn)
 
@@ -1102,10 +1152,15 @@ class Aligner:
                                 made = early["thumbs"].get(path) if early is not None else None
                                 img, geometry = made if made is not None else ns.czi_slide_thumbnail(path, max_px)
                             except Exception:
+                                thumb_ready[path].set()
                                 continue   # (the picture is only a convenience)
                             self.msgs.put(("thumb", (stack, path, img, geometry)))
+                            thumb_ready[path].set()
                 finally:
+                    for event in thumb_ready.values():
+                        event.set()
                     thumbs_done.set()
+                    marks[f"scan overviews ({len(czi_paths)}) all made after"] = time.time() - t_start
 
             threading.Thread(target=thumbs, daemon=True).start()
         else:
@@ -1193,7 +1248,6 @@ class Aligner:
 
         self.start_verify = start_verify
 
-        marks = {}   # seconds after the start at which each phase of the loading was done, for the "Loaded ..." line
 
         def work():
             ns.lower_thread_priority()   # (the window stays responsive while the images load)
@@ -1211,9 +1265,13 @@ class Aligner:
                     pass                      # (tried again, with its message, in the loop below)
             if early is None:
                 # (with the loader's thread making them, the sections do not wait for the overview pictures: only a convenience)
-                self.msgs.put(("status", "Preparing for load: reading the slide scans' overview pictures..."))
-                thumbs_done.wait(30)
-                marks[f"scan overviews ({len(czi_paths)})"] = time.time() - t_start
+                # (only the first section's scan is waited for; each other scan waits for its own overview before it is looked at, which is
+                # made by then or soon: they are made one after the other, and a scan's overview is read before the sections are, so that the
+                # locating of that scan does not keep the picture waiting)
+                self.msgs.put(("status", "Preparing for load: reading the slide scan's overview picture..."))
+                if first_scan in thumb_ready:
+                    thumb_ready[first_scan].wait(30)
+                    marks["the first scan's overview"] = time.time() - t_start
             frame_boxes = None
             pre = getattr(stack, "prelocate", None)
             if pre is not None:
@@ -1240,7 +1298,8 @@ class Aligner:
                 t_locate = time.time()
                 try:
                     problems = ns.calibrate_stack_czi(stack, progress=lambda i, n, text: self.msgs.put(("status", text)),
-                                                      on_located=located)
+                                                      on_located=located,
+                                                      before_scan=lambda path: thumb_ready[path].wait(30) if path in thumb_ready else None)
                 except BaseException as e:   # (a failed install of the reader library, for one)
                     problems = {"the .czi scans": str(e) or type(e).__name__}
                 locate_seconds[0] = time.time() - t_locate
@@ -1307,6 +1366,9 @@ class Aligner:
         threading.Thread(target=work, daemon=True).start()
 
     def poll(self):
+        self.gc_ticks += 1
+        if self.gc_ticks % 20 == 0:          # (every two seconds)
+            gc.collect()
         try:
             while True:
                 kind, payload = self.msgs.get_nowait()
@@ -2637,9 +2699,18 @@ class Aligner:
         if not st.changed:   # (also when "re-render unchanged sections too" would still write every image)
             same = ("every image would be re-rendered, but with the same placement as before" if rerender_all
                     else "the images would be copied unchanged")
-            if not messagebox.askyesno("Nothing changed",
-                                       "No section has been edited since this file was opened, so an export would be a copy "
-                                       f"of it ({same}).\n\nExport anyway?", parent=self.root):
+            from_neuroinfo = bool(getattr(st, "case_file", ""))
+            if from_neuroinfo:
+                # a stack made from NeuroInfo's own files: the export is worth making even so, which the question says
+                text = ("No section has been edited since this file was opened, but this stack was made from NeuroInfo's own files "
+                        f"({st.case_file} and the reconstruction .xml), so an export is still worthwhile: it writes the sections' "
+                        "alignment, and where each lies on its slide scan, into the new JPX. When that file is opened again the "
+                        "positions on the scans need no checking, and the NeuroInfo files are not needed.\n\n"
+                        f"({same[0].upper() + same[1:]}.)\n\nExport?")
+            else:
+                text = ("No section has been edited since this file was opened, so an export would be a copy "
+                        f"of it ({same}).\n\nExport anyway?")
+            if not messagebox.askyesno("Nothing edited" if from_neuroinfo else "Nothing changed", text, parent=self.root):
                 return
         bad = exp.out_of_canvas()
         if bad and not messagebox.askyesno(
@@ -2776,6 +2847,417 @@ class Aligner:
                          f"{-s.rotation_deg:+.2f}", "yes" if s.mirrored else "no", len(s.case_points)))
         return rows
 
+    def build_czi_tab(self, parent):
+        """The fourth tab of the analysis window: everything the slide scan (.czi) says about itself. A table gives each scene's stage
+        position and size (from the scan's metadata) beside its pixel box on the slide grid, with the tiles it was made of. Below it a
+        tree holds the rest, in six parts: the metadata XML; the file header; the scenes as the reader sees them (objective, channels,
+        pixel size, time); the directory of every stored tile (a tile opens to its own metadata, with its stage position); the attachments
+        (label, preview, thumbnail, time stamps, ...); and the layout of the file's segments. The tree can be searched. The scan is picked
+        at the top when the stack uses more than one."""
+        st = self.stack
+        tab = ttk.Frame(parent)
+        scans = sorted({s.source_path for s in st.sections if s.source_path and s.source_path.lower().endswith(".czi")})
+        if not scans:
+            ttk.Label(tab, padding=20, justify=tk.LEFT, text="None of this stack's sections come from a slide scan (.czi).").pack(anchor="w")
+            return tab
+        scale = self.root.winfo_fpixels("1i") / 96
+        top = ttk.Frame(tab, padding=(6, 6, 6, 0))
+        top.pack(fill=tk.X)
+        ttk.Label(top, text="Scan:").pack(side=tk.LEFT)
+        pick = tk.StringVar(tab, scans[0])
+        combo = ttk.Combobox(top, textvariable=pick, values=scans, state="readonly", width=70)
+        combo.pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
+        info = ttk.Label(top, foreground="gray30")
+        info.pack(side=tk.LEFT, padx=6)
+        paned = ttk.PanedWindow(tab, orient=tk.VERTICAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        ttk.Style(tab).configure("Czi.Treeview", rowheight=round(22 * scale))
+
+        def scrolled(parent_, tv):
+            ys = ttk.Scrollbar(parent_, orient=tk.VERTICAL, command=tv.yview)
+            xs = ttk.Scrollbar(parent_, orient=tk.HORIZONTAL, command=tv.xview)
+            tv.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+            parent_.rowconfigure(0, weight=1)
+            parent_.columnconfigure(0, weight=1)
+            tv.grid(row=0, column=0, sticky="nsew")
+            ys.grid(row=0, column=1, sticky="ns")
+            xs.grid(row=1, column=0, sticky="ew")
+
+        scene_cols = [("Scene", 55, "e"), ("Name", 100, "w"), ("Stage centre X (um)", 135, "e"), ("Stage centre Y (um)", 135, "e"),
+                      ("Stage width (um)", 115, "e"), ("Stage height (um)", 115, "e"), ("Pixel box X0", 95, "e"), ("Pixel box Y0", 95, "e"),
+                      ("Pixel width", 85, "e"), ("Pixel height", 85, "e"), ("Tile columns", 90, "e"), ("Tile rows", 80, "e"), ("Tiles", 60, "e"),
+                      ("Focus Z (um)", 100, "e"), ("Scan mode", 85, "w"), ("Region outline points", 140, "e"), ("Pyramid levels", 95, "e"),
+                      ("Sections here", 95, "e")]
+        scene_frame = ttk.Frame(paned)
+        scene_tv = ttk.Treeview(scene_frame, columns=[c[0] for c in scene_cols], show="headings", selectmode="browse", style="Czi.Treeview")
+        for name, w, anchor in scene_cols:
+            scene_tv.heading(name, text=name)
+            scene_tv.column(name, width=round(w * scale), anchor=anchor, stretch=False)
+        scrolled(scene_frame, scene_tv)
+        paned.add(scene_frame, weight=1)
+        lower = ttk.Frame(paned)
+        paned.add(lower, weight=3)
+        bar = ttk.Frame(lower)
+        bar.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(bar, text="Search the tree:").pack(side=tk.LEFT)
+        query = tk.StringVar(tab)
+        entry = ttk.Entry(bar, textvariable=query, width=30)
+        entry.pack(side=tk.LEFT, padx=6)
+        hits = ttk.Label(bar, foreground="gray30")
+        tree_frame = ttk.Frame(lower)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+        tree = ttk.Treeview(tree_frame, columns=("value",), selectmode="browse", style="Czi.Treeview")
+        tree.heading("#0", text="Name")
+        tree.heading("value", text="Value")
+        tree.column("#0", width=round(380 * scale), stretch=False)
+        tree.column("value", width=round(600 * scale), stretch=True)
+        scrolled(tree_frame, tree)
+        PLACEHOLDER = "…"
+        # Every node of the tree is made when its parent is opened: a node is (name, value text, producer of its children or None,
+        # searchable?). A producer returns the list of such tuples, so that nothing of a big scan is read before it is looked at.
+        state = {"token": 0, "prod": {}, "full": {}, "skip": set(), "found": [], "at": 0, "text": ""}
+
+        def one_line(v, limit=400):
+            text = str(v).replace("\r", " ").replace("\n", " ")
+            return text if len(text) <= limit else text[:limit] + "..."
+
+        def show_value(v):
+            """A value as text: arrays summarised, bytes by their length, everything else as it prints."""
+            if isinstance(v, bytes):
+                return f"{len(v):,} bytes"
+            if isinstance(v, np.ndarray):
+                return (f"array {v.shape} {v.dtype}" if v.size > 12 else str(v.tolist()))
+            return str(v)
+
+        def py_kids(obj):
+            """The children of a dict, list or tuple (values that are themselves containers open further)."""
+            items = list(obj.items()) if isinstance(obj, dict) else list(enumerate(obj))
+            kids = []
+            for k, v in items:
+                if isinstance(v, (dict, list, tuple)) and len(v) and not (isinstance(v, tuple) and len(v) <= 6 and not any(
+                        isinstance(x, (dict, list, tuple)) for x in v)):
+                    kids.append((str(k), f"{len(v)} items", (lambda v=v: py_kids(v)), True))
+                else:
+                    kids.append((str(k), show_value(v), None, True))
+            return kids
+
+        def describe(el):
+            attrs = " ".join(f"{k}={v}" for k, v in el.attrib.items())
+            text = (el.text or "").strip()
+            return attrs + ("   " if attrs and text else "") + text
+
+        def xml_kids(el):
+            return [(child.tag, describe(child), (lambda child=child: xml_kids(child)) if len(child) else None, True) for child in el]
+
+        def attr(obj, name, default="-"):
+            try:
+                v = getattr(obj, name)
+                return v() if callable(v) else v
+            except Exception:
+                return default
+
+        def lock(path):
+            return ns._czi_lock_for(path)
+
+        def tile_xml(path, entry_):
+            """What a tile's own metadata block says (its stage position, focus, time, exposure), as a tree."""
+            import xml.etree.ElementTree as ET
+            with lock(path):
+                seg = entry_.read_segment_data(ns.czi_file(path))
+                text = seg.metadata()
+            if not text:
+                return [("(this tile has no metadata block)", "", None, True)]
+            root = ET.fromstring(text.encode("utf-8") if isinstance(text, str) else text)
+            kids = []
+            sx, sy, fz = (root.findtext(".//" + n) for n in ("StageXPosition", "StageYPosition", "FocusPosition"))
+            try:
+                kids.append(("Stage position X, Y and focus Z (um)", f"{float(sx):,.3f}, {float(sy):,.3f}, {float(fz):,.3f}", None, True))
+            except (TypeError, ValueError):
+                pass
+            return kids + [("XML", f"{len(text):,} characters", (lambda: xml_kids(root)), True)]
+
+        def entry_kids(path, e):
+            dims = tuple(attr(e, "dims", ()))
+            start = dict(zip(dims, attr(e, "start", ())))
+            props = {"scene": attr(e, "scene_index"), "start (the tile's corner in the slide grid, px)": start,
+                     "shape (px)": dict(zip(dims, attr(e, "shape", ()))), "stored shape (px)": dict(zip(dims, attr(e, "stored_shape", ()))),
+                     "scale (down-sampling of a pyramid tile)": dict(zip(dims, attr(e, "scale", ()))), "compression": attr(e, "compression"),
+                     "pixel type": attr(e, "pixel_type"), "pyramid type": attr(e, "pyramid_type"), "mosaic index": attr(e, "mosaic_index"),
+                     "position of the tile's data in the file (bytes)": attr(e, "file_position")}
+            return py_kids(props) + [("Tile metadata (the tile's own XML block)", "read when opened", (lambda: tile_xml(path, e)), True)]
+
+        def directory_kids(path):
+            """The tiles of the scan, by scene and by resolution (full size first, then each pyramid step)."""
+            with lock(path):
+                entries = list(ns.czi_file(path).subblock_directory)
+            groups = {}
+            for e in entries:
+                sc = attr(e, "scene_index", 0)
+                sc = 0 if sc in ("-", None) else int(sc)
+                scl = attr(e, "scale", (1, 1, 1, 1))
+                groups.setdefault(sc, {}).setdefault(int(max(scl[1:3])) if len(scl) >= 3 else 1, []).append(e)
+
+            def scene_node(sc):
+                levels = groups[sc]
+
+                def level_node(f):
+                    tiles = levels[f]
+                    xi = lambda e: (attr(e, "dims", ()).index("X") if "X" in attr(e, "dims", ()) else 0)
+
+                    def tile_kids():
+                        out = []
+                        for n, e in enumerate(sorted(tiles, key=lambda e: (attr(e, "start", (0, 0, 0, 0))[attr(e, "dims", ()).index("Y")],
+                                                                          attr(e, "start", (0, 0, 0, 0))[xi(e)]))):
+                            dims = tuple(attr(e, "dims", ()))
+                            s_ = dict(zip(dims, attr(e, "start", ())))
+                            label = f"tile {n}: X={s_.get('X', '-')}, Y={s_.get('Y', '-')}" + (f", channel {s_['C']}" if "C" in s_ else "")
+                            out.append((label, f"{attr(e, 'compression')}, {attr(e, 'shape')}", (lambda e=e: entry_kids(path, e)), False))
+                        return out
+                    return (("full resolution" if f == 1 else f"pyramid, 1/{f} resolution"), f"{len(tiles)} stored tiles", tile_kids, False)
+                return (f"scene {sc}", f"{sum(len(v) for v in levels.values())} entries",
+                        (lambda: [level_node(f) for f in sorted(levels)]), False)
+            return [scene_node(sc) for sc in sorted(groups)]
+
+        def scenes_kids(path):
+            with lock(path):
+                cz = ns.czi_file(path)
+                out = []
+                for i in range(len(cz.scenes)):
+                    sc = cz.scenes[i]
+                    d = {k: attr(sc, k) for k in ("name", "bbox", "sizes", "subblock_sizes", "mpp", "datetime", "objective", "channels",
+                                                  "coord_offsets", "coord_scales", "coord_units", "compression", "scene_indices", "dims")}
+                    d["pyramid levels"] = [str(x) for x in attr(sc, "levels", [])]
+                    d = {k: (str(v) if k in ("datetime", "compression") else v) for k, v in d.items()}
+                    out.append((f"scene {i}", str(d.get("name", "")), (lambda d=d: py_kids(d)), True))
+                return out
+
+        def attachments_kids(path):
+            with lock(path):
+                atts = list(ns.czi_file(path).attachments())
+            out = []
+            for a in atts:
+                en = attr(a, "attachment_entry", None) or attr(a, "directory_entry", None)
+                name = str(attr(en, "name", "attachment"))
+
+                def kids(a=a, en=en):
+                    d = {"content type": attr(en, "content_file_type"), "content guid": attr(en, "content_guid"),
+                         "size (bytes)": attr(a, "data_size"), "position in the file (bytes)": attr(en, "file_position")}
+                    out_ = py_kids(d)
+                    if isinstance(attr(a, "data_size", 0), int) and a.data_size <= 65536:
+                        try:
+                            with lock(path):
+                                data = a.data()
+                            out_.append(("content", show_value(data), (lambda: py_kids(list(data))) if isinstance(data, (tuple, list)) and len(data) else None, True))
+                        except Exception as e:
+                            out_.append(("content", f"could not be read: {e}", None, True))
+                    return out_
+                out.append((name, f"{attr(en, 'content_file_type')}, {attr(a, 'data_size', 0):,} bytes", kids, True))
+            return out
+
+        def segments_kids(path):
+            with lock(path):
+                segs = list(ns.czi_file(path).segments())
+            return [(f"{i}", one_line(str(s).split("\n")[0], 160), None, False) for i, s in enumerate(segs)]
+
+        def header_kids(path):
+            with lock(path):
+                h = ns.czi_file(path).header
+            names = ("version", "primary_file_guid", "file_guid", "file_part", "metadata_position", "directory_position",
+                     "attachment_directory_position", "update_pending")
+            return py_kids({n: attr(h, n) for n in names})
+
+        def roots(path, xml, root):
+            return [("Metadata XML (what the acquisition software wrote)", f"{len(xml) / 1e6:.2f} MB", (lambda: xml_kids(root)), True),
+                    ("File header", "", (lambda: header_kids(path)), True),
+                    ("Scenes as the reader sees them", "objective, channels, pixel size, time", (lambda: scenes_kids(path)), True),
+                    ("Tile directory (every stored tile)", "open a tile for its own metadata and stage position",
+                     (lambda: directory_kids(path)), False),
+                    ("Attachments", "label, preview, thumbnail, time stamps, ...", (lambda: attachments_kids(path)), True),
+                    ("File layout (segments in order)", "", (lambda: segments_kids(path)), False)]
+
+        def insert(parent_iid, kids):
+            for i, (label, value, prod, searchable) in enumerate(kids):
+                iid = f"{parent_iid}/{i}" if parent_iid else str(i)
+                state["full"][iid] = str(value)
+                if not searchable:
+                    state["skip"].add(iid)
+                tree.insert(parent_iid, tk.END, iid=iid, text=label, values=(one_line(value),))
+                if prod is not None:
+                    state["prod"][iid] = prod
+                    tree.insert(iid, tk.END, text=PLACEHOLDER)
+
+        def fill(item):
+            kids = tree.get_children(item)
+            if not (len(kids) == 1 and tree.item(kids[0], "text") == PLACEHOLDER):
+                return
+            tree.delete(kids[0])
+            try:
+                made = state["prod"][item]()
+            except Exception as e:
+                made = [(f"could not be read: {type(e).__name__}: {e}", "", None, True)]
+            insert(item, made)
+
+        tree.bind("<<TreeviewOpen>>", lambda e: fill(tree.focus()))
+
+        def open_to(iid):
+            parts = iid.split("/")
+            for n in range(1, len(parts)):
+                parent_iid = "/".join(parts[:n])
+                fill(parent_iid)
+                tree.item(parent_iid, open=True)
+            tree.selection_set(iid)
+            tree.see(iid)
+
+        def search(_e=None, again=False):
+            text = query.get().strip().lower()
+            if not text or not state.get("roots"):
+                hits.config(text="")
+                return
+            if not again or not state["found"] or state["text"] != text:
+                found = []
+
+                def walk(prefix, kids):
+                    for i, (label, value, prod, searchable) in enumerate(kids):
+                        iid = f"{prefix}/{i}" if prefix else str(i)
+                        if text in label.lower() or text in str(value).lower():
+                            found.append(iid)
+                        if prod is not None and searchable:
+                            try:
+                                walk(iid, prod())
+                            except Exception:
+                                pass
+                info.config(text="searching...")
+                tab.update_idletasks()
+                walk("", state["roots"])
+                state["found"], state["at"], state["text"] = found, -1, text
+                info.config(text=state["summary"])
+            found = state["found"]
+            if not found:
+                hits.config(text="no match (the tile directory and the file layout are not searched: open them to look)")
+                return
+            state["at"] = (state["at"] + 1) % len(found)
+            hits.config(text=f"match {state['at'] + 1} of {len(found)} (Enter for the next)   (the tile directory and the file layout are not searched)")
+            open_to(found[state["at"]])
+
+        entry.bind("<Return>", lambda e: search(again=True))
+        ttk.Button(bar, text="Find", command=lambda: search(again=True)).pack(side=tk.LEFT)
+        hits.pack(side=tk.LEFT, padx=8)
+        MAX_OPEN = 20000
+
+        def expand_all():
+            """Open the selected item and everything under it (the whole tree when nothing is selected, except the tile directory and
+            the file layout, which hold thousands of entries: select one of those to open it all). Stops after MAX_OPEN items."""
+            sel = tree.selection()
+            starts = list(sel) if sel else list(tree.get_children(""))
+            count = [0]
+            info.config(text="opening...")
+            tab.update_idletasks()
+
+            def go(item, explicit):
+                if count[0] >= MAX_OPEN or tree.get_children(item) == ():
+                    return
+                if not explicit and item in state["skip"]:
+                    return
+                fill(item)
+                tree.item(item, open=True)
+                for child in tree.get_children(item):
+                    count[0] += 1
+                    go(child, explicit)
+            for item in starts:
+                go(item, bool(sel))
+            info.config(text=state["summary"] + (f" | stopped after opening {MAX_OPEN:,} items" if count[0] >= MAX_OPEN else ""))
+            if sel:
+                tree.see(sel[0])
+
+        def collapse_all():
+            for item in tree.get_children(""):
+                tree.item(item, open=False)
+
+        ttk.Button(bar, text="Expand all", command=expand_all).pack(side=tk.LEFT, padx=(16, 0))
+        ttk.Button(bar, text="Collapse all", command=collapse_all).pack(side=tk.LEFT, padx=6)
+        ttk.Button(bar, text="Copy value", command=lambda: (tree.selection() and (tab.clipboard_clear(), tab.clipboard_append(
+            state["full"].get(tree.selection()[0], ""))))).pack(side=tk.RIGHT)
+
+        def load(path):
+            state["token"] += 1
+            token = state["token"]
+            info.config(text="reading the scan's metadata...")
+            scene_tv.delete(*scene_tv.get_children())
+            tree.delete(*tree.get_children())
+            state.update(prod={}, full={}, skip=set(), found=[], roots=[])
+
+            def work():
+                try:
+                    import xml.etree.ElementTree as ET
+                    xml = ns.czi_metadata_xml(path)
+                    root = ET.fromstring(xml.encode("utf-8"))
+                    boxes, stage = ns.czi_scenes(path), ns.czi_scene_stage(path)
+                    levels = [ns.czi_levels(path, i) for i in range(len(boxes))]
+                    here = {}
+                    for s in st.sections:
+                        if s.source_path == path and s.czi_origin is not None:
+                            try:
+                                j = ns.czi_scene_of(s, st)
+                                here[j] = here.get(j, 0) + 1
+                            except Exception:
+                                pass
+                    result = (xml, root, boxes, stage, levels, here, None)
+                except Exception as e:
+                    result = (None, None, [], [], [], {}, f"{type(e).__name__}: {e}")
+                done.append(result)
+
+            def poll():
+                if token != state["token"]:
+                    return
+                if done:
+                    show(token, path, done[0])
+                else:
+                    tab.after(100, poll)       # (Tk is only touched from its own thread: the reading hands its result over in `done`)
+
+            done = []
+            threading.Thread(target=work, daemon=True).start()
+            poll()
+
+        def show(token, path, result):
+            if token != state["token"]:
+                return
+            xml, root, boxes, stage, levels, here, error = result
+            if error:
+                info.config(text="could not read it: " + error)
+                return
+            state["summary"] = f"{len(boxes)} scenes | {len(xml) / 1e6:.2f} MB of metadata | {os.path.getsize(path) / 1e9:.2f} GB file"
+            info.config(text=state["summary"])
+            # the rest of what the metadata says of each scene: its name and scan mode (<Scene>), and from its <TileRegion> (the same id)
+            # the number of tiles across and down, the focus height and the traced outline of the region
+            regions = {r.get("Id"): r for r in root.iter("TileRegion")}
+            scene_info = {}
+            for el in root.iter("Scene"):
+                try:
+                    reg = regions.get((el.findtext("RegionId") or "").strip())
+                    cols, rows = (reg.findtext("Columns") or "").strip(), (reg.findtext("Rows") or "").strip()
+                    pts = (reg.findtext("Contour/Points") or "").split()
+                    z = (reg.findtext("Z") or "").strip()
+                    scene_info[int(el.get("Index"))] = (
+                        el.get("Name") or "", cols or "-", rows or "-", str(int(cols) * int(rows)) if cols and rows else "-",
+                        f"{float(z):,.1f}" if z else "-", (el.findtext("ScanMode") or "-").strip(), str(len(pts)) if pts else "-")
+                except Exception:
+                    pass
+            for i, (x0, y0, w, h) in enumerate(boxes):
+                sx = stage[i] if i < len(stage) and len(stage) == len(boxes) else None
+                sv = [f"{v:,.1f}" for v in sx] if sx else ["-"] * 4
+                name, tc, tr, tn, z, mode, npts = scene_info.get(i, ("",) + ("-",) * 6)
+                scene_tv.insert("", tk.END, values=(i, name, *sv, f"{x0:,}", f"{y0:,}", f"{w:,}", f"{h:,}", tc, tr, tn, z, mode, npts,
+                                                    levels[i], here.get(i, 0)))
+            state["roots"] = roots(path, xml, root)
+            insert("", state["roots"])
+
+        combo.bind("<<ComboboxSelected>>", lambda e: load(pick.get()))
+        tab.bind("<Map>", lambda e: (load(pick.get()), tab.unbind("<Map>")), add="+")   # (read when the tab is first shown)
+        tab.czi_scene_tree = scene_tv     # (for tests)
+        tab.czi_tree = tree
+        tab.czi_fill = fill
+        return tab
+
     def build_h5_tab(self, parent):
         """The third tab of the analysis window: the case file's (.h5) contents as a tree. Groups open and close; the details of what is
         selected (its attributes, and a dataset's shape, type and values) are shown beside it. Children are read when a group is opened,
@@ -2809,8 +3291,8 @@ class Aligner:
         tree = ttk.Treeview(left, columns=("what",), selectmode="browse", style="H5.Treeview")
         tree.heading("#0", text="Name")
         tree.heading("what", text="What")
-        tree.column("#0", width=round(330 * scale), stretch=True)
-        tree.column("what", width=round(420 * scale), stretch=False)
+        tree.column("#0", width=round(330 * scale), stretch=False)
+        tree.column("what", width=round(420 * scale), stretch=True)
         ys = ttk.Scrollbar(left, orient=tk.VERTICAL, command=tree.yview)
         xs = ttk.Scrollbar(left, orient=tk.HORIZONTAL, command=tree.xview)
         tree.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
@@ -3048,7 +3530,7 @@ class Aligner:
         ttk.Checkbutton(row3, text="Scenes of the scan (numbered rectangles; one slide at a time)",
                         variable=scene_on).pack(side=tk.LEFT)
         stage_on = tk.BooleanVar(tab, False)
-        ttk.Checkbutton(row3, text="Scenes at their stage positions (dashed rectangles, from the scan's metadata)",
+        ttk.Checkbutton(row3, text="Contour bounding boxes (dashed rectangles, stage um)",
                         variable=stage_on).pack(side=tk.LEFT, padx=16)
         row4 = ttk.Frame(right)
         row4.pack(fill=tk.X)
@@ -3058,6 +3540,14 @@ class Aligner:
         arrow_on = tk.BooleanVar(tab, True)
         ttk.Checkbutton(row4, text="Arrows: move to the previous section",
                         variable=arrow_on).pack(side=tk.LEFT, padx=16)
+        row5 = ttk.Frame(right)
+        row5.pack(fill=tk.X)
+        tiles_on = tk.BooleanVar(tab, False)
+        ttk.Checkbutton(row5, text="Tiles of the scan (thin dotted rectangles, one for each place imaged; one slide at a time)",
+                        variable=tiles_on).pack(side=tk.LEFT)
+        contour_on = tk.BooleanVar(tab, False)
+        ttk.Checkbutton(row5, text="Contour points (traced scan regions, stage um)",
+                        variable=contour_on).pack(side=tk.LEFT, padx=16)
         canvas = tk.Canvas(right, bg="white", highlightthickness=1, highlightbackground="gray70")
         canvas.pack(fill=tk.BOTH, expand=True, pady=4)
         readout = tk.StringVar(tab, "")
@@ -3135,8 +3625,11 @@ class Aligner:
                 return
             # the scenes of the scan (a slide is chosen): rectangles in the slide's own grid, in the color of the section they hold
             scene_rects = []     # (scene number from 1, (x0, y0, x1, y1) in um, color, by stage position?)
+            tile_rects = []      # (scene number from 1, (x0, y0, x1, y1) in um, color)
+            contours = []        # (scene number from 1, points in um, color)
+            state["tiles"] = tile_rects
             sel = lb.curselection()
-            if (scene_on.get() or stage_on.get()) and sel and sel[0] > 0:
+            if (scene_on.get() or stage_on.get() or tiles_on.get() or contour_on.get()) and sel and sel[0] > 0:
                 try:
                     path = secs[0].source_path
                     if path.lower().endswith(".czi"):
@@ -3149,6 +3642,12 @@ class Aligner:
                         if scene_on.get():
                             for j, (bx, by, bw, bh) in enumerate(ns.czi_scenes(path)):
                                 scene_rects.append((j + 1, (bx * pxs, by * pxs, (bx + bw) * pxs, (by + bh) * pxs), colors(j), False))
+                        if tiles_on.get():
+                            for j, tx, ty, tw, th in ns.czi_tiles(path):
+                                tile_rects.append((j + 1, (tx * pxs, ty * pxs, (tx + tw) * pxs, (ty + th) * pxs), colors(j)))
+                        if contour_on.get():
+                            for j, pts in sorted(ns.czi_region_contours(path).items()):
+                                contours.append((j + 1, pts, colors(j)))
                         if stage_on.get():
                             for j, (cx_, cy_, sw, sh) in enumerate(ns.czi_scene_stage(path)):
                                 scene_rects.append((j + 1, (cx_ - sw / 2, cy_ - sh / 2, cx_ + sw / 2, cy_ + sh / 2), colors(j), True))
@@ -3187,12 +3686,44 @@ class Aligner:
                     canvas.create_text(ml - 6, b_, anchor="e", text=f"{gy:g}", fill="gray30", font=("Segoe UI", 8))
             canvas.create_text(w - mr, h - 8, anchor="e", text="X (um)", fill="gray30", font=("Segoe UI", 8))
             canvas.create_text(ml - 6, 8, anchor="ne", text="Y (um)", fill="gray30", font=("Segoe UI", 8))
+            for _num, pts, color in contours:
+                xy = np.array([to_canvas(*p) for p in pts])
+                canvas.create_line(*xy.ravel(), *xy[0], fill=color, width=1)
+                gaps = np.hypot(*np.diff(xy, axis=0).T)
+                if len(gaps) and float(np.median(gaps)) >= 6:      # (zoomed in far enough that the points can be told apart)
+                    for a_, b_ in xy:
+                        canvas.create_oval(a_ - 2, b_ - 2, a_ + 2, b_ + 2, outline=color, fill=color)
+            if tile_rects:
+                # A translucent fill (a canvas has no transparency, so it is one picture laid under the outlines): each tile adds TILE_ALPHA
+                # of its scene's color, so that where tiles overlap the color is deeper (n tiles on a place: 1 - (1 - alpha)^n)
+                TILE_ALPHA = 0.5
+                cw, ch = canvas.winfo_width(), canvas.winfo_height()
+                if cw > 1 and ch > 1:
+                    canvas_rgb = np.full((ch, cw, 3), 255.0)
+                    counts = {}
+                    for num, (a0, b0, a1, b1), color in tile_rects:
+                        p0, p1 = to_canvas(a0, b0), to_canvas(a1, b1)
+                        xa, xb = sorted((int(round(p0[0])), int(round(p1[0]))))
+                        ya, yb = sorted((int(round(p0[1])), int(round(p1[1]))))
+                        xa, xb, ya, yb = max(xa, 0), min(xb, cw), max(ya, 0), min(yb, ch)
+                        if xb > xa and yb > ya:
+                            counts.setdefault((num, color), np.zeros((ch, cw), np.uint8))[ya:yb, xa:xb] += 1
+                    for (num, color), n in sorted(counts.items(), key=lambda kv: kv[0][0]):
+                        a = (1 - (1 - TILE_ALPHA) ** n.astype(np.float32))[..., None]
+                        rgb = np.array([v // 257 for v in canvas.winfo_rgb(color)], np.float32)
+                        canvas_rgb = canvas_rgb * (1 - a) + rgb * a
+                    state["tile_fill"] = ImageTk.PhotoImage(Image.fromarray(canvas_rgb.astype(np.uint8)), master=canvas)
+                    canvas.create_image(0, 0, anchor="nw", image=state["tile_fill"])
+                    canvas.tag_lower(canvas.find_all()[-1])
+            for _num, (a0, b0, a1, b1), color in tile_rects:
+                p0, p1 = to_canvas(a0, b0), to_canvas(a1, b1)
+                canvas.create_rectangle(p0[0], p0[1], p1[0], p1[1], outline=color, width=1, dash=(1, 3))
             for num, (a0, b0, a1, b1), color, by_stage in scene_rects:
                 p0, p1 = to_canvas(a0, b0), to_canvas(a1, b1)
                 lx, rx_, ty, by_ = min(p0[0], p1[0]), max(p0[0], p1[0]), min(p0[1], p1[1]), max(p0[1], p1[1])
                 if by_stage:     # (dashed, labelled at the bottom right, so that it does not run into the pixel box's label)
                     canvas.create_rectangle(p0[0], p0[1], p1[0], p1[1], outline=color, width=1, dash=(5, 3))
-                    canvas.create_text(rx_ - 5, by_ - 3, anchor="se", text=f"scene {num} (stage)", fill=color, font=("Segoe UI", 9, "italic"))
+                    canvas.create_text(rx_ - 5, by_ - 3, anchor="se", text=f"scene {num} contour box", fill=color, font=("Segoe UI", 9, "italic"))
                 else:
                     canvas.create_rectangle(p0[0], p0[1], p1[0], p1[1], outline=color, width=1)
                     canvas.create_text(lx + 5, ty + 3, anchor="nw", text=f"scene {num}", fill=color, font=("Segoe UI", 9, "italic"))
@@ -3235,7 +3766,10 @@ class Aligner:
                         if d is not None:
                             hit += f"   | onto section {s.index}: dX = {d[0]:+.1f}, dY = {d[1]:+.1f} um (length {np.hypot(*d):.1f} um)"
                     break
-            readout.set(f"X = {x:.1f} um, Y = {y:.1f} um{hit}")
+            pxs = st.source_pixel_um or st.pixel_um
+            tile = next((f"   | tile of scene {n} (corner {a / pxs:.0f}, {b / pxs:.0f} px)" for n, (a, b, c_, d_), _c in state.get("tiles", ())
+                         if a <= x < c_ and b <= y < d_), "")
+            readout.set(f"X = {x:.1f} um, Y = {y:.1f} um   |   X = {x / pxs:.1f} px, Y = {y / pxs:.1f} px ({pxs:g} um/px){tile}{hit}")
 
         def zoom(event):
             v = state["view"]
@@ -3270,7 +3804,7 @@ class Aligner:
         canvas.bind("<ButtonPress-1>", press)
         canvas.bind("<B1-Motion>", move)
         canvas.bind("<Double-Button-1>", lambda e: (state.update(zoom=None), redraw()))
-        for var in (y_down, raw_on, rec_on, scene_on, stage_on, xml_on, arrow_on):
+        for var in (y_down, raw_on, rec_on, scene_on, stage_on, xml_on, arrow_on, tiles_on, contour_on):
             var.trace_add("write", lambda *_: redraw())
         lb.selection_set(1 if len(names) > 1 else 0)
         tab.redraw = redraw
@@ -3301,6 +3835,7 @@ class Aligner:
         notebook.add(tab1, text="Sections")
         notebook.add(self.build_outline_tab(notebook), text="Outlines by slide (raw coordinates)")
         notebook.add(self.build_h5_tab(notebook), text="Case file (.h5) browser")
+        notebook.add(self.build_czi_tab(notebook), text="Slide scan (.czi) metadata")
         ttk.Label(tab1, text=summary, padding=(8, 6)).pack(anchor="w")
         frame = ttk.Frame(tab1)
         frame.pack(fill=tk.BOTH, expand=True, padx=8)

@@ -969,6 +969,69 @@ def czi_scene_stage(path):
     return found
 
 
+_czi_tile_lists = {}
+
+
+def czi_tiles(path):
+    """The full-resolution tiles of a scan, in its pixel grid: [(scene, x, y, width, height), ...], each place once (the channels
+    of a tile share it). From the file's directory of tiles, so quick."""
+    key = os.path.normcase(os.path.abspath(path))
+    found = _czi_tile_lists.get(key)
+    if found is None:
+        with _czi_lock_for(path):
+            entries = list(czi_file(path).subblock_directory)
+        seen = set()
+        for e in entries:
+            dims = tuple(e.dims)
+            if "X" not in dims or "Y" not in dims or max(e.scale[dims.index("X")], e.scale[dims.index("Y")]) != 1:
+                continue
+            xi, yi = dims.index("X"), dims.index("Y")
+            seen.add((int(e.scene_index or 0), int(e.start[xi]), int(e.start[yi]), int(e.shape[xi]), int(e.shape[yi])))
+        found = _czi_tile_lists[key] = sorted(seen)
+    return found
+
+
+_czi_region_contours = {}
+
+
+def czi_region_contours(path):
+    """The traced contour of each scan region, in the stage's um: {scene index: array of (x, y) points}. From the <Contour> of the
+    <TileRegion> that the scene's <Scene> names (its RegionId). {} if the file has none."""
+    key = os.path.normcase(os.path.abspath(path))
+    found = _czi_region_contours.get(key)
+    if found is None:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(czi_metadata_xml(path).encode("utf-8"))
+        regions = {r.get("Id"): r for r in root.iter("TileRegion")}
+        found = {}
+        for el in root.iter("Scene"):
+            reg = regions.get((el.findtext("RegionId") or "").strip())
+            text = (reg.findtext("Contour/Points") or "") if reg is not None else ""
+            try:
+                pts = np.array([[float(v) for v in p.split(",")] for p in text.split()], float)
+            except ValueError:
+                continue
+            if len(pts):
+                found[int(el.get("Index"))] = pts
+        _czi_region_contours[key] = found
+    return found
+
+
+def czi_metadata_xml(path):
+    """The scan's whole metadata (the XML text stored in the .czi)."""
+    with _czi_lock_for(path):
+        cz = czi_file(path)
+        md = cz.metadata() if callable(getattr(cz, "metadata", None)) else cz.metadata
+    return md if isinstance(md, str) else str(md)
+
+
+def czi_scene_level_shape(path, scene, level):
+    """(height, width) of a scene's pyramid level, in its pixels."""
+    with _czi_lock_for(path):
+        lv = czi_file(path).scenes[scene].levels[level]
+        return int(lv.shape[-2]), int(lv.shape[-1])
+
+
 def czi_levels(path, scene=0):
     with _czi_lock_for(path):
         return len(czi_file(path).scenes[scene].levels)
@@ -997,6 +1060,141 @@ def czi_read_region(path, scene, x, y, w, h):
     if arr.ndim == 2:
         arr = arr[None]
     return np.moveaxis(arr, 0, -1)
+
+
+def czi_read_level_window(path, scene, level, x, y, w, h):
+    """The window (x, y, w, h) of a scene's pyramid `level`, in that level's pixels counted from the corner of the array czi_read gives
+    (zeros where the window reaches past the scene), as H x W x C: what czi_read(...)[y:y + h, x:x + w] would hold, but only the tiles
+    under the window are read."""
+    yield_to_foreground()
+    S = 2 ** level
+    with _czi_lock_for(path):
+        lv = czi_file(path).scenes[scene].levels[level]
+        bx, by = lv.bbox[0], lv.bbox[1]      # (where the level's array starts, in this level's pixels of the slide's grid)
+        lh, lw = lv.shape[-2], lv.shape[-1]
+        x0, y0, x1, y1 = max(int(x), 0), max(int(y), 0), min(int(x) + int(w), lw), min(int(y) + int(h), lh)
+        out = np.zeros((int(h), int(w), lv.shape[0] if len(lv.shape) == 3 else 1), lv.dtype)
+        if x1 > x0 and y1 > y0:
+            try:
+                arr = lv(roi=(S * (bx + x0), S * (by + y0), S * (x1 - x0), S * (y1 - y0))).asarray(maxworkers=CZI_WORKERS)
+            except ValueError:   # (no tile under the window)
+                return out
+            if arr.ndim == 2:
+                arr = arr[None]
+            arr = np.moveaxis(arr, 0, -1)
+            hh, ww = min(arr.shape[0], y1 - y0), min(arr.shape[1], x1 - x0)
+            out[y0 - int(y):y0 - int(y) + hh, x0 - int(x):x0 - int(x) + ww] = arr[:hh, :ww]
+    return out
+
+
+def _area_centroid(P):
+    x, y = P[:, 0], P[:, 1]
+    x1, y1 = np.roll(x, -1), np.roll(y, -1)
+    a = x * y1 - x1 * y
+    A = a.sum() / 2
+    if abs(A) < 1e-9:
+        return P.mean(0)
+    return np.array([((x + x1) * a).sum() / (6 * A), ((y + y1) * a).sum() / (6 * A)])
+
+
+_czi_stage_offsets = {}
+
+
+def czi_stage_offsets(path, pixel_um):
+    """The offset (px) with which a stage position becomes a slide pixel: pixel = stage_um / pixel_um - offset, for each scene
+    ({scene: (x, y)}). From the stage position that a few tiles state in their own metadata (the tile's centre) against where
+    the tile lies in the slide's grid. The offset is the same for the whole scan (the scenes differ by 15 to 35 px, 10 to 20 um,
+    in the scans looked at), so a tile from each of three scenes is read, not one from every scene: every read is a seek in a file
+    of gigabytes. {} if the tiles state no stage position."""
+    key = (os.path.normcase(os.path.abspath(path)), round(pixel_um, 6))
+    found = _czi_stage_offsets.get(key)
+    if found is None:
+        import xml.etree.ElementTree as ET
+        found = {}
+        try:
+            with _czi_lock_for(path):
+                cz = czi_file(path)
+                tiles = {}
+                for e in cz.subblock_directory:
+                    dims = tuple(e.dims)
+                    if "X" in dims and "Y" in dims and max(e.scale[dims.index("X")], e.scale[dims.index("Y")]) == 1:
+                        tiles.setdefault(int(e.scene_index or 0), []).append(e)
+                scenes = sorted(tiles)
+                offs = []
+                for sc in sorted({scenes[0], scenes[len(scenes) // 2], scenes[-1]}) if scenes else ():
+                    e = tiles[sc][len(tiles[sc]) // 2]
+                    dims = tuple(e.dims)
+                    root = ET.fromstring((e.read_segment_data(cz).metadata() or "<x/>").encode("utf-8"))
+                    sx, sy = root.findtext(".//StageXPosition"), root.findtext(".//StageYPosition")
+                    if sx is None or sy is None:
+                        continue
+                    xi, yi = dims.index("X"), dims.index("Y")
+                    offs.append((float(sx) / pixel_um - (e.start[xi] + e.shape[xi] / 2),
+                                 float(sy) / pixel_um - (e.start[yi] + e.shape[yi] / 2)))
+                if offs:
+                    off = tuple(np.median(np.array(offs), axis=0))
+                    found = {sc: off for sc in scenes}
+        except Exception:
+            found = {}
+        _czi_stage_offsets[key] = found
+    return found
+
+
+def czi_region_plan(stack, path, sections, tol_um=800.0, reach_um=2500.0, max_hints=4):
+    """Which scan region each section probably lies in, and so where its origin (X0, Y0) would be: {section.index: [(scene, X0, Y0),
+    ...]}, the likeliest first. The operator traced a contour round the tissue of each region (in the scan's metadata, in stage um);
+    a section's own centroid lies near the centroid of its region's contour (within about 500 um in the sections measured), and
+    the sections lie in the case file much as the regions do on the scan, so that the two sets of centroids differ by one shift
+    (and, in some versions, a mirroring of x or of y). That shift is found by letting every pair of a section and a region propose
+    one and counting how many sections then have a region within tol_um; each mirroring is tried. Sections without a region near
+    their place (a stray fragment, or two pieces in one region) get none. When the mirrorings fit about equally well (a regular
+    grid of pieces looks alike mirrored) a section gets the region of each. {} where no clear shift is found, or the scan has no
+    contours or states no stage positions: the section is then looked for as without."""
+    pxs = stack.source_pixel_um or stack.pixel_um
+    contours = czi_region_contours(path)
+    offsets = czi_stage_offsets(path, pxs)
+    ids = [j for j in sorted(contours) if j in offsets]
+    secs = [s_ for s_ in sections if len(s_.saved_points)]
+    if len(ids) < 2 or len(secs) < 3:
+        return {}
+    R = np.array([_area_centroid(contours[j]) for j in ids])                       # (stage um)
+    C = np.array([_area_centroid(np.asarray(s_.saved_points, float)) for s_ in secs])      # (case file um)
+    sample = np.linspace(0, len(secs) - 1, min(len(secs), 40)).astype(int)
+    fits = []      # (inliers, cost, signs, shift)
+    for sx in (1, -1):
+        for sy in (1, -1):
+            signs = np.array([sx, sy], float)
+            X = C * signs
+            trial = (R[None, :, :] - X[sample][:, None, :]).reshape(-1, 2)           # every shift a (section, region) pair proposes
+            d = np.linalg.norm(X[sample][None, :, None, :] + trial[:, None, None, :] - R[None, None, :, :], axis=3).min(axis=2)
+            score = (d <= tol_um).sum(axis=1) * 1e6 - np.minimum(d, 2 * tol_um).sum(axis=1)
+            t = trial[int(np.argmax(score))]
+            for _ in range(2):       # (settled on the sections that fit)
+                dist = np.linalg.norm(X[:, None, :] + t - R[None, :, :], axis=2)
+                near = dist.min(axis=1) <= tol_um
+                if near.any():
+                    t = t + np.median(R[dist.argmin(axis=1)][near] - (X[near] + t), axis=0)
+            dist = np.linalg.norm(X[:, None, :] + t - R[None, :, :], axis=2)
+            ok = dist.min(axis=1) <= tol_um
+            fits.append((int(ok.sum()), float(np.minimum(dist.min(axis=1), 2 * tol_um).sum()), signs, t))
+    fits.sort(key=lambda f: (-f[0], f[1]))
+    best = fits[0]
+    if best[0] < max(3, 0.5 * len(secs)):
+        return {}
+    chosen = [f for f in fits if f[0] >= 0.9 * best[0] and f[1] <= 1.25 * best[1] + 1e-6][:2]
+    plan = {}
+    for k, s_ in enumerate(secs):
+        c = C[k]
+        out = []
+        for _, _, signs, t in chosen:
+            dist = np.linalg.norm(c * signs + t - R, axis=1)
+            for r in np.argsort(dist)[:2]:
+                if dist[r] <= reach_um and ids[r] not in [o[0] for o in out]:
+                    g = _area_centroid(contours[ids[r]]) / pxs - np.array(offsets[ids[r]])
+                    out.append((ids[r], float(g[0] - c[0] / stack.pixel_um), float(g[1] + c[1] / stack.pixel_um)))
+        if out:
+            plan[s_.index] = out[:max_hints]
+    return plan
 
 
 def czi_scene_of(section, stack):
@@ -1185,24 +1383,35 @@ def czi_candidates(stack, czi_path, section, frame, coarse=None, hint=None, pre_
         if scenes is not None and i not in scenes:
             continue
         key = (czi_path, i, level)
-        if coarse is not None and key in coarse:
-            arr = coarse[key]
-        else:
-            arr = czi_read(czi_path, i, level).astype(np.float32).mean(2)
-            if coarse is not None:
-                coarse[key] = arr
         ph, pw = tmpl.shape[0] // 2, tmpl.shape[1] // 2      # (the template's padding may reach past the scene)
         if hint is None:
+            if coarse is not None and key in coarse:
+                arr = coarse[key]
+            else:
+                arr = czi_read(czi_path, i, level).astype(np.float32).mean(2)
+                if coarse is not None:
+                    coarse[key] = arr
             img = _crop_zero(arr, -pw, -ph, arr.shape[1] + pw, arr.shape[0] + ph)
             left, top = -pw, -ph
         else:
             hx, hy, bx, by = hint
             ex, ey = (hx + box[0] - x0) / S, (hy + box[1] - y0) / S      # where the template should lie in this scene
             wx, wy = int(np.ceil(bx / S)), int(np.ceil(by / S))
-            if ex > arr.shape[1] + wx or ex + tmpl.shape[1] < -wx or ey > arr.shape[0] + wy or ey + tmpl.shape[0] < -wy:
+            if coarse is not None and key in coarse:
+                arr = coarse[key]
+                lh, lw = arr.shape[:2]
+            else:
+                shape = czi_scene_level_shape(czi_path, i, level)
+                lh, lw = shape
+                arr = None
+            if ex > lw + wx or ex + tmpl.shape[1] < -wx or ey > lh + wy or ey + tmpl.shape[0] < -wy:
                 continue   # (the expected place is not in this scene)
             left, top = int(round(ex)) - wx, int(round(ey)) - wy
-            img = _crop_zero(arr, left, top, left + tmpl.shape[1] + 2 * wx, top + tmpl.shape[0] + 2 * wy)
+            if arr is not None:
+                img = _crop_zero(arr, left, top, left + tmpl.shape[1] + 2 * wx, top + tmpl.shape[0] + 2 * wy)
+            else:   # (only the tiles under the window are read, not the scene)
+                img = czi_read_level_window(czi_path, i, level, left, top, tmpl.shape[1] + 2 * wx, tmpl.shape[0] + 2 * wy
+                                            ).astype(np.float32).mean(2)
         score, (fx, fy) = _best_match(img, tmpl)
         found.append((score, i, x0 + S * (fx + left) - box[0], y0 + S * (fy + top) - box[1]))
     return sorted(found, reverse=True)
@@ -1445,14 +1654,25 @@ def _fine_match(czi_path, scene, tmpl, sbox, X0, Y0, margins=FINE_MARGINS):
     return best
 
 
-def czi_locate_fast(stack, czi_path, section, frame, coarse, guesses=(), candidate=None, strong=0.9, hint=None, scenes=None):
+REGION_DIRECT_MARGIN_PX = 800    # how far (source px) from the origin a scan region's contour suggests the section is looked for at full
+                                 # resolution, with no coarse search first: about 500 um, within which nearly all the sections measured lay
+                                 # (the full-resolution tiles are small, so only a few are read; 1200 px read more and matched no better)
+REGION_BANDS_PX = (2000,)        # if that finds nothing, a coarse (1/8) search over this wider band around the suggested origin
+
+
+def czi_locate_fast(stack, czi_path, section, frame, coarse, guesses=(), candidate=None, strong=0.9, hint=None, scenes=None,
+                    region_hints=None):
     """Place a section on the scan from `frame` (a _Frame). Returns (candidates, (X0, Y0, score) or None).
 
     `guesses` are origins (X0, Y0, margin) expected from the sections placed already; each is tried first (a match at the
     expected place needs no search over the scan). Otherwise the 1/8 picture is searched against the scan for the coarse
     candidates (best first; a `candidate` skips that), and the best of them, when clear (score >= strong), is matched at full
     resolution, looking further around it if the first look does not match well (the coarse place can be off by 100 px or
-    more). Each full-resolution match uses the busiest window inside the outline, 500 px and then 1600 px."""
+    more). Each full-resolution match uses the busiest window inside the outline, 500 px and then 1600 px. `region_hints` (a list, or a
+    function that makes it) is [(scene, X0, Y0), ...], the origins the scan's region contours suggest (see czi_region_plan), the
+    likeliest first: each is matched at full resolution within REGION_DIRECT_MARGIN_PX of it (a few tiles are read, not the scene),
+    and the first that matches well is used; if none does, a coarse search over a wider band around each is tried, and then the
+    search goes on as without them."""
     # (a quicker, coarser decode (1/16) is enough to pick the window for a match at a guessed place; the 1/8 one is for the search)
     S = 16 if guesses else 8
     small = frame.reduced_mean(int(np.log2(S)))
@@ -1495,12 +1715,28 @@ def czi_locate_fast(stack, czi_path, section, frame, coarse, guesses=(), candida
         best = attempt(gx, gy, scene, (gmargin,))
         if best is not None and best[2] >= GOOD_MATCH:
             return [(best[2], scene, best[0], best[1])], best
+    if candidate is None and region_hints:       # (the origins the region contours suggest: matched at full resolution at once)
+        region_hints = region_hints() if callable(region_hints) else region_hints
+        for scene, hx, hy in region_hints or ():
+            best = attempt(hx, hy, scene, (REGION_DIRECT_MARGIN_PX,))
+            if best is not None and best[2] >= GOOD_MATCH:
+                return [(best[2], scene, best[0], best[1])], best
     found = [candidate] if candidate is not None else []
     if S != 8:   # (no guess matched: the search and the windows after it work from the 1/8 picture)
         S = 8
         small = frame.reduced_mean(3)
         masks.clear()
-    if candidate is None:
+    if candidate is None and region_hints:
+        region_hints = region_hints() if callable(region_hints) else region_hints
+        for band in REGION_BANDS_PX:
+            for scene, hx, hy in region_hints or ():     # (the likeliest region first; the first that matches well is taken)
+                tried = czi_candidates(stack, czi_path, section, small, coarse, hint=(hx, hy, band, band), pre_reduced=8, scenes={scene})
+                if tried and tried[0][0] >= strong:
+                    found = tried
+                    break
+            if found:
+                break
+    if candidate is None and not (found and found[0][0] >= strong):
         if hint is not None:   # (the coarse search only over the band where the origin is expected)
             found = czi_candidates(stack, czi_path, section, small, coarse, hint=hint, pre_reduced=8)
         if not found or found[0][0] < strong:
@@ -1515,7 +1751,7 @@ def czi_locate_fast(stack, czi_path, section, frame, coarse, guesses=(), candida
     return found, attempt(X0, Y0, scene, FINE_MARGINS)
 
 
-def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progress=None, on_located=None, workers=None, share=True, scans_at_once=None):
+def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progress=None, on_located=None, workers=None, share=True, scans_at_once=None, before_scan=None):
     """Locate the sections of every .czi source of the stack that have no czi_origin yet, so that they can be rendered.
 
     NeuroInfo's slide coordinates relate to the scan by an offset (X0, Y0) that it does not record, found here by matching each
@@ -1526,7 +1762,8 @@ def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progr
     With `share` (and 6 or more sections in the scan) only a few sections are located and the scan's other sections are given
     their origin (czi_assumed is set on those); see verify_czi_origins. `workers` is how many sections of one scan are looked at
     at once; by default the processors (all but two) shared out among the scans that are located at the same time, so that a stack
-    from one or two scans uses them all and one from many scans keeps two for each, as before."""
+    from one or two scans uses them all and one from many scans keeps two for each, as before. before_scan(path), if given, is
+    called as the work on each scan begins (it may wait, for the scan's overview picture to be made, say)."""
     frames = [b for b in read_boxes(stack.jpx_path) if b.kind == b"jp2c"]
     worker_count = [workers or 2]       # (set below, once it is known how many scans are located at once)
 
@@ -1556,6 +1793,11 @@ def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progr
                 first_ready.set()
 
     def scan(path):
+        if before_scan is not None:
+            try:
+                before_scan(path)
+            except Exception:
+                pass
         name = os.path.basename(path)
         todo = [s for s in stack.sections if s.source_path == path and s.czi_origin is None and len(s.saved_points)]
         if not todo:
@@ -1644,6 +1886,19 @@ def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progr
                 near = {i for i, (scx, scy, sw, sh) in enumerate(stage) if abs(x - scx) <= sw / 2 + 3000 and abs(y - scy) <= sh / 2 + 3000}
                 return near if near and len(near) < len(boxes) else None
 
+            plan, plan_lock = [None], threading.Lock()      # (the regions' plan for the scan's sections: made when first needed)
+
+            def regions_for(sec):
+                """Where the section's origin would be if it lay at the centre of each region the scan's operator traced (see
+                czi_region_hints); [] if the scan does not say (then the search goes on without)."""
+                try:
+                    with plan_lock:
+                        if plan[0] is None:
+                            plan[0] = czi_region_plan(stack, path, todo)
+                    return plan[0].get(sec.index, [])
+                except Exception:
+                    return []
+
             def guesses_for(sec):
                 """Origins (X0, Y0, margin) to try for the section first, from those placed already in this scan. X0 is the same
                 for all of them. Y0 is the same too in some scans, and in others follows the outline's y in the case file; which
@@ -1678,7 +1933,7 @@ def calibrate_stack_czi(stack, log=lambda m: None, strong=0.9, accept=0.6, progr
                 report()
                 if fast:
                     found, placed = czi_locate_fast(stack, path, sec, payload(sec), coarse, guesses_for(sec), strong=strong,
-                                                    hint=hint_for(sec), scenes=lambda: scenes_for(sec))
+                                                    hint=hint_for(sec), scenes=lambda: scenes_for(sec), region_hints=lambda: regions_for(sec))
                 else:
                     frame = load_frame(sec)
                     found = czi_candidates(stack, path, sec, frame, coarse)
