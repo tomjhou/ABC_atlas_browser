@@ -278,6 +278,43 @@ def shade(color, weight):
 
 CRASH_LOG = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "JhouLab", "jpx_aligner_crash.log")
 _crash_file = None
+EXPORT_LOG = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "JhouLab", "jpx_aligner_export.log")
+
+
+def open_export_log(header):
+    """What an export reports to: returns (log, close). log(message) prints the message (as before) and also appends it, with the time, to
+    EXPORT_LOG, which is kept from one export to the next (the older half is kept as .old once it passes 2 MB), so that how long each
+    section took can be looked at afterwards, with no console open. It is called from several threads. A log that can't be written is
+    left out; the export goes on."""
+    lock = threading.Lock()
+    try:
+        os.makedirs(os.path.dirname(EXPORT_LOG), exist_ok=True)
+        if os.path.exists(EXPORT_LOG) and os.path.getsize(EXPORT_LOG) > 2_000_000:
+            os.replace(EXPORT_LOG, EXPORT_LOG + ".old")
+        stream = open(EXPORT_LOG, "a", buffering=1, encoding="utf-8")
+        stream.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+    except OSError:
+        stream = None
+
+    def log(message):
+        print(message, flush=True)
+        if stream is not None:
+            with lock:
+                try:
+                    stream.write(f"{time.strftime('%H:%M:%S')} {message}\n")
+                except (OSError, ValueError):
+                    pass
+
+    def close():
+        if stream is not None:
+            with lock:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+    log(header)
+    return log, close
 
 
 def install_crash_log():
@@ -688,6 +725,7 @@ class Aligner:
         menu.add_cascade(label="View", menu=vm)
         tm = tk.Menu(menu, tearoff=0)
         tm.add_command(label="Analyze project", command=self.analyze_project)
+        tm.add_command(label="Open the log folder", command=self.open_log_folder)
         menu.add_cascade(label="Tools", menu=tm)
         menu.add_command(label="\u25c4 Back to step 3: order sections", command=self.go_back_to_ordering)
         self.back_menu_index = menu.index("end")
@@ -2938,15 +2976,25 @@ class Aligner:
 
         def work():
             t0 = time.time()
+            log, close_log = open_export_log(
+                f"Export to {out}: {len(exp.sections)} sections, "
+                + ("every one re-rendered" if rerender_all else "only the edited ones re-rendered, the rest copied"))
             try:
                 ns.export_stack(exp, out, quality_db=quality, rerender_all=rerender_all,
-                                log=lambda m: print(m, flush=True), progress=progress,
+                                log=log, progress=progress,
                                 stop_event=self.stop_event)
+                log(f"Export finished in {time.time() - t0:.0f} s")
                 self.msgs.put(("export_done", (out, None, time.time() - t0)))
             except ns.UserCanceled:
+                log(f"Export canceled after {time.time() - t0:.0f} s")
                 self.msgs.put(("export_done", (out, "canceled", 0)))
             except Exception as e:
+                import traceback
+                log(f"Export failed after {time.time() - t0:.0f} s: {type(e).__name__}: {e}")
+                log(traceback.format_exc().rstrip())
                 self.msgs.put(("export_done", (out, str(e), 0)))
+            finally:
+                close_log()
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -2996,6 +3044,24 @@ class Aligner:
         self.redraw()
 
     # ---------------------------------------------------------------- run
+
+    def open_log_folder(self):
+        """Tools > Open the log folder: an Explorer window on the folder the program keeps its logs, settings and picture cache in (the export
+        log is shown selected when there is one)."""
+        folder = os.path.dirname(EXPORT_LOG)
+        try:
+            os.makedirs(folder, exist_ok=True)
+            if sys.platform.startswith("win"):
+                import subprocess
+                if os.path.isfile(EXPORT_LOG):
+                    subprocess.Popen(["explorer", "/select,", os.path.normpath(EXPORT_LOG)])      # (explorer reports failure even when it works)
+                else:
+                    os.startfile(folder)
+            else:
+                import subprocess
+                subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", folder])
+        except OSError as e:
+            messagebox.showwarning("Log folder", f"Couldn't open {folder}: {e}", parent=self.root)
 
     # ---------------------------------------------------------------- Tools > Analyze project
 
