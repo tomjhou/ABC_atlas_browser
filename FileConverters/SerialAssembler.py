@@ -22,8 +22,8 @@ def choose():
     choice = []
     outer = ttk.Frame(root, padding=28)
     outer.pack()
-    ttk.Label(outer, text="Section alignment", font=("Segoe UI", 18, "bold")).pack(anchor="w")
-    ttk.Label(outer, text="Steps 1-3 find and order the sections. Step 4 picks up where they leave off.", foreground="gray30").pack(anchor="w", pady=(2, 18))
+    ttk.Label(outer, text="Brain section assembler", font=("Segoe UI", 18, "bold")).pack(anchor="w")
+    ttk.Label(outer, text="Steps 1-3 load and order the sections. Step 4 picks up where they leave off.", foreground="gray30").pack(anchor="w", pady=(2, 18))
 
     def card(number, title, text, key, primary):
         f = tk.Frame(outer, bd=1, relief="solid", padx=16, pady=12, bg="white")

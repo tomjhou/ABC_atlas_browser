@@ -49,6 +49,7 @@ import section_project as sp
 import neuroinfo_dialogs
 from section_order import OrderGrid, THUMB_W, THUMB_H
 from tooltip import Tooltip
+from order_editor import OrderEditor, SIZES, placeholder_image
 
 ns.ensure_packages({"PIL": "pillow"})
 
@@ -92,6 +93,10 @@ def histogram_percentile(h, q):
 PREVIEW_WORKERS = max(2, min(8, (os.cpu_count() or 4) - 2))   # slide scans whose sections' pictures are made at the same time: most of the
 # cores, leaving two for the window and the other work, and at most 8 (each decodes a big picture, so memory and the drive limit it too)
 PREVIEW_MAX_PX = ns.PREVIEW_MAX_PX   # longest side of the cached preview of each section
+# The Overlay comparison mode: each section is shown in one colour, in proportion to its brightness, and the two are added. (red, green, blue) from
+# 0 to 1, and the words for the colours in the Compare panel's label. This section is red and the other, the one it is compared with, grey.
+OVERLAY_THIS_COLOR, OVERLAY_THIS_NAME = (1.0, 0.0, 0.0), "red"
+OVERLAY_OTHER_COLOR, OVERLAY_OTHER_NAME = (0.7, 0.7, 0.7), "grey"
 THUMB_MAX_PX = 1600     # longest side of the slide thumbnail as it is built (it is scaled to the left pane's width when shown)
 CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
                          "JhouLab", "jpx_aligner_cache")
@@ -311,6 +316,256 @@ def install_crash_log():
     sys.excepthook, threading.excepthook = hook, thread_hook
 
 
+class ExportProgressDialog:
+    """The window shown while a JPX is written: what is being done (the text the status bar has), a bar, and a Cancel button."""
+
+    def __init__(self, app, out):
+        self.app = app
+        dlg = self.dlg = tk.Toplevel(app.root)
+        dlg.title("Exporting JPX")
+        dlg.transient(app.root)
+        dlg.resizable(False, False)
+        body = ttk.Frame(dlg, padding=16)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(body, text=f"Writing {os.path.basename(out)}", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        self.text = tk.StringVar(dlg, "Starting the export...")
+        ttk.Label(body, textvariable=self.text, wraplength=420, justify=tk.LEFT).pack(anchor="w", pady=(8, 8))
+        self.bar = ttk.Progressbar(body, length=420, mode="determinate")
+        self.bar.pack(fill=tk.X)
+        self.time_text = tk.StringVar(dlg, "Elapsed 0:00")
+        ttk.Label(body, textvariable=self.time_text, foreground="gray30").pack(anchor="w", pady=(8, 0))
+        self.t_start = time.time()
+        self.t_first = None                 # when the first section was reported: the sections' rate is measured from there
+        self.remaining = None               # (estimated seconds still to go, when it was estimated)
+        self.job = None
+        self.cancel_button = ttk.Button(body, text="Cancel", command=self.cancel)
+        self.cancel_button.pack(side=tk.RIGHT, pady=(14, 0))
+        dlg.protocol("WM_DELETE_WINDOW", self.cancel)
+        dlg.update_idletasks()
+        x = app.root.winfo_rootx() + max((app.root.winfo_width() - dlg.winfo_reqwidth()) // 2, 20)
+        y = app.root.winfo_rooty() + max((app.root.winfo_height() - dlg.winfo_reqheight()) // 3, 20)
+        dlg.geometry(f"+{x}+{y}")
+        dlg.grab_set()                  # (the stack is busy being written: nothing else to do in the main window until it is done)
+        self.tick()
+
+    @staticmethod
+    def clock(seconds):
+        seconds = int(max(seconds, 0) + 0.5)
+        hours, rest = divmod(seconds, 3600)
+        return f"{hours}:{rest // 60:02d}:{rest % 60:02d}" if hours else f"{rest // 60}:{rest % 60:02d}"
+
+    def tick(self):
+        """Twice a second: the elapsed time, and (once two sections have been written) the estimated time remaining, counting down."""
+        now = time.time()
+        text = f"Elapsed {self.clock(now - self.t_start)}"
+        if self.remaining is None:
+            text += "      Estimating the time remaining..." if self.t_first is not None else ""
+        else:
+            left, stamp = self.remaining
+            text += f"      Estimated time remaining {self.clock(left - (now - stamp))}"
+        self.time_text.set(text)
+        self.job = self.dlg.after(500, self.tick)
+
+    def update(self, i, n, text):
+        self.bar.config(maximum=max(n, 1), value=i)
+        self.text.set(text)
+        now = time.time()
+        if self.t_first is None:
+            self.t_first = now
+        if i >= 2:      # (i sections are done or under way: the time they took gives the rate; copied ones are quick, re-rendered ones slow,
+            rate = (now - self.t_first) / i          # so the estimate improves as the mix shows itself)
+            self.remaining = (rate * max(n - i, 0), now)
+
+    def cancel(self):
+        """Cancel: the export stops at the next section (the one being written finishes first) and nothing is written."""
+        self.app.stop_event.set()
+        self.cancel_button.config(state="disabled")
+        self.text.set("Canceling: the section being written finishes first...")
+
+    def close(self):
+        try:
+            if self.job is not None:
+                self.dlg.after_cancel(self.job)
+            self.dlg.grab_release()
+            self.dlg.destroy()
+        except tk.TclError:
+            pass
+
+
+class OrderDialog:
+    """The "Thumbnails..." window of the alignment tool: the sections as pictures, in a grid made and edited by the shared order editor
+    (order_editor.py: drag to reorder, right-click to delete a section or insert a placeholder, Undo, Reverse, Reset, small / medium / large).
+    What is done is a draft until Apply: Cancel leaves the stack as it was. The thumbnails show each section as the main view shows it now
+    (aligned, at the brightness set), with its outline; a placeholder is a grey box. A double-click applies, and goes to that section."""
+
+    def __init__(self, app):
+        self.app = app
+        self.stack = app.stack
+        self.secs = list(self.stack.sections)                  # the sections as they are now
+        self.by_frame = {sec.frame: sec for sec in self.secs}   # (and the placeholders made in this window, until Apply)
+        self.closed = False
+        self.skip = set()                                      # (sections with nothing to show)
+        dlg = self.dlg = tk.Toplevel(app.root)
+        dlg.title("Order the sections")
+        dlg.transient(app.root)
+        dlg.geometry(f"1000x700+{app.root.winfo_rootx() + 40}+{app.root.winfo_rooty() + 40}")
+        top = ttk.Frame(dlg, padding=(12, 8))
+        top.pack(fill=tk.X)
+        self.text = tk.StringVar(dlg)
+        self.editor = OrderEditor(dlg, self, after_draw=lambda: self.text.set(
+            f"{len(self.editor.order)} sections. Drag to reorder; right-click for more; double-click applies and goes to it."))
+        self.grid = self.editor.grid
+        self.grid.order = [sec.frame for sec in self.secs]
+        size = getattr(app, "thumb_size", "medium")          # (the size last used in this run; each run starts at medium)
+        self.editor.var_size.set(size)
+        self.grid.set_scale(SIZES[size])
+        self.editor.reverse_button(top).pack(side=tk.RIGHT)
+        self.editor.reset_button(top).pack(side=tk.RIGHT, padx=8)
+        self.editor.undo_button(top).pack(side=tk.RIGHT)
+        self.editor.size_buttons(top).pack(side=tk.RIGHT, padx=8)
+        ttk.Label(top, textvariable=self.text, foreground="gray30").pack(side=tk.LEFT)
+        bottom = ttk.Frame(dlg, padding=10)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Button(bottom, text="Apply", command=self.apply).pack(side=tk.RIGHT)
+        ttk.Button(bottom, text="Cancel", command=self.close).pack(side=tk.RIGHT, padx=8)
+        self.grid.frame.pack(fill=tk.BOTH, expand=True)
+        dlg.protocol("WM_DELETE_WINDOW", self.close)
+        dlg.bind("<Escape>", lambda e: self.close())
+        dlg.bind("<Control-z>", lambda e: self.editor.undo(e))
+        dlg.update_idletasks()
+        dlg.grab_set()
+        self.grid.draw()
+        self.fill()
+
+    def close(self):
+        self.closed = True
+        self.app.thumb_size = self.editor.var_size.get()
+        self.dlg.destroy()
+
+    # ---- what the editor asks of its host
+    def order_caption(self, frame, i):
+        sec = self.by_frame[frame]
+        if sec.placeholder:
+            return f"{i + 1}  placeholder", "new" if ns.is_new_placeholder(sec) else ""
+        scene = ns.czi_scene_if_known(sec, self.stack)
+        return f"{i + 1}  {os.path.splitext(sec.name)[0][-9:]}", f"scene {scene + 1}" if scene is not None else ""
+
+    def order_double(self, frame, i):
+        self.apply(frame)
+
+    def order_status(self, text):
+        self.text.set(text)
+
+    def order_new_placeholder(self, position):
+        used = [f for f in self.by_frame if f >= ns.PLACEHOLDER_FRAME_BASE]
+        frame = max(used + [ns.PLACEHOLDER_FRAME_BASE - 1]) + 1
+        self.by_frame[frame] = ns.placeholder_section(len(self.by_frame), frame=frame)
+        return frame
+
+    def order_restore(self, frames):
+        for frame in frames:                       # (a placeholder that Reset took away comes back)
+            if frame >= ns.PLACEHOLDER_FRAME_BASE and frame not in self.by_frame:
+                self.by_frame[frame] = ns.placeholder_section(len(self.by_frame), frame=frame)
+
+    def order_reset_keys(self):
+        for frame in [f for f in self.by_frame if f >= ns.PLACEHOLDER_FRAME_BASE and f not in {sec.frame for sec in self.secs}]:
+            del self.by_frame[frame]               # (placeholders made in this window go)
+        return sorted(self.by_frame)
+
+    def order_reset_help(self):
+        return ("Puts the sections back in the order of their frames in the opened file. Any order made by dragging is lost, and so are the "
+                "placeholders inserted here; deleted sections come back. (Cancel leaves everything as it was before this window.)")
+
+    def order_size_changed(self, scale):
+        self.grid.thumbs.clear()
+        self.skip.clear()
+        self.grid.draw()
+        self.fill()
+
+    # ---- the pictures
+    def thumb(self, frame):
+        """The section as the main view shows it (aligned, at the brightness set), fitted into its thumbnail with its outline."""
+        app, stack = self.app, self.stack
+        tw, th = self.grid.tw, self.grid.th
+        sec = self.by_frame[frame]
+        if sec.placeholder:
+            return ImageTk.PhotoImage(Image.fromarray(placeholder_image(tw, th)), master=app.root)
+        P = sec.stack_points
+        if not len(P):
+            return None
+        px = stack.pixel_um
+        X, Y = P[:, 0] / px, -P[:, 1] / px
+        lo, hi = np.array([X.min(), Y.min()]), np.array([X.max(), Y.max()])
+        pad = 0.08 * float((hi - lo).max()) + 4
+        sc = min(tw / (hi[0] - lo[0] + 2 * pad), th / (hi[1] - lo[1] + 2 * pad))
+        ox, oy = tw / 2 - (lo[0] + hi[0]) / 2 * sc, th / 2 - (lo[1] + hi[1]) / 2 * sc
+        saved, app.view = app.view, (sc, ox, oy)
+        try:
+            img, _ = app.warp_section(sec, tw, th)
+        finally:
+            app.view = saved
+        if img is None:
+            return None
+        rgb = (np.clip(app.colorize(img), 0, 1) * 255).astype(np.uint8)
+        cv2.polylines(rgb, [np.column_stack([ox + X * sc, oy + Y * sc]).astype(np.int32)], True, (255, 212, 0), 1, cv2.LINE_AA)
+        return ImageTk.PhotoImage(Image.fromarray(rgb), master=app.root)
+
+    def fill(self):
+        """The thumbnails are made a few at a time as the sections' pictures are loaded (they may still be coming in)."""
+        if self.closed:
+            return
+        made = 0
+        for frame in self.grid.order:
+            if frame in self.grid.thumbs or frame in self.skip:
+                continue
+            sec = self.by_frame[frame]
+            if not sec.placeholder and frame not in self.app.previews:
+                continue
+            try:
+                ph = self.thumb(frame)
+            except Exception:
+                ph = None
+            if ph is None:
+                self.skip.add(frame)
+            else:
+                self.grid.thumbs[frame] = ph
+            made += 1
+            if made >= 12:
+                break
+        if made:
+            self.grid.draw()
+        waiting = [f for f in self.grid.order if f not in self.grid.thumbs and f not in self.skip]
+        if waiting and not self.closed:
+            self.dlg.after(30 if made else 300, self.fill)
+
+    # ---- Apply
+    def apply(self, go_to=None):
+        app, stack = self.app, self.stack
+        if stack is not app.stack:
+            return self.close()
+        order = list(self.grid.order)
+        named = set(order)
+        new = [self.by_frame[f] for f in order]
+        current = self.secs[app.cur] if app.cur < len(self.secs) else None
+        changed = [sec.frame for sec in new] != [sec.frame for sec in self.secs]
+        self.close()
+        if not changed:
+            if go_to is not None:
+                app.select(self.by_frame[go_to].index)
+            return
+        stack.deleted += sum(1 for sec in self.secs if sec.frame not in named)
+        stack.sections[:] = new
+        for sec in new:
+            if sec.placeholder and sec.frame not in app.previews:
+                app.previews[sec.frame] = blank_frame_preview(stack)         # (nothing to read: a blank frame, perhaps not in the file yet)
+        app.renumber()
+        keep = self.by_frame[go_to] if go_to is not None else (current if current in new else None)
+        app.cur = keep.index if keep is not None else min(app.cur, len(new) - 1)
+        app.refresh_list()
+        app.select(app.cur)
+        app.var_status.set("Changed the sections' order. Export to save it.")
+
+
 class Aligner:
     def __init__(self, path=None):
         install_crash_log()
@@ -428,6 +683,9 @@ class Aligner:
         em.add_command(label="Reset this section", command=self.reset_section)
         em.add_command(label="Reset all sections", command=self.reset_all)
         menu.add_cascade(label="Edit", menu=em)
+        vm = tk.Menu(menu, tearoff=0)
+        vm.add_checkbutton(label="Crosshair at the centre of the canvas", variable=self.var_crosshair, command=self.redraw)
+        menu.add_cascade(label="View", menu=vm)
         tm = tk.Menu(menu, tearoff=0)
         tm.add_command(label="Analyze project", command=self.analyze_project)
         menu.add_cascade(label="Tools", menu=tm)
@@ -474,7 +732,7 @@ class Aligner:
                 ("Move up", lambda: self.move_section(-1), "Move selected section earlier in the sequence order"),
                 ("Move down", lambda: self.move_section(1), "Move selected section later in the sequence order"),
                 ("Delete", self.delete_section, "Remove section from sequence"),
-                ("Thumbnails...", self.order_dialog, "Put the sections in order by dragging their pictures about in a window")):
+                ("Thumbnails...", self.order_dialog, "Put the sections in order by dragging their pictures about in a window; delete sections; insert placeholders")):
             button = ttk.Button(order, text=text, command=command)
             button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
             Tooltip(button, tip)
@@ -604,20 +862,18 @@ class Aligner:
         for text, val in (("Previous section", "previous"), ("Next section", "next"), ("Nothing", "none")):
             ttk.Radiobutton(f, text=text, value=val, variable=self.var_ref,
                             command=self.redraw).pack(anchor="w")
-        self.mode_frame = ttk.Frame(f)   # the blending modes: advanced mode only (otherwise the sections are always blended)
+        self.mode_frame = ttk.Frame(f)   # the blending modes: Blend (true colours) or Overlay (red and grey)
         ttk.Separator(self.mode_frame).pack(fill=tk.X, pady=4)
         ttk.Radiobutton(self.mode_frame, text="Blend (true colors)", value="blend", variable=self.var_mode,
                         command=self.redraw).pack(anchor="w")
-        ttk.Radiobutton(self.mode_frame, text="Overlay (this = magenta, other = cyan)", value="overlay",
+        ttk.Radiobutton(self.mode_frame, text=f"Overlay (this = {OVERLAY_THIS_NAME}, other = {OVERLAY_OTHER_NAME})", value="overlay",
                         variable=self.var_mode, command=self.redraw).pack(anchor="w")
         self.label_opacity = ttk.Label(f, text="Opacity of this section")
         self.label_opacity.pack(anchor="w", pady=(4, 0))
+        self.mode_frame.pack(fill=tk.X, before=self.label_opacity)
         ttk.Scale(f, from_=0, to=1, variable=self.var_opacity,
                   command=lambda v: self.redraw()).pack(fill=tk.X)
 
-        self.view_frame = f = ttk.LabelFrame(right, text="View", padding=6)   # (advanced mode only)
-        ttk.Checkbutton(f, text="Crosshair at the centre of the canvas", variable=self.var_crosshair,
-                        command=self.redraw).pack(anchor="w")
 
         f = self.export_frame = ttk.LabelFrame(right, text="Export settings", padding=6)
         f.pack(fill=tk.X, pady=(0, 6))
@@ -723,18 +979,12 @@ class Aligner:
     def apply_advanced_mode(self):
         """Show the features meant for experienced users only in advanced mode (and use the plain ones otherwise)."""
         if self.var_advanced.get():
-            self.mode_frame.pack(fill=tk.X, before=self.label_opacity)
-            self.view_frame.pack(fill=tk.X, pady=(0, 6), before=self.export_frame)
             for w in self.export_advanced:
                 w.grid()
         else:
             # what is hidden goes back to its default, so nothing unseen keeps affecting the picture or the export
-            self.mode_frame.pack_forget()
-            self.view_frame.pack_forget()
             for w in self.export_advanced:
                 w.grid_remove()
-            self.var_mode.set("blend")
-            self.var_crosshair.set(True)
             self.var_quality.set(f"{ns.DEFAULT_QUALITY_DB:g}")
 
     def advanced_option_changed(self):
@@ -844,9 +1094,16 @@ class Aligner:
             proj = self.project_obj or sp.Project.load(self.project_path)
             if proj.is_jpx:
                 proj.jpx_order = [s.frame for s in self.stack.sections]       # (the order made here is the project's now)
-            elif sp.write_back_outlines(proj, self.stack) and self.reuse_info is not None:
-                # (outlines edited here are the project's outlines now, so step 1 shows them; this window still stands for the project)
-                self.reuse_info = sp.reuse_info(proj, self.stack)
+            else:
+                # Outlines edited here are the project's outlines now, so step 1 shows them; and the order of the sections here (a placeholder
+                # inserted, sections moved or deleted) is the project's order, so step 3 shows it. This window still stands for the project.
+                changed = bool(sp.write_back_outlines(proj, self.stack))
+                new_order = sp.order_from_stack(proj, self.stack)
+                if new_order is not None and [tuple(e) for e in new_order] != [tuple(e) for e in (proj.order or proj.default_order())]:
+                    proj.order = new_order
+                    changed = True
+                if changed and self.reuse_info is not None:
+                    self.reuse_info = sp.reuse_info(proj, self.stack)
             proj.alignment = ns.stack_json(self.stack, self.project_path)
             proj.alignment_key = proj.fingerprint()
             proj.save(self.project_path)
@@ -1424,6 +1681,8 @@ class Aligner:
                     i, n, text = payload
                     self.progress.config(maximum=n, value=i)
                     self.var_status.set(text)
+                    if getattr(self, "export_progress", None) is not None:
+                        self.export_progress.update(i, n, text)
                     for item in self.canvas.find_withtag("loadtext"):
                         self.canvas.itemconfig(item, text=text)
                 elif kind == "export_done":
@@ -1862,117 +2121,11 @@ class Aligner:
             self.move_to(d["from"], d["target"])
 
     def order_dialog(self):
-        """A window with a picture of every section, to put them in order by dragging (the grid of step 1's third tab). Apply makes the
-        new order; Cancel leaves things as they were. A double-click applies it too, and goes to that section."""
-        if not self.stack or self.busy or self.opening or len(self.stack.sections) < 2:
+        """A window with a picture of every section, to put them in order by dragging, delete sections from the order and insert placeholders
+        (the same editor as step 3's ordering tab). Apply makes the new order; Cancel leaves things as they were."""
+        if not self.stack or self.busy or self.opening:
             return
-        stack = self.stack
-        secs = list(stack.sections)
-        by_frame = {sec.frame: sec for sec in secs}
-        dlg = tk.Toplevel(self.root)
-        dlg.title("Order the sections")
-        dlg.transient(self.root)
-        dlg.geometry(f"1000x700+{self.root.winfo_rootx() + 40}+{self.root.winfo_rooty() + 40}")
-        top = ttk.Frame(dlg, padding=(12, 8))
-        top.pack(fill=tk.X)
-        text = tk.StringVar(dlg)
-        state = {"closed": False}
-
-        def caption(frame, i):
-            sec = by_frame[frame]
-            scene = ns.czi_scene_if_known(sec, stack)
-            return f"{i + 1}  {os.path.splitext(sec.name)[0][-9:]}", f"scene {scene + 1}" if scene is not None else ""
-
-        grid = OrderGrid(dlg, caption, on_double=lambda frame, i: apply(frame),
-                         after_draw=lambda: text.set(f"{len(grid.order)} sections. Drag to reorder; double-click applies and goes to it."))
-        grid.order = [sec.frame for sec in secs]
-
-        def close():
-            state["closed"] = True
-            dlg.destroy()
-
-        def apply(go_to=None):
-            if stack is not self.stack:
-                return close()
-            new = [by_frame[f] for f in grid.order]
-            changed = [sec.frame for sec in new] != [sec.frame for sec in secs]
-            keep = by_frame[go_to] if go_to is not None else secs[self.cur]
-            close()
-            if changed:
-                stack.sections[:] = new
-                self.renumber()
-                self.cur = keep.index
-                self.refresh_list()
-                self.select(self.cur)
-                self.var_status.set("Reordered the sections. Export to save the new order.")
-            elif go_to is not None:
-                self.select(keep.index)
-
-        def thumb(frame):
-            """The section as the main view shows it (aligned, at the brightness set), fitted into its thumbnail with its outline."""
-            sec = by_frame[frame]
-            P = sec.stack_points
-            if not len(P):
-                return None
-            px = stack.pixel_um
-            X, Y = P[:, 0] / px, -P[:, 1] / px
-            lo, hi = np.array([X.min(), Y.min()]), np.array([X.max(), Y.max()])
-            pad = 0.08 * float((hi - lo).max()) + 4
-            sc = min(THUMB_W / (hi[0] - lo[0] + 2 * pad), THUMB_H / (hi[1] - lo[1] + 2 * pad))
-            ox, oy = THUMB_W / 2 - (lo[0] + hi[0]) / 2 * sc, THUMB_H / 2 - (lo[1] + hi[1]) / 2 * sc
-            saved, self.view = self.view, (sc, ox, oy)
-            try:
-                img, _ = self.warp_section(sec, THUMB_W, THUMB_H)
-            finally:
-                self.view = saved
-            if img is None:
-                return None
-            rgb = (np.clip(self.colorize(img), 0, 1) * 255).astype(np.uint8)
-            cv2.polylines(rgb, [np.column_stack([ox + X * sc, oy + Y * sc]).astype(np.int32)], True, (255, 212, 0), 1, cv2.LINE_AA)
-            return ImageTk.PhotoImage(Image.fromarray(rgb), master=self.root)
-
-        skip = set()      # (sections with nothing to show)
-
-        def fill():
-            """The thumbnails are made a few at a time as the sections' pictures are loaded (they may still be coming in)."""
-            if state["closed"]:
-                return
-            made = 0
-            for frame in grid.order:
-                if frame in grid.thumbs or frame in skip:
-                    continue
-                if frame not in self.previews:
-                    continue
-                try:
-                    ph = thumb(frame)
-                except Exception:
-                    ph = None
-                if ph is None:
-                    skip.add(frame)
-                else:
-                    grid.thumbs[frame] = ph
-                made += 1
-                if made >= 12:
-                    break
-            if made:
-                grid.draw()
-            if len(grid.thumbs) + len(skip) < len(by_frame):
-                dlg.after(30 if made else 300, fill)
-
-        ttk.Button(top, text="Reverse order", command=grid.reverse).pack(side=tk.RIGHT)
-        ttk.Button(top, text="Original order", command=lambda: (grid.order.sort(), grid.draw())).pack(side=tk.RIGHT, padx=8)
-        ttk.Label(top, textvariable=text, foreground="gray30").pack(side=tk.LEFT)
-        bottom = ttk.Frame(dlg, padding=10)
-        bottom.pack(side=tk.BOTTOM, fill=tk.X)
-        ttk.Button(bottom, text="Apply", command=apply).pack(side=tk.RIGHT)
-        ttk.Button(bottom, text="Cancel", command=close).pack(side=tk.RIGHT, padx=8)
-        grid.frame.pack(fill=tk.BOTH, expand=True)
-        dlg.protocol("WM_DELETE_WINDOW", close)
-        dlg.bind("<Escape>", lambda e: close())
-        dlg.update_idletasks()
-        dlg.grab_set()
-        grid.draw()
-        fill()
+        OrderDialog(self)
 
     def delete_section(self):
         """Remove the current section from the stack (after asking); the exported JPX will not contain it."""
@@ -1985,7 +2138,7 @@ class Aligner:
         s = secs[self.cur]
         if not messagebox.askyesno(
                 "Delete section", f"Delete section {s.index + 1} from the stack?\n\n"
-                "It is left out when you export. The source image and the original JPX are not touched, but the deletion "
+                "The source image and the original JPX are not touched, but the deletion "
                 "can't be undone here (reopen the file to get it back).", icon="warning", parent=self.root):
             return
         i = self.cur
@@ -2264,9 +2417,9 @@ class Aligner:
         if self.var_mode.get() == "overlay":
             out = np.zeros((vh, vw, 3), np.float32)
             if ref_img is not None:
-                out += self.luminance(ref_img)[..., None] * np.array([0, 1, 1], np.float32) * (1 - alpha) * 2
+                out += self.luminance(ref_img)[..., None] * np.array(OVERLAY_OTHER_COLOR, np.float32) * (1 - alpha) * 2
             if cur_img is not None:
-                out += self.luminance(cur_img)[..., None] * np.array([1, 0, 1], np.float32) * alpha * 2
+                out += self.luminance(cur_img)[..., None] * np.array(OVERLAY_THIS_COLOR, np.float32) * alpha * 2
         else:
             out = np.zeros((vh, vw, 3), np.float32)
             rc = self.colorize(ref_img) if ref_img is not None else None
@@ -2778,6 +2931,7 @@ class Aligner:
         self.button_cancel.config(state="normal")
         self.update_cursor()
         self.var_status.set(f"Exporting to {out} ...")
+        self.export_progress = ExportProgressDialog(self, out)
 
         def progress(i, n, name):
             self.msgs.put(("progress", (i, n, f"Exporting: {name} ({i + 1} of {n})...")))
@@ -2797,6 +2951,9 @@ class Aligner:
         threading.Thread(target=work, daemon=True).start()
 
     def export_finished(self, out, error, seconds):
+        if getattr(self, "export_progress", None) is not None:
+            self.export_progress.close()
+            self.export_progress = None
         self.busy = False
         self.button_cancel.config(state="disabled")
         self.update_cursor()
@@ -2819,8 +2976,8 @@ class Aligner:
             return
         self.progress.config(value=self.progress["maximum"])
         add_recent(out)   # the exported file joins the File > Open recent list (an existing entry just moves to the top)
-        self.var_status.set(f"Exported {os.path.basename(out)} in {seconds:.0f} s. "
-                            "Now editing the exported file.")
+        self.var_status.set(f"Exported {os.path.basename(out)} in {seconds:.0f} s. The window now shows the exported file; "
+                            "later exports build on it, and your original is unchanged.")
         # Continue from the exported file, so later exports only re-render later changes
         keep_previews, keep_view, cur = self.previews, self.view, self.cur
         try:

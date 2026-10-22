@@ -31,10 +31,17 @@
   JPX and case file; `SectionLoader.jpx_from_reconstruction_xml` then adds the JPX as usual with the XML/.h5 preset in `neuro_presets`.
   Placeholders (NeuroInfo's blank frames that keep the spacing even): in reconstruction.xml a contour with an EMPTY GUID, in the .h5 a gap
   ("Blank") in the OrderedSections chain, so `_load_neuroinfo` takes the order from the XML when it has one; they load as `Section.placeholder`
-  (no source, no outline, shown from the frame). One inserted in step 3 (right-click > "Insert placeholder before this section", JPX projects
-  only) is a section whose `frame` is `ns.PLACEHOLDER_FRAME_BASE` + n (kept in `project.jpx_order`, made again by `sp.apply_jpx_order`); export
+  (no source, no outline, shown from the frame). One inserted (right-click > "Insert placeholder before this section", in step 3 or the
+  aligner's Thumbnails window, any kind of project) is a section whose `frame` is `ns.PLACEHOLDER_FRAME_BASE` + n: for a JPX project kept in
+  `project.jpx_order` (made again by `sp.apply_jpx_order`), for a project of scans/images as an entry `[-1, n]` in `project.order` (`sp.
+  PLACEHOLDER_SLIDE`; `_order_items` gives it as `(None, n, "Placeholder")`, `build_stack` makes the section). Export
   writes a blank frame for it (`export_stack`), `write_jpx_like` can now add frames (header boxes copied, XMP entries added by
   `patch_xmp_frames`), and the alignment JSON written into the file gets `frame` = the section's place (the frames of the file written).
+  The aligner writes its order back into a scan project's `order` (`sp.order_from_stack`, from `save_project_state`), so step 3 shows what was
+  done there; a section is told by its source image AND its `origin_key` (`sp.polygon_of`), since images of one size can have identical outlines.
+  `order_editor.OrderEditor` is the shared editor of both order windows (grid, Reverse/Reset/Undo, sizes, right-click menu, history): each
+  window is its "host" (`order_caption`, `order_new_placeholder`, `order_reset_keys`, ... see the module's docstring). Deleting a section
+  takes it out of the order (JPX: `apply_jpx_order` drops the frames not named, counted in `stack.deleted`). The thumbnail size resets each run.
 
 # jpx_aligner / neuroinfo_stack
 

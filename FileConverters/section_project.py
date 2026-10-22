@@ -683,13 +683,67 @@ def outline_key(poly):
     return hashlib.sha1(np.round(np.asarray(poly, float), 1).tobytes()).hexdigest()[:12]
 
 
+def _norm(path):
+    return os.path.normcase(os.path.abspath(path)) if path else ""
+
+
+def polygon_index(project):
+    """What polygon_of needs: ({(slide's path, code of the outline): (slide index, outline index)}, {code: [(slide index, outline index)]}).
+    Outlines of different slides can be identical (images of one size, each outlined whole), so the slide takes part in telling them apart."""
+    exact, loose = {}, {}
+    for si, slide in enumerate(project.slides):
+        for pi, poly in enumerate(slide.polygons):
+            code = outline_key(poly)
+            exact.setdefault((_norm(slide.path), code), (si, pi))
+            loose.setdefault(code, []).append((si, pi))
+    return exact, loose
+
+
+def polygon_of(index, section):
+    """(slide index, outline index) of the project's outline that a section was made from (by its source image and its origin_key), or None."""
+    exact, loose = index
+    hit = exact.get((_norm(section.source_path), section.origin_key))
+    if hit is not None:
+        return hit
+    candidates = loose.get(section.origin_key, [])
+    return candidates[0] if len(candidates) == 1 else None
+
+
+PLACEHOLDER_SLIDE = -1     # in a project's order, an entry [-1, k] is a placeholder (a blank section, number k) instead of an outline [slide, outline]
+
+
 def _order_items(project):
-    """[(slide, outline in slide pixels, name)] of the project's sections in their order."""
+    """[(slide, outline in slide pixels, name)] of the project's sections in their order; a placeholder is (None, its number, "Placeholder")."""
     items = []
     for si, pi in (project.order or project.default_order()):
+        if si == PLACEHOLDER_SLIDE:
+            items.append((None, pi, "Placeholder"))
+            continue
         slide = project.slides[si]
         items.append((slide, slide.polygons[pi], f"{os.path.splitext(os.path.basename(slide.path))[0]} #{pi + 1}"))   # (# is the outline's number in step 1, whatever order it ends up in)
     return items
+
+
+def order_from_stack(project, stack):
+    """The project's order (entries [slide, outline], [-1, k] for a placeholder) that the sections of `stack` are in now, so that what is done in
+    the alignment tool (a placeholder inserted, sections moved or deleted) is what step 3 shows; None for a JPX project (which keeps frames),
+    or when a section cannot be told (then the order stays as the project has it). Needs the outlines written back first
+    (write_back_outlines), since a section is told by the code of the outline it came from."""
+    if project.is_jpx:
+        return None
+    index = polygon_index(project)
+    order = []
+    for sec in stack.sections:
+        if sec.placeholder:
+            if sec.frame < ns.PLACEHOLDER_FRAME_BASE:
+                return None
+            order.append((PLACEHOLDER_SLIDE, sec.frame - ns.PLACEHOLDER_FRAME_BASE))
+        else:
+            hit = polygon_of(index, sec) if sec.origin_key else None
+            if hit is None:
+                return None
+            order.append(hit)
+    return order or None
 
 
 def match_alignment(project):
@@ -711,6 +765,8 @@ def match_alignment(project):
     assign, taken = {}, set()
     groups = {}
     for n, (slide, poly, _) in enumerate(items):
+        if slide is None:
+            continue                                         # (a placeholder: nothing to match)
         groups.setdefault(os.path.basename(slide.path).lower(), []).append(n)
     for base, news in groups.items():
         cand = [i for i, (b, p) in enumerate(olds) if p is not None and (b == base or b.startswith(os.path.splitext(base)[0]))]
@@ -740,7 +796,7 @@ def match_alignment(project):
                 assign[n] = i
                 taken.add(i)
     dropped = [i for i in range(len(olds)) if i not in taken]
-    return assign, dropped, [n for n in range(len(items)) if n not in assign]
+    return assign, dropped, [n for n in range(len(items)) if n not in assign and items[n][0] is not None]
 
 
 def apply_jpx_order(stack, frames):
@@ -791,17 +847,14 @@ def write_back_outlines(project, stack):
     the caller then saves the project (its alignment_key must be made again: the fingerprint changes with the outlines)."""
     if project.is_jpx:
         return 0
-    by_key = {}
-    for slide in project.slides:
-        for pi, poly in enumerate(slide.polygons):
-            by_key.setdefault(outline_key(poly), (slide, pi))
+    index = polygon_index(project)
     replaced = 0
     for sec in stack.sections:
-        hit = by_key.get(sec.origin_key) if sec.origin_key else None
+        hit = polygon_of(index, sec) if sec.origin_key else None
         P = np.asarray(sec.case_points, float).reshape(-1, 2)
         if hit is None or len(P) < 3:
             continue
-        slide, pi = hit
+        slide, pi = project.slides[hit[0]], hit[1]
         k = slide_pixel_um(slide)
         if k <= 0:
             continue
@@ -821,8 +874,10 @@ def reuse_info(project, stack):
     reuse_order."""
     if project.is_jpx:
         return {"jpx": os.path.abspath(project.jpx_path)}
-    polys = [np.asarray(p, float).copy() for _, p, _ in _order_items(project)]
-    return {"snap": polys, "keys": [outline_key(p) for p in polys], "pixel_um": stack.pixel_um}
+    outlines = [(slide, np.asarray(p, float).copy()) for slide, p, _ in _order_items(project) if slide is not None]
+    polys = [p for _, p in outlines]
+    return {"snap": polys, "keys": [outline_key(p) for p in polys], "paths": [_norm(slide.path) for slide, _ in outlines],
+            "pixel_um": stack.pixel_um}
 
 
 def reuse_order(info, project, live_stack, new_stack):
@@ -841,23 +896,38 @@ def reuse_order(info, project, live_stack, new_stack):
         return None
     snap, keys = info["snap"], info["keys"]
     items = _order_items(project)
-    if len(items) != len(snap):
+    outlines = [item for item in items if item[0] is not None]       # (the placeholders are found by their number below)
+    if len(outlines) != len(snap):
         return None
+    paths = info.get("paths") or [None] * len(snap)
     cents = np.array([p.mean(0) for p in snap]) if snap else np.zeros((0, 2))
     taken, chosen = set(), []
-    for _, poly, _ in items:
+    for slide, poly, _ in outlines:
         poly = np.asarray(poly, float)
         match = None
         for j in np.flatnonzero(np.abs(cents - poly.mean(0)).max(axis=1) < 1.0):
-            if int(j) not in taken and snap[j].shape == poly.shape and np.allclose(snap[j], poly, atol=0.02):
+            if int(j) not in taken and paths[j] in (None, _norm(slide.path)) and snap[j].shape == poly.shape \
+                    and np.allclose(snap[j], poly, atol=0.02):
                 match = int(j)
                 break
         if match is None:
             return None
         taken.add(match)
         chosen.append(match)
-    by_key = {s.origin_key: s for s in live_stack.sections if s.origin_key}
-    ordered = [by_key[keys[j]] for j in chosen if keys[j] in by_key]
+    by_key = {(_norm(s.source_path), s.origin_key): s for s in live_stack.sections if s.origin_key}
+    live_placeholders = {s.frame: s for s in live_stack.sections if s.placeholder}
+    ordered, next_outline = [], 0
+    for slide, number, _ in items:
+        if slide is None:
+            section = live_placeholders.get(ns.PLACEHOLDER_FRAME_BASE + number)
+            if section is None:
+                return None                  # (a placeholder inserted in step 3 since: this window's stack lacks it, so it is made again)
+            ordered.append(section)
+        else:
+            j = chosen[next_outline]
+            next_outline += 1
+            if (paths[j] or _norm(slide.path), keys[j]) in by_key:
+                ordered.append(by_key[(paths[j] or _norm(slide.path), keys[j])])
     return ordered or None
 
 
@@ -892,14 +962,17 @@ def build_stack(project, margin=0.2):
     if any(len(infos[s.path].channels) != len(first.channels) for s in project.slides):
         raise ValueError("The slides have different numbers of channels, so their sections can't go in one stack.")
     items = _order_items(project)
-    if not items:
+    if not any(slide is not None for slide, _, _ in items):
         raise ValueError("There are no section outlines.")
     # section outlines in the scan's own um (y up, as NeuroInfo keeps them), whatever the slide's pixel size
     pts = []
     for slide, poly, _ in items:
+        if slide is None:
+            pts.append(None)                         # (a placeholder has no outline)
+            continue
         k = px_of(slide)
         pts.append(np.column_stack([poly[:, 0] * k, -poly[:, 1] * k]))
-    extent = max(max(np.ptp(p[:, 0]), np.ptp(p[:, 1])) for p in pts)
+    extent = max(max(np.ptp(p[:, 0]), np.ptp(p[:, 1])) for p in pts if p is not None)
     old = project.alignment
     assign = match_alignment(project)[0] if old else {}
     if old:
@@ -912,6 +985,9 @@ def build_stack(project, margin=0.2):
     stack.unsaved = True
     centre = np.array([cw / 2 * px, -ch / 2 * px])
     for n, ((slide, poly, name), p) in enumerate(zip(items, pts)):
+        if slide is None:                            # (a placeholder: its blank frame is written when the stack is exported)
+            stack.sections.append(ns.placeholder_section(n, frame=ns.PLACEHOLDER_FRAME_BASE + poly))
+            continue
         c = polygon_centroid(p)
         sec = ns.Section(n, name, slide.path, p, np.eye(2), centre - c, pivot_src=c,
                          czi_origin=None if is_jp2(slide.path) else (0.0, 0.0), origin_key=outline_key(poly))

@@ -4,8 +4,8 @@ REM Finds Python (installing Python 3.13 first if there is none): see ensure_pyt
 REM Missing libraries are installed automatically on first run.
 setlocal
 cd /d "%~dp0"
-title Section alignment
-echo ==== Section alignment: step 1 load/detect, step 2 align ====
+title Steps 1-3, brain assembler
+echo ==== Brain assembler: step 1 load/detect, step 2 detect outlines, step 3 order ====
 echo.
 
 call "%~dp0..\ensure_python.bat"

@@ -6,3 +6,5 @@ __pycache__/
 *.pyc
 .idea/
 .vscode/
+# Private Python environment made by ensure_python.bat
+.venv/

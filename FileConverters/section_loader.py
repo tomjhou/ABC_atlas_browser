@@ -30,6 +30,7 @@ import neuroinfo_dialogs
 import neuroinfo_stack as ns
 import section_project as sp
 from section_order import OrderGrid, THUMB_W, THUMB_H, CELL_PAD
+from order_editor import OrderEditor, placeholder_image
 from tooltip import Tooltip
 
 STAGES = ("Load slides", "Detect outlines", "Order sections", "Edit outlines and alignment")
@@ -855,7 +856,7 @@ class SectionLoader:
         tree = ttk.Treeview(dlg, columns=cols, show="headings", selectmode="browse", height=min(max(len(paths), 4), 12))
         for c, t, w, a in (("name", "Project", 280, "w"), ("sections", "Sections", 110, "e"), ("folder", "Folder", 400, "w"), ("when", "Last saved", 190, "w")):
             tree.heading(c, text=t)
-            tree.column(c, width=w, anchor=a)
+            tree.column(c, width=w, anchor=a, stretch=c in ("name", "folder"))   # (a wider window widens only Project and Folder)
         # The window comes up at once, from the names alone: reading each project file for its date and section count can take a while (the files
         # are often on a network drive, and a big project is a big file), so that is filled in, row by row, by a thread.
         for i, p in enumerate(paths):
@@ -1922,6 +1923,8 @@ class SectionLoader:
                 for n, q in enumerate(polys, 1):
                     pts = np.asarray(q, float) * f
                     cv2.polylines(base, [np.round(pts).astype(np.int32)], True, (255, 212, 0), 1, cv2.LINE_AA)
+                    if len(polys) < 2:
+                        continue                     # (a lone outline needs no number: a 1 on every image looks odd)
                     # the outline's number, as in the single-image view, at its centre (its size follows the outline's)
                     scale = float(np.clip(np.sqrt(abs(sp.signed_area(pts))) / 70, 0.35, 0.9))
                     thick = 1 if scale < 0.6 else 2
@@ -2033,11 +2036,13 @@ class SectionLoader:
                 color = SELECT_COLOR if sel else OUTLINE_COLOR
                 c.create_polygon(*pts.ravel(), outline=color, fill="", width=3 if sel else 2)
                 cx, cy = self.to_canvas(sp.polygon_centroid(p))
-                c.create_text(cx, cy, text=str(i + 1), fill=color, font=("Segoe UI", 16, "bold"))
+                lone = len(self.polys.get(self.cur, [])) < 2      # (an image with just one outline: no number, a 1 on every image looks odd)
+                if not lone:
+                    c.create_text(cx, cy, text=str(i + 1), fill=color, font=("Segoe UI", 16, "bold"))
                 sx, sy = self.to_slide(sp.polygon_centroid(p))
                 scene = sp.scene_of(boxes, sx, sy) + 1
                 if scene != i + 1:     # (the number is the place in the scene order; where it differs, say which scene it is in)
-                    c.create_text(cx, cy + 20, text=f"scene {scene}", fill=color, font=("Segoe UI", 9))
+                    c.create_text(cx, cy if lone else cy + 20, text=f"scene {scene}", fill=color, font=("Segoe UI", 9))
         if self.mode == "draw" and self.draw_pts:
             pts = self.to_canvas(self.draw_pts)
             if len(pts) > 1:
@@ -2113,22 +2118,20 @@ class SectionLoader:
 
     def build_order(self):
         f = ttk.Frame(self.body)
-        self.order_history = []                       # the orders of the sections before each change, for Undo (see push_order_history)
         top = ttk.Frame(f, padding=(12, 8))
         top.pack(fill=tk.X)
         self.var_order_text = tk.StringVar(f, "")
+        # the grid and what goes with it (Reverse, Reset, Undo, the sizes, the right-click menu) are the shared editor's: see order_editor.py
+        self.editor = OrderEditor(f, self, enabled=lambda: self.stage == 2,
+                                  after_draw=lambda: self.var_order_text.set(f"{len(self.grid.order)} section(s). Drag a picture to reorder."))
+        self.grid = self.editor.grid
         help_label = ttk.Label(top, textvariable=self.var_order_text, foreground="gray30")
-        ttk.Button(top, text="Reverse order", command=self.reverse_order).pack(side=tk.RIGHT)
+        self.editor.reverse_button(top).pack(side=tk.RIGHT)
         self.var_spacing = tk.StringVar(f, "")
         ttk.Entry(top, textvariable=self.var_spacing, width=7).pack(side=tk.RIGHT, padx=(4, 18))
         ttk.Label(top, text="Distance between adjacent sections (\u00b5m):").pack(side=tk.RIGHT)
-        reset = ttk.Button(top, text="Reset order", command=self.reset_order)
-        reset.pack(side=tk.RIGHT, padx=8)
-        Tooltip(reset, self.reset_order_help, wraplength=340)
-        self.btn_undo_order = ttk.Button(top, text="Undo", command=self.undo_order, state="disabled")
-        self.btn_undo_order.pack(side=tk.RIGHT)
-        Tooltip(self.btn_undo_order, "Undoes the last change of the order: a move, a deleted section, an inserted placeholder, Reverse order "
-                                     "or Reset order (Ctrl+Z does the same).", wraplength=300)
+        self.editor.reset_button(top).pack(side=tk.RIGHT, padx=8)
+        self.editor.undo_button(top).pack(side=tk.RIGHT)
         self.var_fit_thumbs = tk.BooleanVar(f, True)
         ttk.Checkbutton(top, text="Scale sections to fit thumbnails", variable=self.var_fit_thumbs,
                         command=self.on_fit_thumbs).pack(side=tk.RIGHT, padx=8)
@@ -2143,27 +2146,8 @@ class SectionLoader:
             b = ttk.Radiobutton(bright, text=text, value=value, variable=self.var_bright, style="Toolbutton", command=self.on_bright)
             b.pack(side=tk.LEFT, padx=1)
             self.bright_buttons.append(b)
-        # the size of the thumbnails: medium is the usual size, small half of it, large twice
-        self.var_thumb_size = tk.StringVar(f, "medium")
-        sizes = ttk.Frame(top)
-        sizes.pack(side=tk.RIGHT, padx=8)
-        ttk.Label(sizes, text="Thumbnails:").pack(side=tk.LEFT, padx=(0, 4))
-        for text, value in (("Small", "small"), ("Medium", "medium"), ("Large", "large")):
-            ttk.Radiobutton(sizes, text=text, value=value, variable=self.var_thumb_size, style="Toolbutton",
-                            command=self.on_thumb_size).pack(side=tk.LEFT, padx=1)
+        self.editor.size_buttons(top).pack(side=tk.RIGHT, padx=8)
         help_label.pack(side=tk.LEFT)      # (packed last: if the window is narrow it is the help text that is cut, not the buttons)
-
-        def caption(key, i):
-            if self.project.is_jpx:                  # (key: (0, frame): #, the section's place in the JPX as it was)
-                sec = self.jpx_by_frame.get(key[1])
-                if sec is not None and sec.placeholder:      # (one NeuroInfo made is a frame of the JPX; one made here is new)
-                    return f"{i + 1}   placeholder", "new" if ns.is_new_placeholder(sec) else f"#{key[1] + 1}"
-                return f"{i + 1}   {os.path.splitext(sec.name)[0][-9:] if sec else ''}", f"#{key[1] + 1}"
-            slide = self.project.slides[key[0]]
-            return f"{i + 1}   {os.path.splitext(os.path.basename(slide.path))[0][-9:]}", f"#{key[1] + 1}"   # (#: its outline's number in tab 2)
-
-        self.grid = OrderGrid(f, caption, on_double=self.order_double, enabled=lambda: self.stage == 2, on_context=self.order_context, before_change=self.push_order_history,
-                              after_draw=lambda: self.var_order_text.set(f"{len(self.grid.order)} section(s). Drag a picture to reorder."))
         self.grid.frame.pack(fill=tk.BOTH, expand=True)
         return f
 
@@ -2187,15 +2171,15 @@ class SectionLoader:
 
     def enter_order(self):
         proj = self.project
-        self.order_history = []
-        self.update_undo_button()
+        self.editor.clear_history()
         if proj.is_jpx:
             self.enter_order_jpx()
             return
         for b in getattr(self, "bright_buttons", ()):
             b.state(["disabled"])                    # (a scan's thumbnails come from one overview of the slide)
         key = proj.polygons_key()
-        if proj.order and self.order_key == key and all(si < len(proj.slides) and pi < len(proj.slides[si].polygons) for si, pi in proj.order):
+        if proj.order and self.order_key == key and all(si == -1 or (si < len(proj.slides) and pi < len(proj.slides[si].polygons))
+                                                         for si, pi in proj.order):
             self.order = list(proj.order)
         else:
             self.order = proj.default_order()
@@ -2206,7 +2190,7 @@ class SectionLoader:
         self.draw_order()
 
     def make_thumbs(self):
-        need = {(si, pi) for si, pi in self.order}
+        need = {(si, pi) for si, pi in self.order if si >= 0}
         paths = {self.project.slides[si].path for si, _ in need if self.project.slides[si].path not in self.ov}
         for p in paths:
             self.want(p, "gray", urgent=True)
@@ -2217,7 +2201,7 @@ class SectionLoader:
 
     def finish_thumbs(self):
         """The ordering stage is waiting for pictures: once all are here, the thumbnails are made."""
-        if all(self.project.slides[si].path in self.ov for si, _ in self.order):
+        if all(self.project.slides[si].path in self.ov for si, _ in self.order if si >= 0):
             self.var_status.set("")
             self.build_thumbs()
             self.draw_order()
@@ -2234,13 +2218,9 @@ class SectionLoader:
         scans, whose thumbnails have no such setting."""
         return self.bright_mode if self.project.is_jpx else None
 
-    def on_thumb_size(self):
-        """Small / Medium / Large thumbnails: half, one and two times the usual size. A JPX's pictures are read again only when they must be
-        sharper (large); the thumbnails on screen stay until each is replaced by one of the new size."""
-        scale = {"small": 0.5, "medium": 1.0, "large": 2.0}[self.var_thumb_size.get()]
-        if scale == self.grid.scale:
-            return
-        self.grid.set_scale(scale)
+    def order_size_changed(self, scale):
+        """Small / Medium / Large thumbnails (half, one and two times the usual size): made again at the new size. A JPX's pictures are read
+        again only when they must be sharper (large); the thumbnails on screen stay until each is replaced by one of the new size."""
         if self.project.is_jpx:
             target = 512 if scale > 1.0 else 256
             if target != self.jpx_target:
@@ -2269,6 +2249,8 @@ class SectionLoader:
         fit = self.var_fit_thumbs.get()
         items = []                                   # (key, crop box a, b, outline in overview pixels, um per overview pixel)
         for si, pi in self.order:
+            if si < 0:
+                continue                             # (a placeholder: its thumbnail is made below)
             s = self.project.slides[si]
             if s.path not in self.ov:
                 continue
@@ -2296,6 +2278,9 @@ class SectionLoader:
             rgb = cv2.resize(crop3, (max(int(crop.shape[1] * f), 1), max(int(crop.shape[0] * f), 1)), interpolation=cv2.INTER_AREA)
             cv2.polylines(rgb, [((poly - a) * f).astype(np.int32)], True, (255, 212, 0), 1, cv2.LINE_AA)
             self.thumbs[key] = ImageTk.PhotoImage(Image.fromarray(rgb), master=self.root)
+        for key in self.order:                       # (the placeholders: a grey box)
+            if key[0] < 0 and key not in self.thumbs:
+                self.thumbs[key] = ImageTk.PhotoImage(Image.fromarray(placeholder_image(self.grid.tw, self.grid.th)), master=self.root)
 
     # ---- the ordering tab of a JPX project: the thumbnails come from the JPX's own frames, only those in view (and a few rows more), a few at a
     # time in the background, and are kept on disk
@@ -2413,8 +2398,7 @@ class SectionLoader:
         if not proj.jpx_order:        # (a saved order names the sections there are: any it leaves out were deleted)
             order += [s.frame for s in stack.sections if s.frame not in named]
         self.order = [(0, f) for f in order]
-        self.order_history = []
-        self.update_undo_button()
+        self.editor.clear_history()
         if proj.z_spacing_um <= 0 and stack.z_spacing_um > 0:
             self.var_spacing.set(f"{stack.z_spacing_um:g}")
         self.draw_order()
@@ -2495,11 +2479,7 @@ class SectionLoader:
         img = cv2.resize(rgb, (max(int(w * f), 1), max(int(h * f), 1)), interpolation=cv2.INTER_AREA)
         section = self.jpx_by_frame.get(key[1])
         if section is not None and getattr(section, "placeholder", False):
-            img = np.full((self.grid.th, self.grid.tw, 3), 58, np.uint8)           # (a grey box saying what it is)
-            scale = max(self.grid.tw / 190, 0.4)
-            (tw_, th_), _ = cv2.getTextSize("Placeholder", cv2.FONT_HERSHEY_SIMPLEX, 0.6 * scale, 1)
-            cv2.putText(img, "Placeholder", ((img.shape[1] - tw_) // 2, (img.shape[0] + th_) // 2), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6 * scale, (200, 200, 200), 1, cv2.LINE_AA)
+            img = placeholder_image(self.grid.tw, self.grid.th)                     # (a grey box saying what it is)
         elif len(poly):
             cv2.polylines(img, [(poly * f).astype(np.int32)], True, (255, 212, 0), 1, cv2.LINE_AA)
         self.thumbs[key] = ImageTk.PhotoImage(Image.fromarray(img), master=self.root)
@@ -2509,89 +2489,59 @@ class SectionLoader:
     def draw_order(self):
         self.grid.draw()
 
-    def order_context(self, key, i, event):
-        """Right-click on a thumbnail: a menu of what can be done with that section: delete it, or (JPX projects) insert a placeholder before it."""
-        menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label="Delete section", command=lambda: self.delete_section(i))
-        if self.project.is_jpx and self.jpx_stack is not None:
-            menu.add_command(label="Insert placeholder before this section", command=lambda: self.insert_placeholder(i))
-        else:
-            menu.add_command(label="Insert placeholder before this section (JPX projects only)", state="disabled")
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
+    # ---- what the shared editor (order_editor.py) asks of this window
 
-    def push_order_history(self, snapshot=None):
-        """Remember the order as it is (or `snapshot`) before a change, so that Undo can bring it back."""
-        self.order_history.append(list(self.order if snapshot is None else snapshot))
-        del self.order_history[:-200]
-        self.update_undo_button()
+    def order_status(self, text):
+        self.var_status.set(text)
 
-    def update_undo_button(self):
-        button = getattr(self, "btn_undo_order", None)
-        if button is not None:
-            button.state(["!disabled"] if self.order_history else ["disabled"])
+    def order_caption(self, key, i):
+        if key[0] < 0:                               # (a placeholder in a scan project: key (-1, k))
+            return f"{i + 1}   placeholder", "new"
+        if self.project.is_jpx:                      # (key: (0, frame): #, the section's place in the JPX as it was)
+            sec = self.jpx_by_frame.get(key[1])
+            if sec is not None and sec.placeholder:      # (one NeuroInfo made is a frame of the JPX; one made here is new)
+                return f"{i + 1}   placeholder", "new" if ns.is_new_placeholder(sec) else f"#{key[1] + 1}"
+            return f"{i + 1}   {os.path.splitext(sec.name)[0][-9:] if sec else ''}", f"#{key[1] + 1}"
+        slide = self.project.slides[key[0]]
+        return f"{i + 1}   {os.path.splitext(os.path.basename(slide.path))[0][-9:]}", f"#{key[1] + 1}"   # (#: its outline's number in tab 2)
 
-    def undo_order(self):
-        """Undo: the order as it was before the last change (a move, a deleted section, a placeholder, Reverse, Reset)."""
-        if not self.order_history:
+    def order_new_placeholder(self, position):
+        """A placeholder, a blank section, to go in the order: in a JPX project a section of the stack with a frame number of its own (its blank
+        frame is written when the stack is exported); in a project of scans or images a key (-1, number) that the project's order keeps."""
+        if self.project.is_jpx:
+            stack = self.jpx_stack
+            if stack is None:
+                return None
+            used = [s.frame for s in stack.sections if s.frame >= ns.PLACEHOLDER_FRAME_BASE]
+            frame = max(used + [ns.PLACEHOLDER_FRAME_BASE - 1]) + 1
+            section = ns.placeholder_section(len(stack.sections), frame=frame)
+            stack.sections.append(section)
+            self.jpx_by_frame[frame] = section
+            return (0, frame)
+        used = [k for si, k in self.order if si < 0]
+        return (-1, max(used + [-1]) + 1)
+
+    def order_restore(self, keys):
+        """Undo is about to put the order `keys` back: a placeholder that Reset order took away of a JPX's stack is made again."""
+        if not (self.project.is_jpx and self.jpx_stack is not None):
             return
-        snapshot = self.order_history.pop()
-        if self.project.is_jpx and self.jpx_stack is not None:
-            for key in snapshot:        # (a placeholder that Reset order took away comes back)
-                if key[1] >= ns.PLACEHOLDER_FRAME_BASE and not any(s.frame == key[1] for s in self.jpx_stack.sections):
-                    self.jpx_stack.sections.append(ns.placeholder_section(len(self.jpx_stack.sections), frame=key[1]))
-            self.jpx_by_frame = {s.frame: s for s in self.jpx_stack.sections}
-        self.order = snapshot
-        self.grid.selected = None
-        self.update_undo_button()
-        self.draw_order()
-        self.var_status.set("Undone.")
+        for key in keys:
+            if key[1] >= ns.PLACEHOLDER_FRAME_BASE and not any(s.frame == key[1] for s in self.jpx_stack.sections):
+                self.jpx_stack.sections.append(ns.placeholder_section(len(self.jpx_stack.sections), frame=key[1]))
+        self.jpx_by_frame = {s.frame: s for s in self.jpx_stack.sections}
 
     def undo_any(self, event=None):
         """Ctrl+Z: undoes the last change of the order in step 3, of the outlines in step 2."""
         if event is not None and isinstance(event.widget, (tk.Entry, ttk.Entry)):
             return
         if self.stage == 2:
-            self.undo_order()
+            self.editor.undo(event)
         else:
             self.undo_last()
 
-    def delete_section(self, position):
-        """Take the section at `position` out of the order: it is not in the stack that goes on to the alignment tool (Undo, or Reset order,
-        brings it back; its outline or frame is not touched)."""
-        if not 0 <= position < len(self.order):
-            return
-        if len(self.order) <= 1:
-            messagebox.showinfo("Delete section", "At least one section has to stay.", parent=self.root)
-            return
-        self.push_order_history()
-        self.order.pop(position)
-        self.grid.selected = None
-        self.draw_order()
-        self.var_status.set(f"Deleted section {position + 1}; the sections after it moved up. Undo brings it back.")
-
-    def insert_placeholder(self, position):
-        """A blank frame (NeuroInfo's "placeholder", which keeps the spacing even where a section is missing) before the section at
-        `position`. It is a section of the stack with no image and no outline; its blank frame is written when the stack is exported."""
-        stack = self.jpx_stack
-        if stack is None or not 0 <= position <= len(self.order):
-            return
-        used = [s.frame for s in stack.sections if s.frame >= ns.PLACEHOLDER_FRAME_BASE]
-        frame = max(used + [ns.PLACEHOLDER_FRAME_BASE - 1]) + 1
-        section = ns.placeholder_section(len(stack.sections), frame=frame)
-        stack.sections.append(section)
-        self.jpx_by_frame[frame] = section
-        self.push_order_history()
-        self.order.insert(position, (0, frame))
-        self.grid.selected = (0, frame)
-        self.draw_order()
-        self.var_status.set(f"Placeholder inserted before section {position + 2}: its blank frame is written when the stack is exported.")
-
     def order_double(self, key, i):
         """Double-click on a thumbnail: back to the outlines tab, at that section's image with its outline selected."""
-        if self.busy or self.project.is_jpx:         # (a JPX has no outlines tab)
+        if self.busy or self.project.is_jpx or key[0] < 0:         # (a JPX has no outlines tab, and a placeholder no outline)
             return
         si, pi = key
         self.project.order = list(self.order)         # (the order made so far is kept for when the tab is entered again)
@@ -2602,33 +2552,27 @@ class SectionLoader:
             self.update_edit_help()
             self.redraw()
 
-    def reverse_order(self):
-        self.grid.reverse()
-
-    def reset_order_help(self):
+    def order_reset_help(self):
         """What Reset order does, for its tool tip (it depends on the kind of project and, for scans, on how step 2 numbers the outlines)."""
         if self.project.is_jpx:
             return ("Puts the sections back in the order of the frames in the JPX file, as it was when the file was opened. "
-                    "Any order made by dragging is lost, and so are the placeholders inserted here.")
+                    "Any order made by dragging is lost, and so are the placeholders inserted here; deleted sections come back.")
         how = {"rows": "across the image, then down (by rows)", "columns": "down the image, then across (by columns)",
                "scene": "by scene number, the order of the scenes in the .czi"}.get(self.project.numbering, self.project.numbering)
         return ("Puts the sections back in the order they were numbered in step 2: the images in the order of the list in step 1, and "
                 f"within each image the outlines in the order chosen under \"Number the outlines\" in step 2, now: {how}. "
-                "Any order made by dragging is lost.")
+                "Any order made by dragging is lost, and so are the placeholders inserted here; deleted sections come back.")
 
-    def reset_order(self):
-        self.push_order_history()
+    def order_reset_keys(self):
+        """The order Reset puts back."""
         if self.project.is_jpx:
             if self.jpx_stack is not None:        # (placeholders inserted here are not in the JPX: they go)
                 self.jpx_stack.sections[:] = [s for s in self.jpx_stack.sections if not ns.is_new_placeholder(s)]
-                for k, s in enumerate(self.jpx_stack.sections):
-                    s.index = k
-                self.jpx_by_frame = {s.frame: s for s in self.jpx_stack.sections}
-            self.grid.selected = None
-            self.order = [(0, f) for f in sorted(self.jpx_by_frame)]       # (the JPX's own order)
-        else:
-            self.order = self.project.default_order()
-        self.draw_order()
+                for k, sec in enumerate(self.jpx_stack.sections):
+                    sec.index = k
+                self.jpx_by_frame = {sec.frame: sec for sec in self.jpx_stack.sections}
+            return [(0, f) for f in sorted(self.jpx_by_frame)]                 # (the JPX's own order)
+        return self.project.default_order()
 
     # ------------------------------------------------------------------ done
 

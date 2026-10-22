@@ -16,6 +16,9 @@ taxonomy level or gene expression (including the imputed gene dataset).
    by hand. To install everything up front instead, run `python-install.bat`
    from the same environment, or set `AUTO_INSTALL_LIBRARIES = False` in
    `ABC_atlas_browser.py` to turn automatic installation off.
+   The `RUN_*.bat` files do this inside a private virtual environment, the
+   `.venv` folder next to them (shared by all of them, made on first run; delete
+   it to start afresh), so the computer's own Python is left alone.
 
 ## Running
 
