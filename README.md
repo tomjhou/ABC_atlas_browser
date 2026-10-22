@@ -5,6 +5,18 @@ Interactive browser for the Allen Brain Cell (ABC) atlas MERFISH dataset
 of the selected cells, and explore it alongside spatial section maps, colored by
 taxonomy level or gene expression (including the imputed gene dataset).
 
+## Section alignment program for Windows (no Python needed)
+
+The section assembler and aligner (`FileConverters/`: find sections on Zeiss .czi slide scans, put them in order, and align NeuroInfo
+serial-section stacks) is also available as a Windows program with everything inside it, so nothing has to be installed:
+
+1. Download [SectionAssembler-windows.zip](https://github.com/tomjhou/Brain-anatomy-tools/releases/latest/download/SectionAssembler-windows.zip)
+   (always the newest version; older ones and their notes are on the [Releases](https://github.com/tomjhou/Brain-anatomy-tools/releases) page).
+2. Unzip it anywhere and run `SectionAssembler\SectionAssembler.exe`.
+
+Windows may warn "Windows protected your PC" the first time, because the program is not code-signed: choose More info, then Run anyway.
+To update, download the zip again. `SHA256SUMS.txt` on the release page lets you check the download. How it is built: `packaging/README.md`.
+
 ## Setup
 
 1. Install Python.

@@ -2398,6 +2398,14 @@ class SectionLoader:
         if not proj.jpx_order:        # (a saved order names the sections there are: any it leaves out were deleted)
             order += [s.frame for s in stack.sections if s.frame not in named]
         self.order = [(0, f) for f in order]
+        if proj.path and not proj.jpx_sections and self.order:
+            # (the project is being opened, and has no count of its sections yet: now that they are known, the list of recent projects can
+            # show it. Only this one value is written into the file.)
+            proj.jpx_sections = len(self.order)
+            try:
+                sp.record_jpx_sections(proj.path, proj.jpx_sections)
+            except (OSError, ValueError):
+                pass
         self.editor.clear_history()
         if proj.z_spacing_um <= 0 and stack.z_spacing_um > 0:
             self.var_spacing.set(f"{stack.z_spacing_um:g}")

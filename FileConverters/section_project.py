@@ -69,9 +69,30 @@ def count_sections(path):
         return None
 
 
+def jpx_frame_count(jpx_path):
+    """How many frames (sections) a JPX holds, counted from the headers of its boxes (the frames themselves are not read)."""
+    return sum(1 for b in ns.read_boxes(jpx_path) if b.kind == b"jp2c")
+
+
+def record_jpx_sections(project_path, count):
+    """Put the number of sections into a JPX project's file, if it has none yet, changing nothing else in it (the file is only read and
+    written again: it is not made from a project, so nothing the program does not know about is lost)."""
+    with open(project_path, encoding="utf-8") as f:
+        doc = json.load(f)
+    if doc.get("jpx_sections"):
+        return
+    doc["jpx_sections"] = int(count)
+    tmp = project_path + ".partial"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(doc, f, separators=(",", ":"))
+    os.replace(tmp, project_path)
+
+
 def sections_text(path):
-    """What the recent-projects list shows as a project's number of sections: the number, or, for a JPX project that has no count yet (it was
-    added but never got as far as the order), why not when its NeuroInfo files are missing ("No casefile", "No xml"), else blank."""
+    """What the recent-projects list shows as a project's number of sections: the number. For a JPX project that has none recorded (it was
+    added but never got as far as the order): the sections of its saved alignment, else why not when its NeuroInfo files are missing ("No
+    casefile", "No xml"), else the number of frames the JPX holds (counted here, which reads the file's box headers: the list asks from a
+    thread). Blank when it cannot be told."""
     n = count_sections(path)
     if n is not None:
         return n
@@ -79,15 +100,18 @@ def sections_text(path):
         with open(path, encoding="utf-8") as f:
             doc = json.load(f)
         slides = doc["slides"]
-        if len(slides) != 1 or not is_jpx(slides[0]["path"]) or doc.get("alignment"):
+        if len(slides) != 1 or not is_jpx(slides[0]["path"]):
             return ""
+        alignment = doc.get("alignment")
+        if alignment and alignment.get("sections"):
+            return len(alignment["sections"])
         jpx = slides[0]["path"]
         if not os.path.isabs(jpx):
             jpx = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(path)), jpx))
         check = ns.neuroinfo_check(jpx)
-        if check.get("state") != "missing":
-            return ""
-        return {("h5",): "No casefile", ("xml",): "No xml"}.get(tuple(check["missing"]), "No xml or casefile")
+        if check.get("state") == "missing":
+            return {("h5",): "No casefile", ("xml",): "No xml"}.get(tuple(check["missing"]), "No xml or casefile")
+        return jpx_frame_count(jpx) or ""
     except Exception:
         return ""
 

@@ -97,6 +97,13 @@ def ensure_packages(required=None, exit_on_failure=True):
     """Install any missing packages ({import name: pip name}) into this
     interpreter's environment."""
     required = required or REQUIRED_PACKAGES
+    if getattr(sys, "frozen", False):      # (the packaged program: its libraries are inside it, and there is no pip to install them with)
+        still = [pip for mod, pip in required.items() if importlib.util.find_spec(mod) is None]
+        if still and exit_on_failure:
+            sys.exit(f"This program is missing {', '.join(still)}: it was not packaged with it.")
+        if still:
+            raise ImportError(f"{', '.join(still)} is not part of this program.")
+        return
     missing = [pip for mod, pip in required.items() if importlib.util.find_spec(mod) is None]
     if not missing:
         return

@@ -1,0 +1,11 @@
+# The libraries of the packaged section assembler and aligner (FileConverters/SerialAssembler.py), as tested. The program installs missing
+# libraries itself when it runs from source; the packaged one has them inside, so they are pinned here to build the same thing each time.
+numpy==2.5.4
+opencv-python==5.0.0.93
+pillow==13.0.0
+imagecodecs==2026.10.10
+h5py==3.16.0
+czifile==2026.10.14
+rasterio==1.5.2
+psutil==7.2.2
+pyinstaller==6.22.3

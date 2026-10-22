@@ -8,3 +8,7 @@ __pycache__/
 .vscode/
 # Private Python environment made by ensure_python.bat
 .venv/
+
+# Packaging (see packaging/): what the build makes
+packaging/build/
+packaging/dist/
