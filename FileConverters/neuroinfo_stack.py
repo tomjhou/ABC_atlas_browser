@@ -220,6 +220,15 @@ def box_bytes(kind, payload):
     return struct.pack(">I4sQ", 1, kind, 16 + len(payload)) + payload
 
 
+def write_box(dst, kind, payload):
+    """box_bytes(kind, payload) written to `dst` without first making a second copy of the payload (a frame is tens of MB)."""
+    if 8 + len(payload) < 2 ** 32:
+        dst.write(struct.pack(">I4s", 8 + len(payload), kind))
+    else:
+        dst.write(struct.pack(">I4sQ", 1, kind, 16 + len(payload)))
+    dst.write(payload)
+
+
 def add_com_markers(codestream, comments):
     """Insert COM marker segments just before the first tile-part (SOT)."""
     pos = 2
@@ -2113,8 +2122,10 @@ def read_jp2_image(path):
         return imagecodecs.jpeg2k_decode(f.read(), numthreads=os.cpu_count() or 1)
 
 
-def render_section(section, stack, source=None, interpolation=cv2.INTER_LINEAR, use_edit=True):
-    """Full-resolution section image on the stack canvas (H x W x C)."""
+def render_section(section, stack, source=None, interpolation=cv2.INTER_LINEAR, use_edit=True, timings=None):
+    """Full-resolution section image on the stack canvas (H x W x C). `timings`, a dict, is given the seconds spent reading the source
+    ("read") and in placing it on the canvas ("warp") and blanking what is outside the outline ("mask")."""
+    t_start = time.time()
     offset = (0.0, 0.0)
     if source is None:
         if not section.source_path:
@@ -2127,6 +2138,7 @@ def render_section(section, stack, source=None, interpolation=cv2.INTER_LINEAR, 
             source = read_jp2_image(section.source_path)
     if source.ndim == 2:
         source = source[..., None]
+    t_read = time.time()
     R, t = section.effective() if use_edit else (section.R, section.t)
     M = canvas_to_source_matrix(R, t, stack.pixel_um)
     M[:, 2] += offset
@@ -2135,6 +2147,7 @@ def render_section(section, stack, source=None, interpolation=cv2.INTER_LINEAR, 
         out[..., c] = cv2.warpAffine(source[..., c], M, (stack.canvas_w, stack.canvas_h),
                                      flags=interpolation | cv2.WARP_INVERSE_MAP,
                                      borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    t_warp = time.time()
     if section.source_path.lower().endswith(".czi") and len(section.case_points) >= 3:
         # A slide scan holds more than one section (and debris); NeuroInfo's frames keep only what is inside the section's
         # outline, so everything outside the (possibly edited) outline is blanked here too.
@@ -2143,6 +2156,8 @@ def render_section(section, stack, source=None, interpolation=cv2.INTER_LINEAR, 
         cv2.fillPoly(mask, [np.column_stack([P[:, 0] / stack.pixel_um, -P[:, 1] / stack.pixel_um]).round().astype(np.int32)], 1)
         for c in range(out.shape[2]):      # (a mask, not out[mask == 0] = 0, which is slow on a canvas this big)
             out[..., c] = cv2.bitwise_and(out[..., c], out[..., c], mask=mask)
+    if timings is not None:
+        timings.update(read=t_read - t_start, warp=t_warp - t_read, mask=time.time() - t_warp)
     return out
 
 
@@ -2188,7 +2203,7 @@ def write_jpx_like(template_path, codestreams, out_path, extra_payloads=(), pixe
                     continue   # (the frames that were left out, and their header boxes)
                 if b.kind == b"jp2c":
                     cs = codestreams[i]
-                    dst.write(box_bytes(b"jp2c", cs() if callable(cs) else cs))
+                    write_box(dst, b"jp2c", cs() if callable(cs) else cs)
                     i += 1
                     continue
                 if b.kind == b"uuid" and read_payload(src, b, 16) == ALIGNER_UUID:
@@ -2280,6 +2295,52 @@ def write_jpx_new(codestreams, out_path, canvas_w, canvas_h, channel_info, pixel
         raise
 
 
+COPY_READERS = 8                # frames of the opened JPX read at the same time when they are copied unchanged: one read of a file on a network
+                                # share runs at about 4 MB/s here, and many at once at 20 to 30 MB/s in all
+COPY_AHEAD_BYTES = 1.5e9        # (at most this much of them is read ahead of the part of the file being written)
+
+
+class FramePrefetcher:
+    """Reads the frames that are copied unchanged out of the opened JPX, several at a time and ahead of the writing, so that the writing
+    does not wait for one read after another. The frames are `taken` in the order given; at most about COPY_AHEAD_BYTES of them are held
+    in memory (more than one only if they are smaller than that)."""
+
+    def __init__(self, path, boxes, readers=COPY_READERS, ahead_bytes=COPY_AHEAD_BYTES):
+        self.path = path
+        self.boxes = list(boxes)
+        self.ahead_bytes = ahead_bytes
+        self.pool = ThreadPoolExecutor(max_workers=max(1, readers), thread_name_prefix="jpx-frame-reader")
+        self.futures = {}          # position in `boxes` -> the Future that reads it
+        self.submitted = 0         # how many have been asked for
+        self.held = 0              # bytes of those asked for and not taken yet
+        self._top_up()
+
+    def _read(self, box):
+        with open(self.path, "rb") as f:        # (a file object of its own: they are read at the same time)
+            f.seek(box.payload_offset)
+            return f.read(box.payload_length)
+
+    def _top_up(self):
+        while self.submitted < len(self.boxes):
+            size = self.boxes[self.submitted].payload_length
+            if self.held and self.held + size > self.ahead_bytes:
+                break
+            self.futures[self.submitted] = self.pool.submit(self._read, self.boxes[self.submitted])
+            self.held += size
+            self.submitted += 1
+
+    def take(self, k):
+        """The k-th frame, once it has been read (they are taken in order; each is released from here as it is handed over)."""
+        data = self.futures.pop(k).result()
+        self.held -= self.boxes[k].payload_length
+        self._top_up()
+        return data
+
+    def close(self):
+        self.pool.shutdown(wait=False, cancel_futures=True)
+        self.futures.clear()
+
+
 EXPORT_PARALLEL = 1   # sections rendered at once. Measured on 6 sections of a 17664 px canvas: 1 -> 12.8 s each, 2 -> 11.7 s,
                       # 3 -> 20.8 s (the encoder already uses every processor, and memory bandwidth is the limit)
 
@@ -2314,6 +2375,16 @@ def export_stack(stack, out_path, quality_db=DEFAULT_QUALITY_DB, rerender_all=Fa
         raise ValueError("Some sections can't be rendered from their source images.")
     codestreams = []
     n_render = 0
+
+    def describe(sec):
+        """Which section this is, for the log: its number in the stack, its slide, and (for a slide scan) the scene it lies in (numbered
+        from 1, as in the aligner's list), since many sections share a slide."""
+        try:
+            scene = czi_scene_if_known(sec, stack)
+        except Exception:
+            scene = None
+        return f"section {sec.index + 1} of {len(stack.sections)} ({sec.name}" + (f", scene {scene + 1}" if scene is not None else "") + ")"
+
     workers = export_workers(stack, len(todo))
     threads = max(2, (os.cpu_count() or 4) // workers)   # (each encode gets its share of the processors)
 
@@ -2325,39 +2396,66 @@ def export_stack(stack, out_path, quality_db=DEFAULT_QUALITY_DB, rerender_all=Fa
         if progress is not None:
             progress(s.index, len(stack.sections), s.name)
         t0 = time.time()
-        img = render_section(s, stack)
+        timings = {}
+        img = render_section(s, stack, timings=timings)
+        t_enc = time.time()
         cs = encode_frame(img, quality_db, threads)
+        shape = img.shape
         del img
-        log(f"  {s.name}: re-rendered ({len(cs) / 1e6:.1f} MB, {time.time() - t0:.0f} s)")
+        log(f"  {describe(s)}: re-rendered ({len(cs) / 1e6:.1f} MB, {time.time() - t0:.0f} s: reading the source {timings.get('read', 0):.1f} s, "
+            f"placing it {timings.get('warp', 0):.1f} s, blanking outside the outline {timings.get('mask', 0):.1f} s, "
+            f"encoding the {shape[1]} x {shape[0]} px canvas {time.time() - t_enc:.1f} s; {time.time() - t_export:.0f} s since the start)")
         return cs
 
-    with (contextlib.nullcontext() if fresh else open(stack.jpx_path, "rb")) as fj, \
-            ThreadPoolExecutor(max_workers=workers) as pool:
-        jobs = {id(s): pool.submit(render, s) for s in todo}
-        try:
-            for s in stack.sections:
-                if stop_event is not None and stop_event.is_set():
-                    raise UserCanceled
-                if s not in todo:
-                    if progress is not None:
-                        progress(s.index, len(stack.sections), s.name)
-                    codestreams.append(read_payload(fj, frames[s.frame]))
-                    log(f"  {s.name}: unchanged, copied")
-                    continue
-                codestreams.append(jobs[id(s)].result())
-                n_render += 1
-        except BaseException:
-            for j in jobs.values():
-                j.cancel()
-            raise
-    doc = stack_json(stack, out_path)
-    extra = [ALIGNER_UUID + json.dumps(doc, separators=(",", ":")).encode("utf-8")]
-    if fresh:
-        write_jpx_new(codestreams, out_path, stack.canvas_w, stack.canvas_h, stack.channel_info, stack.pixel_um, extra_payloads=extra,
-                      z_spacing_um=stack.z_spacing_um or 240.0)
-    else:
-        write_jpx_like(stack.jpx_path, codestreams, out_path, extra_payloads=extra,
-                       pixel_um=stack.pixel_um if stack.pixel_corrected else None, z_spacing_um=stack.z_spacing_um or None)
+    # The frames that are copied unchanged are not read one after another here: they are read several at a time, ahead of the writing, and
+    # each is taken as the file is written (a read of a file on a network share is slow, and held in memory for the whole stack they
+    # would take as much as the file does).
+    todo_ids = {id(s) for s in todo}
+    copied = [s for s in stack.sections if id(s) not in todo_ids]
+    copy_position = {id(s): k for k, s in enumerate(copied)}
+    prefetch = FramePrefetcher(stack.jpx_path, [frames[s.frame] for s in copied]) if copied else None
+
+    def copy_lazily(s):
+        """The frame of section `s`, copied unchanged: a function that hands it over when the file is written."""
+        def take():
+            if stop_event is not None and stop_event.is_set():
+                raise UserCanceled
+            if progress is not None:
+                progress(s.index, len(stack.sections), s.name)
+            t_wait = time.time()
+            data = prefetch.take(copy_position[id(s)])
+            log(f"  {describe(s)}: unchanged, copied ({len(data) / 1e6:.0f} MB; waited {time.time() - t_wait:.1f} s for the read; "
+                f"{time.time() - t_export:.0f} s since the start)")
+            return data
+        return take
+
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            jobs = {id(s): pool.submit(render, s) for s in todo}
+            try:
+                for s in stack.sections:
+                    if stop_event is not None and stop_event.is_set():
+                        raise UserCanceled
+                    if id(s) not in todo_ids:
+                        codestreams.append(copy_lazily(s))
+                        continue
+                    codestreams.append(jobs[id(s)].result())
+                    n_render += 1
+            except BaseException:
+                for j in jobs.values():
+                    j.cancel()
+                raise
+        doc = stack_json(stack, out_path)
+        extra = [ALIGNER_UUID + json.dumps(doc, separators=(",", ":")).encode("utf-8")]
+        if fresh:
+            write_jpx_new(codestreams, out_path, stack.canvas_w, stack.canvas_h, stack.channel_info, stack.pixel_um, extra_payloads=extra,
+                          z_spacing_um=stack.z_spacing_um or 240.0)
+        else:
+            write_jpx_like(stack.jpx_path, codestreams, out_path, extra_payloads=extra,
+                           pixel_um=stack.pixel_um if stack.pixel_corrected else None, z_spacing_um=stack.z_spacing_um or None)
+    finally:
+        if prefetch is not None:
+            prefetch.close()
     elapsed = time.time() - t_export
     log(f"Wrote {out_path} ({os.path.getsize(out_path) / 1e6:.0f} MB; {n_render} re-rendered, "
         f"{len(stack.sections) - n_render} copied)")

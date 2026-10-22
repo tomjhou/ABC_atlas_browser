@@ -407,12 +407,13 @@ class Aligner:
         self.var_fit = tk.BooleanVar(self.root, True)          # fit the canvas to the sections when exporting a stack made in memory
         self.var_margin = tk.StringVar(self.root, "10")       # (the margin around them, %)
         self.var_spacing = tk.StringVar(self.root, "")        # distance between adjacent sections (um), written into the JPX
-        self.var_rerender = tk.BooleanVar(self.root, True)   # every image is written again, so each JPX file has all of its images
-        self.var_background = tk.BooleanVar(self.root, bool(load_settings().get("background_loading", True)))
+        # (off unless chosen: only the sections that were edited are rendered again on export, and the rest are copied as they are,
+        # which is far quicker; the choice is kept in the settings)
+        self.var_rerender = tk.BooleanVar(self.root, bool(load_settings().get("rerender_unchanged", False)))
         self.var_advanced = tk.BooleanVar(self.root, bool(load_settings().get("advanced_mode", False)))
         self.var_verify = tk.BooleanVar(self.root, bool(load_settings().get("verify_positions", True)))
         self.var_crosshair = tk.BooleanVar(self.root, True)
-        self.var_follow = tk.BooleanVar(self.root, False)   # an edit also moves the sections after it
+        self.var_follow = tk.BooleanVar(self.root, False)   # an edit also moves the sections after it (File > Options; off at each start)
         self.var_status = tk.StringVar(self.root, "Open a reconstruction.jpx to start (File > Open).")
         self.chan_vars = []         # per channel (visible BooleanVar, lo DoubleVar, hi DoubleVar)
 
@@ -436,10 +437,11 @@ class Aligner:
         fm.config(postcommand=self.fill_recent_menu)   # (refreshed each time the File menu opens)
         fm.add_command(label="Export JPX...", command=self.export_dialog, accelerator="Ctrl+S")
         om = tk.Menu(fm, tearoff=0)
-        om.add_checkbutton(label="Load images in the background", variable=self.var_background,
-                           command=self.background_option_changed)
         om.add_checkbutton(label="Check section positions in the background", variable=self.var_verify,
                            command=lambda: save_settings(verify_positions=bool(self.var_verify.get())))
+        om.add_checkbutton(label="Re-render unchanged sections too when exporting (slower)", variable=self.var_rerender,
+                           command=lambda: save_settings(rerender_unchanged=bool(self.var_rerender.get())))
+        om.add_checkbutton(label="Edits also move subsequent sections", variable=self.var_follow)
         om.add_checkbutton(label="Advanced mode", variable=self.var_advanced, command=self.advanced_option_changed)
         fm.add_cascade(label="Options", menu=om)
         fm.add_separator()
@@ -577,9 +579,11 @@ class Aligner:
 
         f = ttk.LabelFrame(right, text="Current section", padding=6)
         f.pack(fill=tk.X, pady=(0, 6))
-        # (advanced mode only)
-        self.follow_check = ttk.Checkbutton(f, text="Edits also move subsequent sections", variable=self.var_follow)
-        self.follow_check.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 4))
+        # (the choice is in File > Options; while it is on, this line says so, since an edit then moves other sections as well)
+        self.follow_note = ttk.Label(f, text="Edits also move the following sections (File > Options)", foreground="#b00020")
+        self.follow_note.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 4))
+        self.follow_note.grid_remove()
+        self.var_follow.trace_add("write", lambda *_: self.follow_note.grid() if self.var_follow.get() else self.follow_note.grid_remove())
         self.label_section = ttk.Label(f, text="-", font=("Segoe UI", 10, "bold"))
         self.label_section.grid(row=1, column=0, columnspan=4, sticky="w")
         for r, (text, var) in enumerate((("Rotation (deg, clockwise)", self.var_rot), ("Shift x (um)", self.var_dx),
@@ -630,14 +634,13 @@ class Aligner:
 
         f = self.export_frame = ttk.LabelFrame(right, text="Export", padding=6)
         f.pack(fill=tk.X, pady=(0, 6))
-        # (the quality and re-render choices are for advanced mode only; the defaults are the sensible ones)
+        # (the quality choice is for advanced mode only; the default is the sensible one. Whether unchanged sections are rendered again
+        # is in the File > Options menu)
         self.export_advanced = [
             ttk.Label(f, text="Quality (dB, max ~96)"),   # 16-bit frames: nothing above ~96 dB changes the file
-            ttk.Entry(f, textvariable=self.var_quality, width=6),
-            ttk.Checkbutton(f, text="Re-render unchanged sections too", variable=self.var_rerender)]
+            ttk.Entry(f, textvariable=self.var_quality, width=6)]
         self.export_advanced[0].grid(row=0, column=0, sticky="e")
         self.export_advanced[1].grid(row=0, column=1, sticky="w", padx=4)
-        self.export_advanced[2].grid(row=1, column=0, columnspan=2, sticky="w")
         ttk.Label(f, text="Distance between sections (\u00b5m)").grid(row=2, column=0, sticky="e", pady=(4, 0))
         ttk.Entry(f, textvariable=self.var_spacing, width=6).grid(row=2, column=1, sticky="w", padx=4, pady=(4, 0))
         self.fit_row = ttk.Frame(f)    # (only for a stack made in memory: one opened from a JPX keeps its canvas)
@@ -725,9 +728,8 @@ class Aligner:
 
     @property
     def busy(self):
-        """Something is running that rules out editing: an export, or (with background loading switched off) the loading of
-        the section images."""
-        return self._busy or (self.loading_previews and not self.var_background.get())
+        """Something is running that rules out editing: an export. (The section images load in the background, while one edits.)"""
+        return self._busy
 
     @busy.setter
     def busy(self, value):
@@ -740,32 +742,20 @@ class Aligner:
             self.view_frame.pack(fill=tk.X, pady=(0, 6), before=self.export_frame)
             for w in self.export_advanced:
                 w.grid()
-            self.follow_check.grid()
         else:
             # what is hidden goes back to its default, so nothing unseen keeps affecting the picture or the export
             self.mode_frame.pack_forget()
             self.view_frame.pack_forget()
             for w in self.export_advanced:
                 w.grid_remove()
-            self.follow_check.grid_remove()
-            self.var_follow.set(False)
             self.var_mode.set("blend")
             self.var_crosshair.set(True)
             self.var_quality.set(f"{ns.DEFAULT_QUALITY_DB:g}")
-            self.var_rerender.set(True)
 
     def advanced_option_changed(self):
         save_settings(advanced_mode=bool(self.var_advanced.get()))
         self.apply_advanced_mode()
         if self.stack:
-            self.redraw()
-
-    def background_option_changed(self):
-        save_settings(background_loading=bool(self.var_background.get()))
-        self.update_cursor()
-        self.refresh_list()
-        if self.stack:
-            self.update_controls()
             self.redraw()
 
     def update_cursor(self):
@@ -1238,10 +1228,14 @@ class Aligner:
 
         def start_verify():
             """Start the check of the unchecked positions (once, and only if there are any); True if one is running."""
+            nonlocal verify_stop
             if self.verifying:
                 return True
             if self.stack is not stack or not any(s.czi_assumed for s in stack.sections):
                 return False
+            if verify_stop.is_set():     # (stopped for an export that was then not made: this stack is still the current one)
+                verify_stop = threading.Event()
+                self.stop_event_verify = verify_stop
             self.verifying = True
             threading.Thread(target=verify, daemon=True).start()
             return True
@@ -1682,7 +1676,7 @@ class Aligner:
             return None
         if self.calibrating and self.var_follow.get() and any(
                 f.source_path.lower().endswith(".czi") and f.czi_origin is None for f in self.stack.sections[s.index + 1:]):
-            self.var_status.set("Following sections are still being located: wait, or turn off \"Edits also move subsequent sections\".")
+            self.var_status.set("Following sections are still being located: wait, or turn off \"Edits also move subsequent sections\" (File > Options).")
             return None
         return s
 
@@ -2645,22 +2639,44 @@ class Aligner:
 
     # ---------------------------------------------------------------- export
 
+    def origin_agreement(self, unchecked):
+        """How closely the sections located directly on the scans of `unchecked` sections agree on their origin: the largest difference
+        (px, in x or y) among them within any one of those scans, or None if no scan has two such sections."""
+        spread = None
+        for path in {s.source_path for s in unchecked}:
+            origins = np.array([s.czi_origin for s in self.stack.sections
+                                if s.source_path == path and s.czi_origin is not None and not s.czi_assumed], float)
+            if len(origins) >= 2:
+                d = float(np.ptp(origins, axis=0).max())
+                spread = d if spread is None else max(spread, d)
+        return spread
+
     def export_dialog(self):
         if not self.stack or self.busy:
             return
+        stop_check = False      # (the check of the positions is stopped for the export, once the file is chosen)
         unchecked = [s for s in self.stack.sections if s.czi_assumed]
         if unchecked:
             # A section's position on its scan can be one that was only assumed (the scan's shared origin): the picture exported is rendered
             # from the scan at that position, so an unchecked one could be a few pixels off. The export waits until they are checked.
             running = False if self.check_incomplete else self.start_verify()
             if running:
-                messagebox.showinfo(
-                    "Section positions are being checked",
-                    f"The positions of {len(unchecked)} section(s) on their slide scans haven't been checked against their own frames yet: "
-                    "they are only assumed, and an exported picture would be rendered at that position.\n\nThe check is running (see the "
-                    "status line); export when it has finished.", parent=self.root)
-                return
-            if not messagebox.askyesno(
+                spread = self.origin_agreement(unchecked)
+                agree = (f"The sections that were located directly on those scans agree on their origin to within {spread:.1f} px, "
+                         if spread is not None else "The sections that were located directly on those scans agree on their origin, ")
+                if not messagebox.askyesno(
+                        "Section positions are still being checked",
+                        f"The positions of {len(unchecked)} section(s) on their slide scans haven't been checked against their own frames "
+                        "yet. The check is running (see the status line).\n\n"
+                        "These sections were given the origin that the others on their scan agree on. " + agree +
+                        "so a scan's origin appears highly consistent between its sections, and the positions are probably right: it is "
+                        "probably fine to export now.\n\n"
+                        "If you export now, the check is stopped and these positions are saved as unchecked; they are checked when the "
+                        "exported file is opened. A position the check would have moved by more than 3 px is not corrected in the export "
+                        "until then.\n\nExport now? (No: wait for the check to finish, and export again.)", parent=self.root):
+                    return
+                stop_check = True
+            elif not messagebox.askyesno(
                     "Section positions not checked",
                     f"The positions of {len(unchecked)} section(s) on their slide scans haven't been checked, and can't be checked "
                     "now (the check is off in File > Options, or it couldn't run). An exported picture is rendered from the scan at the "
@@ -2736,6 +2752,16 @@ class Aligner:
             filetypes=[("JPX stacks", "*.jpx")])
         if not out:
             return
+        self.check_stopped_for_export = False
+        if stop_check and self.verifying:
+            # (stopped only now that the export is going ahead; the sections being checked finish, which takes a few seconds)
+            self.stop_event_verify.set()
+            self.check_stopped_for_export = True
+            self.var_status.set("Stopping the position check for the export...")
+            t_wait = time.time()
+            while self.verifying and time.time() - t_wait < 20:
+                self.root.update()
+                time.sleep(0.05)
         self.busy = True
         self.stop_event.clear()
         self.button_cancel.config(state="normal")
@@ -2763,12 +2789,22 @@ class Aligner:
         self.busy = False
         self.button_cancel.config(state="disabled")
         self.update_cursor()
+        resume_check = getattr(self, "check_stopped_for_export", False)
+        self.check_stopped_for_export = False
+
+        def resume():
+            """An export that did not happen: the position check that was stopped for it goes on."""
+            if resume_check and self.var_verify.get() and getattr(self, "start_verify", None):
+                self.check_incomplete = False
+                self.start_verify()
         if error == "canceled":
             self.var_status.set("Export canceled; nothing was written.")
+            resume()
             return
         if error:
             self.var_status.set("Export failed.")
             messagebox.showerror("Export failed", error, parent=self.root)
+            resume()
             return
         self.progress.config(value=self.progress["maximum"])
         add_recent(out)   # the exported file joins the File > Open recent list (an existing entry just moves to the top)
