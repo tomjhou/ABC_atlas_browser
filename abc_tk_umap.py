@@ -40,7 +40,11 @@ RING = "#ff1493"
 MAX_COLORED_CATEGORIES = 400
 LEVEL_NAMES = {"class": "Class", "subclass": "Subclass", "supertype": "Supertype", "cluster": "Cluster", "leiden": "Leiden"}
 TILE_PX = 230
-MIN_TILE_PX = 120
+MIN_TILE_PX = 50
+TILE_COLUMNS = {"Very small": 5, "Small": 3, "Medium": 2, "Large": 1}     # the section panels' size choices: how many fit across the pane (a fifth, a third, a half, all of its width)
+DEFAULT_TILE_SIZE = "Medium"
+DOT_SIZES = {"Small": 0.5, "Medium": 1.0, "Large": 2.0}      # the section panels' dot size choices: times DOT_MM
+DEFAULT_DOT_SIZE = "Medium"
 LABEL_ZOOM_CAP = 5.0               # the group numbers grow with the zoom up to this, then stay the same size
 HOVER_HOLD_MS = 250                # the pointer must rest this long before the plots dim
 GROUP_HOLD_MS = 500                # ...and this long before the cell's group is marked
@@ -105,6 +109,7 @@ class PointCanvas:
         self.on_view = None                         # fn() after a redraw
         self.on_change = None                       # fn(zoom, dx, dy) after the user zoomed or panned (the view, relative to the whole view)
         self.pan_from = None
+        self.dot_factor = 1.0                       # times the size of the dots that have a size on the tissue
         self.visible_fn = None                      # fn() -> whether this canvas is on screen; one that is not is only drawn once it is
         self.stale = False                          # needs drawing (it was not on screen when asked)
         self.base = None                            # the last picture of the points (H x W x 3)
@@ -245,7 +250,7 @@ class PointCanvas:
         hw, hh = w / (2 * self.scale), h / (2 * self.scale)
         for lay in self.layers:
             if "size_mm" in lay:                                              # (a size on the tissue: the same at any window size)
-                d = int(max(round(lay["size_mm"] * self.scale), 1))
+                d = int(max(round(lay["size_mm"] * self.dot_factor * self.scale), 1))
             else:
                 d = int(max(round(lay["size"] * zoom ** 0.7), 1))          # (the dots grow as the view is zoomed in)
             x, y = lay["x"], lay["y"]
@@ -565,10 +570,20 @@ class UmapWindow(ExportsMixin):
         pw.pack(fill=tk.BOTH, expand=True)
         # the section panels
         left = ttk.Frame(pw)
+        bars = ttk.Frame(left, padding=(6, 4))
+        bars.pack(side=tk.TOP, fill=tk.X)
+        self.var_tile_size = tk.StringVar(bars, DEFAULT_TILE_SIZE)
+        self.var_dot_size = tk.StringVar(bars, DEFAULT_DOT_SIZE)
+        for r, (text, var, choices, command) in enumerate((("Section map size:", self.var_tile_size, TILE_COLUMNS, self.layout_tiles),
+                                                           ("Dot size:", self.var_dot_size, DOT_SIZES, self.apply_dot_size))):
+            ttk.Label(bars, text=text, width=16).grid(row=r, column=0, sticky="w")
+            for k, name in enumerate(choices):
+                ttk.Radiobutton(bars, text=name, value=name, variable=var, command=command).grid(row=r, column=k + 1, sticky="w", padx=(8, 0))
         self.tile_scroll = tk.Canvas(left, highlightthickness=0, bg="#f4f4f4")
         sb = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.tile_scroll.yview)
         self.tile_scroll.configure(yscrollcommand=lambda a, b: (sb.set(a, b), self.root.after_idle(self.refresh_visible)))
         sb.pack(side=tk.RIGHT, fill=tk.Y)
+        sb.bind("<MouseWheel>", lambda e: self.tile_scroll.yview_scroll(-1 if e.delta > 0 else 1, "units"))
         self.tile_scroll.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.tile_frame = tk.Frame(self.tile_scroll, bg="#f4f4f4")
         self.tile_window = self.tile_scroll.create_window(0, 0, window=self.tile_frame, anchor="nw")
@@ -596,13 +611,11 @@ class UmapWindow(ExportsMixin):
         self.root.after(400, self.fit_left_pane)
 
     def fit_left_pane(self):
-        """Once, at the start: the section pane is only as wide as its panels (the rest of the window goes to the UMAP)."""
-        if not self.tiles or not self.root.winfo_viewable():
+        """Once, at the start: the section pane gets about a third of the window (the panels fill whatever width it has)."""
+        if not self.root.winfo_viewable():
             return
-        self.layout_tiles()
-        want = self.tile_cols * (self.tile_px + 16) + 24
-        if want < self.pw.winfo_width() * 0.7:
-            self.pw.sashpos(0, want)
+        total = self.pw.winfo_width()
+        self.pw.sashpos(0, int(min(max(total * 0.33, 520), total * 0.5)))
 
     def build_side(self, f):
         self.color_label = ttk.Label(f, text="Color by", font=("Segoe UI", 13, "bold"))
@@ -750,8 +763,10 @@ class UmapWindow(ExportsMixin):
             tk.Label(fr, textvariable=title, bg="#f4f4f4", font=("Segoe UI", 9, "bold")).pack(anchor="w")
             pc = PointCanvas(fr, (mx - span_x / 2, mx + span_x / 2, my - span_y / 2, my + span_y / 2), flip_y=False, width=TILE_PX, height=int(TILE_PX / self.tile_aspect))
             pc.canvas.pack()
+            pc.canvas.bind("<Shift-MouseWheel>", lambda e: self.tile_scroll.yview_scroll(-1 if e.delta > 0 else 1, "units"))     # (the plain wheel zooms)
             pc.add_marker("hover", 7)
             pc.plus_arm = 2
+            pc.dot_factor = DOT_SIZES[self.var_dot_size.get()]
             pc.visible_fn = lambda fr=fr: self.frame_visible(fr)
             if not self.tiles:
                 pc.enable_scalebar()                       # (the first section's panel carries the scale bar)
@@ -766,25 +781,30 @@ class UmapWindow(ExportsMixin):
         self.layout_tiles()
 
     def layout_tiles(self):
-        """The panels are as big as they can be while all fitting in the pane (columns chosen for the biggest); if the pane is too
-        small for that to be readable they keep a minimum size and the pane scrolls."""
+        """The panels are a third, a half or all of the pane's width (the Section map size buttons), as many to a row as that gives; the
+        pane scrolls to the rest."""
         if not getattr(self, "tiles", None):
             return
-        w, h = max(self.tile_scroll.winfo_width(), 100), max(self.tile_scroll.winfo_height(), 100)
-        n, title = len(self.tiles), 36
-        best = (0, 1)
-        for cols in range(1, n + 1):
-            rows = -(-n // cols)
-            size = min((w - 6) // cols - 8, ((h - 4) // rows - title - 4) * self.tile_aspect)       # (the panel's width)
-            if size > best[0]:
-                best = (size, cols)
-        px, cols = int(max(best[0], MIN_TILE_PX)), best[1]
+        cols = TILE_COLUMNS[self.var_tile_size.get()]
+        w = max(self.tile_scroll.winfo_width(), 100)
+        px = int(max((w - 4) // cols - 8 - 2, MIN_TILE_PX))          # (8: the gaps either side of a panel; 2: its canvas border)
         if cols == self.tile_cols and px == self.tile_px:
             return
         self.tile_cols, self.tile_px = cols, px
         for k, t in enumerate(self.tiles):
             t["pc"].canvas.config(width=px, height=int(px / self.tile_aspect))
             t["frame"].grid(row=k // cols, column=k % cols, padx=4, pady=3, sticky="nw")
+        self.root.after_idle(self.refresh_visible)
+
+    def apply_dot_size(self):
+        """The Dot size buttons: redraw the section panels with bigger or smaller dots (the ones off screen when they come on screen)."""
+        f = DOT_SIZES[self.var_dot_size.get()]
+        for t in self.tiles:
+            t["pc"].dot_factor = f
+            if self.frame_visible(t["frame"]):
+                t["pc"].request_draw()
+            else:
+                t["pc"].stale = True
 
     def link_tiles(self, source, zoom, dx, dy):
         """Zooming or panning one section does the same to all the others."""
@@ -1500,8 +1520,6 @@ class UmapWindow(ExportsMixin):
     def hover_settled(self, info):
         self.hover_job = None
         self.set_dim(True)
-        if info["source"] == "umap" and info["sec"] is not None:
-            self.reveal_tile(info["sec"])
 
     def set_dim(self, on):
         self.umap.set_dim(on)
@@ -1551,20 +1569,6 @@ class UmapWindow(ExportsMixin):
                 m = self.info[level][idx] == label
                 xy = (self.cx[idx][m], self.cy[idx][m])
             t["pc"].set_pluses(xy if len(xy[0]) else None)
-
-    def reveal_tile(self, label):
-        """Scroll the section panels so this section's is in view."""
-        t = self.section_tile(label)
-        if t is None:
-            return
-        self.root.update_idletasks()
-        fr = t["frame"]
-        top, h = fr.winfo_y(), fr.winfo_height()
-        total = max(self.tile_frame.winfo_height(), 1)
-        view_top = self.tile_scroll.canvasy(0)
-        view_h = self.tile_scroll.winfo_height()
-        if top < view_top or top + h > view_top + view_h:
-            self.tile_scroll.yview_moveto(max(0.0, (top - 10) / total))
 
     def umap_motion(self, px, py):
         if px is None or not self.viewer_settings.get("hover_enabled", True):
