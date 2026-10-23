@@ -1,6 +1,6 @@
 """A Tk version of the atlas browser's launch screen: the output folder, then one of "Open Brain Browser / ROI Chooser", "Load
 Existing ROI Dataset" or "Open 3D Viewer". Which cells to analyze (Neurons, Non-neurons or All cells) is asked later, by
-choose_cells_to_analyze(), once the sections and ROIs are confirmed. It is a function of the same shape as the matplotlib one (prompt_startup_panel in
+choose_run_options(), once the sections and ROIs are confirmed. It is a function of the same shape as the matplotlib one (prompt_startup_panel in
 ABC_atlas_browser.py): the browser passes in the few of its own functions it needs (recent folders, the check of a run folder, the 3D
 viewer launcher, the settings window), so this file has no start-up side effects of its own.
 
@@ -19,26 +19,94 @@ ACCENT = "#1f5fa8"
 RECOVERABLE = {"ROI coordinates", "Processed AnnData"}      # (cached files of a run that can be made again: not required to load it)
 
 
-def choose_cells_to_analyze(current="Neurons"):
-    """A small window, after the sections and ROIs are confirmed: which cells the analysis (the UMAP and what follows) is made of. Returns
-    "Neurons" | "NonNeurons" | "All", or None if cancelled."""
+SUBSAMPLE_CAPS = (("200,000 cells (recommended)", 200_000), ("No limit: every cell", None))
+LARGE_PROJECT_CELLS = 200_000            # a selection of more cells than this is a "large project": the dialog asks how to handle it
+
+
+def choose_run_options(current="Neurons", counts=None):
+    """The one window between confirming the sections and ROIs and the long analysis that follows, so that the analysis then runs without
+    asking anything more: which cells to analyze, how to handle a large project (a selection of more than LARGE_PROJECT_CELLS cells: use a
+    random subset, or all), the project name that is added to the folder name, and whether to make the optional subclass / supertype plots.
+    `counts`: {"Neurons": n, "NonNeurons": n, "All": n}, the cells in the selection, if known (they are shown, and the large-project question
+    is asked only when the chosen kind has more than LARGE_PROJECT_CELLS; if not known it is always asked).
+    Returns a dict {"cell_type": "Neurons" | "NonNeurons" | "All", "cap": the most cells to use, or None for no limit, "label": the project
+    name (may be empty), "optional_plots": bool}, or None if cancelled."""
     root = tk.Tk()
-    root.title("Cells to analyze")
+    root.title("Analysis options")
     root.resizable(False, False)
-    choice = tk.StringVar(root, current)
+    cell_type = tk.StringVar(root, current)
+    cap_choice = tk.StringVar(root, SUBSAMPLE_CAPS[0][0])
+    custom_cap = tk.StringVar(root, "")
+    label = tk.StringVar(root, "")
+    optional = tk.BooleanVar(root, False)
     answer = {"value": None}
     f = ttk.Frame(root, padding=22)
     f.pack()
+
     ttk.Label(f, text="Which cells do you want to analyze?", font=("Segoe UI", 12, "bold")).pack(anchor="w")
-    ttk.Label(f, text="The cells in the sections and ROIs you chose, of this kind, are made into the UMAP.", foreground="gray30",
-              wraplength=330, justify=tk.LEFT).pack(anchor="w", pady=(2, 8))
+    ttk.Label(f, text="The cells of this kind in the sections and ROIs you chose are made into the UMAP.", foreground="gray30",
+              wraplength=400, justify=tk.LEFT).pack(anchor="w", pady=(2, 4))
     for value, text in CELL_TYPES:
-        ttk.Radiobutton(f, text=text, value=value, variable=choice).pack(anchor="w", pady=(4, 0))
+        shown = text if not counts or counts.get(value) is None else f"{text}  ({counts[value]:,} cells)"
+        ttk.Radiobutton(f, text=shown, value=value, variable=cell_type).pack(anchor="w", pady=(3, 0))
+
+    slot = ttk.Frame(f)                                           # (where the large-project question goes, when it is asked: see show_large)
+    slot.pack(anchor="w")
+    large = ttk.Frame(slot)
+    ttk.Label(large, text="How to handle large projects", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(16, 0))
+    large_text = tk.StringVar(large, "")
+    ttk.Label(large, textvariable=large_text, foreground="gray30", wraplength=400, justify=tk.LEFT).pack(anchor="w", pady=(2, 4))
+    for text, _cap in SUBSAMPLE_CAPS:
+        ttk.Radiobutton(large, text=text, value=text, variable=cap_choice).pack(anchor="w", pady=(3, 0))
+    custom_row = ttk.Frame(large)
+    custom_row.pack(anchor="w", pady=(3, 0))
+    ttk.Radiobutton(custom_row, text="At most", value="custom", variable=cap_choice).pack(side=tk.LEFT)
+    custom_entry = ttk.Entry(custom_row, textvariable=custom_cap, width=10)
+    custom_entry.pack(side=tk.LEFT, padx=(6, 6))
+    ttk.Label(custom_row, text="cells").pack(side=tk.LEFT)
+    custom_cap.trace_add("write", lambda *args: cap_choice.set("custom") if custom_cap.get() else None)         # (typing a number picks "At most")
+
+    ttk.Label(f, text="Project name (optional)", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(16, 0))
+    ttk.Label(f, text="Added to the end of the project's folder name, to remember what it is, e.g. RMTg-VTA.", foreground="gray30",
+              wraplength=400, justify=tk.LEFT).pack(anchor="w", pady=(2, 4))
+    ttk.Entry(f, textvariable=label, width=44).pack(anchor="w")
+
+    ttk.Checkbutton(f, text="Also make the optional subclass / supertype UMAP plots and spatial maps (slower)", variable=optional).pack(
+        anchor="w", pady=(16, 0))
+
     row = ttk.Frame(f)
-    row.pack(fill=tk.X, pady=(16, 0))
+    row.pack(fill=tk.X, pady=(18, 0))
+
+    def is_large():
+        n = counts.get(cell_type.get()) if counts else None
+        return n is None or n > LARGE_PROJECT_CELLS
+
+    def show_large(*args):
+        if is_large():
+            n = counts.get(cell_type.get()) if counts else None
+            large_text.set((f"This selection has {n:,} cells. " if n is not None else "") +
+                           "A UMAP of that many cells takes a very long time. Use a random subset of this size, or all of them:")
+            large.pack(anchor="w")
+        else:
+            large.pack_forget()
 
     def done(ok):
-        answer["value"] = choice.get() if ok else None
+        if not ok:
+            answer["value"] = None
+            root.destroy()
+            return
+        cap = LARGE_PROJECT_CELLS            # (a selection that is not large is not limited by this)
+        if is_large():
+            cap = dict(SUBSAMPLE_CAPS).get(cap_choice.get(), "custom")
+            if cap == "custom":
+                try:
+                    cap = int(custom_cap.get().replace(",", "").strip())
+                    if cap < 1:
+                        raise ValueError
+                except ValueError:
+                    messagebox.showerror("How to handle large projects", "Enter a whole number of cells, or pick one of the other choices.", parent=root)
+                    return
+        answer["value"] = {"cell_type": cell_type.get(), "cap": cap, "label": label.get().strip(), "optional_plots": bool(optional.get())}
         root.destroy()
 
     ok_button = ttk.Button(row, text="Continue", command=lambda: done(True))
@@ -47,9 +115,12 @@ def choose_cells_to_analyze(current="Neurons"):
     root.bind("<Return>", lambda e: done(True))
     root.bind("<Escape>", lambda e: done(False))
     root.protocol("WM_DELETE_WINDOW", lambda: done(False))
+    cell_type.trace_add("write", show_large)
+    root.update_idletasks()
+    show_large()
     root.update_idletasks()
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-    root.geometry(f"+{(sw - root.winfo_width()) // 2}+{(sh - root.winfo_height()) // 3}")
+    root.geometry(f"+{(sw - root.winfo_width()) // 2}+{(sh - root.winfo_height()) // 4}")
     root.attributes("-topmost", True)
     ok_button.focus_force()
     root.mainloop()

@@ -620,10 +620,10 @@ def show_coordinate_settings_dialog(abc_cache):
         anchor="w", pady=(6, 0))
     ttk.Separator(frame).pack(fill=tk.X, pady=(14, 8))
     tk_var = tk.BooleanVar(dlg, bool(COORD_SETTINGS['tk_section_window']))
-    ttk.Checkbutton(frame, text="Use the new Tk windows (this launch screen, the section picker, the section windows and the UMAP viewer)", variable=tk_var).pack(anchor="w")
+    ttk.Checkbutton(frame, text="Use the new Tk windows (the section picker, the section windows and the UMAP viewer)", variable=tk_var).pack(anchor="w")
     ttk.Label(frame, foreground="gray35", justify=tk.LEFT, wraplength=460, text=(
         "Smoother zoom, pan and ROI editing, with the Groups, Gene, Imputed Gene and Find group views. Untick to use the older "
-        "matplotlib windows. Takes effect the next time each window is opened (this launch screen: the next time the app starts).")).pack(
+        "matplotlib windows. Takes effect the next time each window is opened.")).pack(
         anchor="w", pady=(2, 0))
     result = {'ok': False}
 
@@ -6111,348 +6111,30 @@ def open_3d_viewer_launcher(abc_cache):
 
 
 def prompt_startup_panel(out_folder):
-    """First screen shown at launch: pick a cell-type subset, then either
-    open the section/ROI picker (today's full pipeline, Step 0 onward) or
-    load a previously computed run's cached files directly into the
-    interactive UMAP viewer, skipping section/ROI selection and UMAP
-    computation entirely.
+    """First screen shown at launch (abc_tk_launcher.prompt_startup_panel_tk): the output folder, then either open the section/ROI picker
+    (the full pipeline, Step 0 onward), load a previously computed run's cached files directly into the interactive UMAP viewer, or open
+    the 3D viewer. (The matplotlib version of this screen was removed: the cell type is no longer asked here at all.)
 
-    Returns (action, cell_type_selection, load_folder, chosen_out_folder):
-    action is 'new_run' or 'load_existing'; cell_type_selection is always
-    one of CELL_TYPE_OPTIONS' values (used by the 'new_run' path; harmless
-    but unused for 'load_existing', kept for a uniform return shape);
-    load_folder is the chosen run folder (a Path) when action is
-    'load_existing', else None; chosen_out_folder is the output folder the
-    user settled on via the folder box (a Path, already created) — the
-    caller should adopt it as the working directory for this session.
+    Returns (action, cell_type_selection, load_folder, chosen_out_folder): action is 'new_run' or 'load_existing'; cell_type_selection is
+    None for a new run (asked after the sections and ROIs are confirmed) and unused for 'load_existing'; load_folder is the chosen run
+    folder (a Path) when action is 'load_existing', else None; chosen_out_folder is the output folder the user settled on (a Path, already
+    created) — the caller should adopt it as the working directory for this session.
 
-    Blocks until a choice is made (see show_figure_blocking). Exits the
-    process if the window is closed without choosing an action (mirrors
-    resolve_out_folder's own "cancelled -> exit" behavior for this same
-    startup phase, rather than falling through into a pipeline with no
-    selection made)."""
+    Exits the process if the window is closed without choosing an action. Raises if the Tk launch screen can't be loaded (the caller
+    falls back to a console prompt)."""
     start_section_coordinate_load(abc_cache)   # (the table of sections' z values, read in the background for the windows to come)
-    if COORD_SETTINGS.get('tk_section_window'):
-        # the Tk version of this screen (see Settings); the functions it needs from this file are handed to it
-        try:
-            from abc_tk_launcher import prompt_startup_panel_tk
-        except Exception as e:
-            print(f"Could not load the Tk launch screen ({e}); using the matplotlib one.")
-        else:
-            outcome = prompt_startup_panel_tk(out_folder, abc_cache, {
-                'load_recent_output_folders': load_recent_output_folders,
-                'remember_recent_output_folder': remember_recent_output_folder,
-                'required_cached_run_files': required_cached_run_files,
-                'open_3d_viewer': open_3d_viewer_launcher,
-                'settings_dialog': show_coordinate_settings_dialog,
-            })
-            if outcome is None:
-                print("No selection made; exiting.")
-                sys.exit(0)
-            return outcome
-    RADIO_OPTIONS = ('Neurons', 'NonNeurons', 'All')
-
-    fig = plt.figure(figsize=compute_figsize_for_screen_height(1.55, height_frac=0.5, default=(10, 6)))
-    normalize_tk_scaling(fig)
-    fig.canvas.manager.set_window_title("AllenABC UMAP Explorer")
-
-    fig.text(0.5, 0.93, "AllenABC UMAP Explorer", ha='center', va='center', fontsize=UI_BUTTON_FONTSIZE * 1.4,
-              fontweight='bold')
-    fig.text(0.5, 0.85, "Cell type when choosing new section/ROI set", ha='center', va='center',
-             fontsize=UI_BUTTON_FONTSIZE)
-
-    fig_w_in = fig.get_size_inches()[0]
-    dot_x, label_x, radio_width = radio_layout_as_axes_fractions(RADIO_OPTIONS, UI_BUTTON_FONTSIZE, 0.6, fig_w_in)
-    radio_ax = fig.add_axes([(1 - radio_width) / 2, 0.745, radio_width, 0.09])
-    radio_ax.set_xlim(0, 1)
-    radio_ax.set_ylim(0, 1)
-    radio_ax.set_xticks([])
-    radio_ax.set_yticks([])
-    for spine in radio_ax.spines.values():
-        spine.set_visible(False)
-    # Same fontsize**2 dot-size convention as this file's other hand-rolled
-    # radios (e.g. the interactive UMAP viewer's mode_dots).
-    radio_dots = radio_ax.scatter(
-        dot_x, [0.5] * len(RADIO_OPTIONS), s=[UI_BUTTON_FONTSIZE ** 2] * len(RADIO_OPTIONS),
-        marker='o', edgecolor='black', facecolor=['tab:blue'] + ['none'] * (len(RADIO_OPTIONS) - 1), zorder=3,
-    )
-    for x, label in zip(label_x, RADIO_OPTIONS):
-        radio_ax.text(x, 0.5, label, fontsize=UI_BUTTON_FONTSIZE, va='center', ha='left')
-
-    radio_state = {'index': 0}  # 'Neurons' preselected
-
-    def set_radio_selection(idx):
-        radio_state['index'] = idx
-        facecolors = ['none'] * len(RADIO_OPTIONS)
-        facecolors[idx] = 'tab:blue'
-        radio_dots.set_facecolor(facecolors)
-        fig.canvas.draw_idle()
-
-    def on_radio_click(event):
-        if event.inaxes is not radio_ax or event.xdata is None:
-            return
-        idx = min(range(len(dot_x)), key=lambda i: abs(dot_x[i] - event.xdata))
-        set_radio_selection(idx)
-
-    fig.canvas.mpl_connect('button_press_event', on_radio_click)
-
-    # ------------------------------------------------------------------
-    # Output-folder chooser: an editable path box, a Browse… dialog, and a
-    # dropdown of recently-used folders (persisted — see
-    # load_recent_output_folders / remember_recent_output_folder) so
-    # switching between projects is a click, not a re-typed path.
-    # ------------------------------------------------------------------
-    fig.text(0.06, 0.675, "Output folder (where runs are saved and loaded from):",
-             ha='left', va='center', fontsize=UI_BUTTON_FONTSIZE)
-
-    folder_box_ax = fig.add_axes([0.06, 0.585, 0.55, 0.075])
-    folder_textbox = TextBox(folder_box_ax, '', initial=str(out_folder))
-    folder_textbox.text_disp.set_fontsize(UI_BUTTON_FONTSIZE)
-
-    recent_toggle_ax = fig.add_axes([0.615, 0.585, 0.05, 0.075])
-    recent_toggle_button = Button(recent_toggle_ax, '▾', hovercolor='0.85')
-    recent_toggle_button.label.set_fontsize(UI_BUTTON_FONTSIZE)
-
-    browse_ax = fig.add_axes([0.68, 0.585, 0.27, 0.075])
-    browse_button = Button(browse_ax, 'Browse…', hovercolor='0.85')
-    browse_button.label.set_fontsize(UI_BUTTON_FONTSIZE)
-
-    # Opaque popup drawn on top of the action buttons below (high zorder) —
-    # closed by picking an entry or clicking away, same pattern as the
-    # gene-name autocomplete dropdowns elsewhere in this file. Its exact
-    # position/size is set each time it's shown, sized to the number of
-    # recent folders (see show_recent_dropdown).
-    recent_dropdown_ax = fig.add_axes([0.06, 0.20, 0.89, 0.38], zorder=30)
-    recent_dropdown_ax.set_xlim(0, 1)
-    recent_dropdown_ax.set_ylim(0, 1)
-    recent_dropdown_ax.set_xticks([])
-    recent_dropdown_ax.set_yticks([])
-    for spine in recent_dropdown_ax.spines.values():
-        spine.set_visible(True)
-        spine.set_color('black')
-    recent_dropdown_ax.patch.set_facecolor('#f0f0f0')
-    recent_dropdown_ax.set_visible(False)
-    recent_dropdown_texts = [
-        recent_dropdown_ax.text(0.03, 0, '', fontsize=UI_BUTTON_FONTSIZE * 0.85, va='center', ha='left',
-                                 family='monospace')
-        for _ in range(MAX_RECENT_OUTPUT_FOLDERS)
-    ]
-    recent_state = {'items': []}
-
-    def current_recent_items():
-        typed = folder_textbox.text.strip().strip('"')
-        items = load_recent_output_folders()
-        if typed and _normalized_folder_key(typed) not in {_normalized_folder_key(p) for p in items}:
-            items = [typed] + items
-        return items[:MAX_RECENT_OUTPUT_FOLDERS]
-
-    def hide_recent_dropdown():
-        if recent_dropdown_ax.get_visible():
-            recent_dropdown_ax.set_visible(False)
-            fig.canvas.draw_idle()
-
-    def show_recent_dropdown():
-        items = current_recent_items()
-        recent_state['items'] = items
-        if not items:
-            return
-        n = len(items)
-        row_h = min(0.05, 0.40 / n)
-        box_top = 0.575
-        recent_dropdown_ax.set_position([0.06, box_top - n * row_h, 0.89, n * row_h])
-        for i, t in enumerate(recent_dropdown_texts):
-            if i < n:
-                label = items[i]
-                if len(label) > 92:  # ellipsize from the left — the tail is what differs between projects
-                    label = '…' + label[-91:]
-                t.set_text(label)
-                t.set_position((0.03, 1 - (i + 0.5) / n))
-            else:
-                t.set_text('')
-        recent_dropdown_ax.set_visible(True)
-        fig.canvas.draw_idle()
-
-    def on_recent_toggle(event):
-        if recent_dropdown_ax.get_visible():
-            hide_recent_dropdown()
-        else:
-            show_recent_dropdown()
-
-    recent_toggle_button.on_clicked(on_recent_toggle)
-
-    def on_dropdown_click(event):
-        if not recent_dropdown_ax.get_visible():
-            return
-        if event.inaxes is recent_dropdown_ax and event.ydata is not None:
-            n = len(recent_state['items'])
-            if n > 0:
-                row = min(n - 1, max(0, int((1 - event.ydata) * n)))
-                folder_textbox.set_val(recent_state['items'][row])
-            hide_recent_dropdown()
-        elif event.inaxes is not recent_toggle_ax:  # the toggle has its own handler
-            hide_recent_dropdown()
-
-    fig.canvas.mpl_connect('button_press_event', on_dropdown_click)
-
-    def show_folder_error(message):
-        try:
-            import tkinter as tk
-            from tkinter import messagebox
-            root = tk.Tk()
-            root.withdraw()
-            root.attributes('-topmost', True)
-            messagebox.showerror("Output folder", message)
-            root.destroy()
-        except Exception:
-            print(message)
-
-    def committed_out_folder():
-        """The folder currently in the box, created if it doesn't exist yet.
-        Returns a Path on success, or None (after showing an error and
-        leaving the panel open) if it's blank or can't be created."""
-        raw = folder_textbox.text.strip().strip('"')
-        if not raw:
-            show_folder_error("Enter an output folder, or click Browse… to pick one.")
-            return None
-        path = Path(os.path.expanduser(raw))
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            show_folder_error(f"Can't create or access that folder:\n\n{path}\n\n{e}")
-            return None
-        return path
-
-    def on_browse(event):
-        hide_recent_dropdown()
-        raw = folder_textbox.text.strip().strip('"')
-        initial = raw if raw and Path(os.path.expanduser(raw)).is_dir() else str(out_folder)
-        try:
-            import tkinter as tk
-            from tkinter import filedialog
-            root = tk.Tk()
-            root.withdraw()
-            root.attributes('-topmost', True)
-            chosen = filedialog.askdirectory(title="Choose the output folder", initialdir=initial)
-            root.destroy()
-        except Exception as e:
-            print(f"Could not open folder picker: {e}")
-            return
-        if chosen:
-            folder_textbox.set_val(os.path.normpath(chosen))  # askdirectory returns forward slashes on Windows
-
-    browse_button.on_clicked(on_browse)
-
-    result = {'action': None, 'load_folder': None, 'out_folder': None}
-    button_width, button_height = 0.55, 0.08
-    button_left = (1 - button_width) / 2
-
-    new_run_ax = fig.add_axes([button_left, 0.45, button_width, button_height])
-    new_run_button = Button(new_run_ax, 'Open Brain Browser/ROI Chooser', hovercolor='0.85')
-    new_run_button.label.set_fontsize(UI_BUTTON_FONTSIZE)
-
-    load_existing_ax = fig.add_axes([button_left, 0.335, button_width, button_height])
-    load_existing_button = Button(load_existing_ax, 'Load Existing ROI Dataset…', hovercolor='0.85')
-    load_existing_button.label.set_fontsize(UI_BUTTON_FONTSIZE)
-
-    viewer3d_ax = fig.add_axes([button_left, 0.22, button_width, button_height])
-    viewer3d_button = Button(viewer3d_ax, 'Open 3D Viewer…', hovercolor='0.85')
-    viewer3d_button.label.set_fontsize(UI_BUTTON_FONTSIZE)
-
-    cancel_ax = fig.add_axes([button_left, 0.105, button_width, button_height])   # same gap as above it
-    cancel_button = Button(cancel_ax, 'Exit', hovercolor='0.85')
-    cancel_button.label.set_fontsize(UI_BUTTON_FONTSIZE)
-
-    settings_ax = fig.add_axes([0.80, 0.915, 0.15, 0.06])    # top-right corner, level with the title
-    settings_button = Button(settings_ax, 'Settings…', hovercolor='0.85')
-    settings_button.label.set_fontsize(UI_BUTTON_FONTSIZE * 0.9)
-
-    def on_settings(event):
-        hide_recent_dropdown()
-        show_coordinate_settings_dialog(abc_cache)   # returns when its window is closed; the panel is still here
-        fig.canvas.draw_idle()
-
-    settings_button.on_clicked(on_settings)
-
-    def on_new_run(event):
-        hide_recent_dropdown()
-        folder = committed_out_folder()
-        if folder is None:
-            return
-        result['action'] = 'new_run'
-        result['out_folder'] = folder
-        remember_recent_output_folder(folder)
-        plt.close(fig)
-
-    def on_cancel(event):
-        plt.close(fig)
-
-    def on_load_existing(event):
-        hide_recent_dropdown()
-        folder = committed_out_folder()
-        if folder is None:
-            return
-        try:
-            import tkinter as tk
-            from tkinter import filedialog, messagebox
-            root = tk.Tk()
-            root.withdraw()
-            root.attributes('-topmost', True)
-            chosen = filedialog.askdirectory(
-                title="Select an existing run folder to load", initialdir=str(folder),
-            )
-            root.destroy()
-        except Exception as e:
-            print(f"Could not open folder picker: {e}")
-            return
-        if not chosen:
-            return
-        chosen_path = Path(chosen)
-        required = required_cached_run_files(chosen_path)
-        # Only umap_coords.csv is genuinely required. The other two are
-        # recoverable:
-        #   ROI coordinates — a run over the whole brain (no ROIs, no
-        #     explicit whole-section picks) never gets a roi_coords.csv
-        #     written in the first place (see the main script's own
-        #     roi_csv_path-writing block); warned about, not blocked, once
-        #     this run folder is actually loaded.
-        #   Processed AnnData — rebuilt on demand from the raw backed h5ad
-        #     plus this CSV's own cell IDs/metadata, no section/ROI picker
-        #     needed (see rebuild_processed_adata).
-        recoverable = {'ROI coordinates', 'Processed AnnData'}
-        missing = [f'{label}: {path}' for label, path in required.items()
-                   if label not in recoverable and not path.exists()]
-        if missing:
-            message = "This folder is missing required cached file(s):\n\n" + "\n".join(missing)
-            try:
-                messagebox.showerror("Missing cached files", message)
-            except Exception:
-                print(message)
-            return  # stay on the panel so the user can pick a different folder
-        result['action'] = 'load_existing'
-        result['load_folder'] = chosen_path
-        result['out_folder'] = folder
-        remember_recent_output_folder(folder)
-        plt.close(fig)
-
-    def on_3d_viewer(event):
-        hide_recent_dropdown()
-        open_3d_viewer_launcher(abc_cache)   # returns when its window is closed; the panel is still here
-        fig.canvas.draw_idle()
-
-    new_run_button.on_clicked(on_new_run)
-    load_existing_button.on_clicked(on_load_existing)
-    viewer3d_button.on_clicked(on_3d_viewer)
-    cancel_button.on_clicked(on_cancel)
-
-    center_figure_window(fig)
-    show_figure_blocking(fig)
-
-    if result['action'] is None:
+    from abc_tk_launcher import prompt_startup_panel_tk
+    outcome = prompt_startup_panel_tk(out_folder, abc_cache, {
+        'load_recent_output_folders': load_recent_output_folders,
+        'remember_recent_output_folder': remember_recent_output_folder,
+        'required_cached_run_files': required_cached_run_files,
+        'open_3d_viewer': open_3d_viewer_launcher,
+        'settings_dialog': show_coordinate_settings_dialog,
+    })
+    if outcome is None:
         print("No selection made; exiting.")
         sys.exit(0)
-
-    cell_type_selection = RADIO_OPTIONS[radio_state['index']]
-    return result['action'], cell_type_selection, result['load_folder'], result['out_folder']
+    return outcome
 
 
 def prompt_section_selection_gui(adata, abc_cache, section_series, out_folder=None, cell_type_selection='All',
@@ -10348,6 +10030,29 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
     return pending
 
 
+def count_selected_cells(adata, abc_cache, section_series, selected_sections, rois):
+    """How many cells a selection holds, without filtering anything: {'Neurons': n, 'NonNeurons': n, 'All': n} for the sections / ROIs chosen
+    (as filter_by_sections / filter_by_rois would select them: ROIs, if any, replace the whole-section choice), from the cached annotation and
+    coordinate tables, so it takes a few seconds."""
+    annotations = load_annotations_aligned(adata.obs.index, abc_cache)
+    sections = section_series.to_numpy() if section_series is not None else annotations[SECTION_COL].to_numpy()
+    if rois:
+        spatial = load_section_spatial_coords(adata, abc_cache)
+        xs = pd.to_numeric(spatial['x'], errors='coerce').to_numpy()
+        ys = pd.to_numeric(spatial['y'], errors='coerce').to_numpy()
+        keep = np.zeros(len(xs), dtype=bool)
+        for roi in rois:
+            keep |= (sections == roi['section']) & (xs >= roi['x_min']) & (xs <= roi['x_max']) & (ys >= roi['y_min']) & (ys <= roi['y_max'])
+    elif selected_sections is not None:
+        keep = pd.Series(sections).isin(selected_sections).to_numpy()
+    else:
+        keep = np.ones(len(sections), dtype=bool)
+    class_ids = pd.to_numeric(annotations['class'].astype(str).str.strip().str.extract(r'^(\d+)')[0], errors='coerce')
+    valid = class_ids.notna().to_numpy()
+    is_non_neuron = valid & class_ids.isin(NON_NEURON_CLASS_IDS).to_numpy()
+    return {'All': int(keep.sum()), 'Neurons': int((keep & valid & ~is_non_neuron).sum()), 'NonNeurons': int((keep & is_non_neuron).sum())}
+
+
 def filter_by_rois(adata, abc_cache, rois, section_col=SECTION_COL):
     """Subset adata to cells falling within any of `rois` (each a dict with
     'section', 'x_min', 'x_max', 'y_min', 'y_max'). A cell must match both
@@ -10792,7 +10497,12 @@ def prompt_roi_run_label():
     again — a different or missing label is a different folder name, hence
     a fresh run. Reusing a labeled run on purpose is what the startup
     panel's 'Load existing run' picker is for."""
-    raw = input("Optional label for this ROI run's folder name (blank to skip): ").strip()
+    return sanitize_run_label(input("Optional label for this ROI run's folder name (blank to skip): "))
+
+
+def sanitize_run_label(raw):
+    """A label typed for an ROI run's folder name, made filename-safe (see prompt_roi_run_label); '' for none."""
+    raw = (raw or '').strip()
     if not raw:
         return ''
     # Alphanumerics kept as-is; every run of anything else (spaces,
@@ -18719,14 +18429,32 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         selected_sections, sections_suffix = prompt_section_selection(section_series)
         rois = []
         imputed_adata_from_picker = None
-    if cell_type_selection is None:
-        from abc_tk_launcher import choose_cells_to_analyze
-        cell_type_selection = choose_cells_to_analyze()
-        if cell_type_selection is None:
-            print("No cell type chosen; returning to the startup panel.")
+    # One window now settles everything the analysis would otherwise stop to ask (cell type, the most cells in the UMAP, the ROI run's
+    # label, the optional plots), so that it can then run unattended. Without a window (no display), the questions come one by one at the
+    # console as they always did (run_options stays None).
+    run_options = None
+    selection_counts = None
+    try:
+        print("Counting the cells in the selection...")
+        selection_counts = count_selected_cells(adata, abc_cache, section_series, selected_sections, rois)
+        print(f"Cells in the selection: {selection_counts}")
+    except Exception as e:
+        print(f"Could not count the cells in the selection ({e}); the large-project question will be asked regardless.")
+    try:
+        from abc_tk_launcher import choose_run_options
+        run_options = choose_run_options(cell_type_selection or 'Neurons', counts=selection_counts)
+        if run_options is None:
+            print("Analysis options cancelled; returning to the startup panel.")
             return
-        subset_suffix = CELL_TYPE_SUFFIXES[cell_type_selection]
-        print(f"Selected cell type subset: {cell_type_selection}")
+    except Exception as e:
+        print(f"Analysis options window unavailable ({e}); the questions will be asked here instead.")
+        if cell_type_selection is None:
+            cell_type_selection = prompt_cell_type_selection()
+    if run_options is not None:
+        cell_type_selection = run_options['cell_type']
+        print(f"Analysis options: {run_options}")
+    subset_suffix = CELL_TYPE_SUFFIXES[cell_type_selection]
+    print(f"Selected cell type subset: {cell_type_selection}")
     # Reference point for log_status()'s elapsed-time prefix, used from here on
     # for every status update in the processing pipeline below.
     selection_confirmed_at = time.perf_counter()
@@ -18761,10 +18489,11 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         region_suffix = f'_rois{len(rois)}-{roi_hash}'
         log_status(f"Using {len(rois)} ROI(s) across {len(roi_sections)} section(s) "
                    "(overrides whole-section selection above).")
-        run_label = prompt_roi_run_label()
-        if run_label:
-            region_suffix += f'_{run_label}'
-            log_status(f"Adding label '{run_label}' to this run's folder name.")
+    # The project name (typed in the options window; at the console, asked for ROI runs only, as it always was) ends the folder name.
+    run_label = sanitize_run_label(run_options['label']) if run_options is not None else (prompt_roi_run_label() if rois else '')
+    if run_label:
+        region_suffix += f'_{run_label}'
+        log_status(f"Adding the project name '{run_label}' to this run's folder name.")
 
     # ---------------------------------------------------------------------------
     # Early cache-hit check: look for an existing UMAP run matching this exact
@@ -18887,7 +18616,12 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         log_status(f"Step 4: Skipped — reusing subsample_target={subsample_target} from the matched run.")
     else:
         subsample_target = None  # None means "use every filtered cell, no subsampling"
-        if adata.n_obs > N_SUBSAMPLE_DEFAULT:
+        if run_options is not None:
+            cap = run_options['cap']
+            if cap is not None and adata.n_obs > cap:
+                subsample_target = cap
+                log_status(f"Step 4: {adata.n_obs} cells exceed the limit of {cap}: using a random subset of {cap}.")
+        elif adata.n_obs > N_SUBSAMPLE_DEFAULT:
             subsample_target = prompt_subsample_choice(adata.n_obs, N_SUBSAMPLE_DEFAULT)
 
     run_suffix = f'{subset_suffix}_{sections_suffix}{region_suffix}'
@@ -18920,7 +18654,7 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
     if rois or whole_only_sections:
         if roi_selection_is_unchanged:
             log_status(f"ROI/whole-section selection unchanged since last save; skipping {roi_csv_path}.")
-        elif confirm_overwrite(roi_csv_path):
+        elif run_options is not None or confirm_overwrite(roi_csv_path):       # (with the options window, files of this run are simply replaced)
             # Whole-section rows get blank x_min/x_max/y_min/y_max, marking
             # "every cell in this section" as distinct from an actual
             # sub-region — load_rois_csv() reads that blankness back out to
@@ -18940,7 +18674,7 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         roi_map_path = run_folder / 'roi_map.png'
         if roi_selection_is_unchanged and roi_map_path.exists() and roi_map_path.with_suffix('.svg').exists():
             log_status(f"ROI selection unchanged since last save; skipping {roi_map_path}.")
-        elif confirm_overwrite(roi_map_path):
+        elif run_options is not None or confirm_overwrite(roi_map_path):
             # Uses adata_backed, the reference to the original, unfiltered
             # AnnData saved off in Step 1 before `adata` gets reassigned by
             # filtering/subsampling below, so the map shows each ROI's full
@@ -19148,7 +18882,7 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
     # whichever single subclass gets highlighted interactively in Step 9 below)
     # colored on the UMAP, plus their spatial location.
     if 'subclass' in adata.obs.columns:
-        if prompt_yes_no(
+        if run_options['optional_plots'] if run_options is not None else prompt_yes_no(
             "Step 7: Generate optional plots of UMAP subclasses, and spatial plot of subclass/supertype? (y/N): ",
             default=False,
         ):
