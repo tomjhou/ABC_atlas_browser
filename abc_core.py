@@ -11,7 +11,9 @@ The atlas cache object (`abc_cache`) is always passed in, never global.
 
 import os
 import re
+import sys
 import json
+import pickle
 import math
 import time
 import hashlib
@@ -28,8 +30,14 @@ from matplotlib.image import imread
 
 
 # Resolved from this script's own folder, not the working directory, so the app
-# finds the same data wherever it's launched from.
-SCRIPT_DIR = Path(__file__).resolve().parent
+# finds the same data wherever it's launched from. The packaged program (PyInstaller: see packaging/) has no folder of its own to write in
+# (its files are replaced by every new version), so it keeps its caches, settings and the default atlas and output folders under
+# %LOCALAPPDATA%\JhouLab\ABCAtlasBrowser instead: SCRIPT_DIR is the "program" folder in there and the defaults are beside it.
+if getattr(sys, 'frozen', False):
+    SCRIPT_DIR = Path(os.environ.get('LOCALAPPDATA') or Path.home()) / 'JhouLab' / 'ABCAtlasBrowser' / 'program'
+    SCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+else:
+    SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 # Local cache dir for anything expensive to regenerate but cheap to keep on
@@ -242,28 +250,77 @@ GRID_CACHE_LAYOUT = CACHE_DIR / f'{DATASET_NAME}_section_picker_grid_layout.json
 GRID_CACHE_DPI = 375  # 300 * 1.25
 
 
+ANNOTATION_COLUMNS = ('class', 'subclass', 'supertype', 'cluster', SECTION_COL)     # what load_annotations_aligned() gives
+ANNOTATION_CACHE_VERSION = 1
+
+
+def _index_fingerprint(index):
+    """A short fingerprint of a cell-ID index (its length and about a thousand of its values): enough to tell the atlas's own cell order from any other."""
+    n = len(index)
+    step = max(n // 1000, 1)
+    sample = [str(v) for v in index[::step]] + [str(v) for v in index[-3:]]
+    return hashlib.md5((f"{n}|" + "|".join(sample)).encode('utf-8')).hexdigest()
+
+
+def load_annotations_aligned(index, abc_cache):
+    """The cell-type annotations (class, subclass, supertype, cluster) and the brain section of every cell in `index`, from the atlas's cell
+    metadata table: a DataFrame on `index`, columns as in ANNOTATION_COLUMNS (those the table has), text values, NaN where a cell is not in
+    the table. Reading that table (a gigabyte of CSV) takes the better part of a minute, so the result, already in the order of `index`, is kept
+    in CACHE_DIR, as a table of codes: later calls with the same cells in the same order take about a second. The cache is keyed on the CSV's
+    size and modification time (an updated atlas file is read afresh) and on the index."""
+    meta_path = abc_cache.get_metadata_path(directory='MERFISH-C57BL6J-638850', file_name='cell_metadata_with_cluster_annotation')
+    st = os.stat(meta_path)
+    key = f"{meta_path}|{st.st_mtime_ns}|{st.st_size}|{_index_fingerprint(index)}"
+    cache_path = CACHE_DIR / f"annotations_v{ANNOTATION_CACHE_VERSION}_{hashlib.md5(key.encode('utf-8')).hexdigest()[:16]}.pkl"
+
+    def frame(columns):
+        out = {}
+        for name, (codes, categories) in columns.items():
+            values = np.full(len(codes), np.nan, dtype=object)
+            known = codes >= 0
+            values[known] = categories[codes[known]]
+            out[name] = values
+        return pd.DataFrame(out, index=index)
+
+    try:
+        with open(cache_path, 'rb') as f:
+            cached = pickle.load(f)
+        if cached.get('n') == len(index):
+            return frame(cached['columns'])
+    except Exception:
+        pass
+    header = pd.read_csv(meta_path, nrows=0).columns.tolist()
+    wanted = [c for c in ANNOTATION_COLUMNS if c in header]
+    # dtype str keeps the cell-ID index as text (long numeric-looking IDs would otherwise lose precision as floats)
+    table = pd.read_csv(meta_path, index_col=0, dtype={header[0]: str}, usecols=[header[0]] + wanted)
+    aligned = table.reindex(index)
+    columns = {}
+    for name in wanted:
+        categorical = pd.Categorical(aligned[name])
+        columns[name] = (np.asarray(categorical.codes), categorical.categories.to_numpy(dtype=object))
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, 'wb') as f:
+            pickle.dump({'n': len(index), 'columns': columns}, f, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception as e:
+        print(f"Could not save the annotation cache ({e}); it will be read from the CSV again next time.")
+    return frame(columns)
+
+
 def get_section_labels(adata, abc_cache):
     """Return a pandas Series of per-cell section labels, aligned to
     adata.obs.index. Prefers the column already present on adata.obs;
-    otherwise loads it from the ABC atlas cell_metadata table."""
+    otherwise loads it from the ABC atlas cell_metadata table (through the
+    annotation cache: see load_annotations_aligned)."""
     if SECTION_COL in adata.obs.columns:
         return adata.obs[SECTION_COL]
     try:
-        cell_metadata_path = abc_cache.get_metadata_path(
-            directory='MERFISH-C57BL6J-638850',
-            file_name='cell_metadata_with_cluster_annotation'
-        )
-        header_cols = pd.read_csv(cell_metadata_path, nrows=0).columns.tolist()
-        if SECTION_COL not in header_cols:
+        annotations = load_annotations_aligned(adata.obs.index, abc_cache)
+        if SECTION_COL not in annotations.columns:
             print(f"Warning: '{SECTION_COL}' column not found in cell_metadata; "
                   "section selection unavailable.")
             return None
-        index_col_name = header_cols[0]
-        cell_meta = pd.read_csv(
-            cell_metadata_path, index_col=0, converters={0: str},
-            usecols=[index_col_name, SECTION_COL],
-        )
-        return cell_meta[SECTION_COL].reindex(adata.obs.index)
+        return annotations[SECTION_COL]
     except Exception as e:
         print(f"Warning: could not load '{SECTION_COL}' for section selection ({e}).")
         return None

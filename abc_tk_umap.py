@@ -44,19 +44,22 @@ TILE_PX = 230
 MIN_TILE_PX = 50
 TILE_COLUMNS = (6, 5, 4, 3, 2, 1)         # the Section map size slider's stops: how many panels fit across the pane (1/6 of its width ... all of it)
 DEFAULT_TILE_INDEX = 4                    # (two across)
-DOT_SIZES = {"Small": 0.5, "Medium": 1.0, "Large": 1.5}      # the section panels' dot size choices: times DOT_MM (15, 30 and 60 um)
+CELL_SIZES_UM = (20, 30, 40, 50, 60)       # the Cell size slider's stops: the width of a cell's dot in the section panels, in microns
+CELL_SIZE_NAMES = ("Small", "Medium-small", "Medium", "Medium-large", "Large")
 OTHER_CELLS_DOT_RATIO = 0.5       # the dots of the cells of the other kind (e.g. the non-neurons of a neuron run), relative to the others'
-DEFAULT_DOT_INDEX = 1                     # (the middle of DOT_SIZES)
+DEFAULT_DOT_INDEX = 2                     # (40 microns, DOT_MM: the size the dots have always had)
 MARKER_SIZES = (0.5, 1.0, 2.0)            # the Marker size slider's stops: times the size of the hover ring and of the red + marks in the section panels
 DEFAULT_MARKER_INDEX = 1
 GROUP_SORT_DESCENDING_FIRST = {"count"}     # the group list's columns whose first click sorts largest first (the others: smallest / A first)
 LABEL_SIZES = (0.7, 1.0, 1.4, 2.0)         # the UMAP's Label size slider's stops: times the group numbers' font size
 LABEL_SIZE_NAMES = ("Small", "Medium", "Large", "Very large")
 DEFAULT_LABEL_INDEX = 1
+OPACITIES = (0.15, 0.25, 0.35, 0.5, 0.75, 1.0)      # the Opacity slider's stops, low to high: how opaque one cell's dot is (overlapping dots add up)
+DEFAULT_OPACITY_INDEX = 5                          # (fully opaque: the dots on top hide the ones below)
 LABEL_ZOOM_CAP = 5.0               # the group numbers grow with the zoom up to this, then stay the same size
 HOVER_HOLD_MS = 250                # the pointer must rest this long before the plots dim
 GROUP_HOLD_MS = 500                # ...and this long before the cell's group is marked
-DOT_MM = 0.04                      # a cell's dot in the section panels: 30 um across on the tissue
+DOT_MM = 0.04                      # a cell's dot in the section panels: 40 um across on the tissue
 BIG_DOT_PX = 40                    # dots wider than this are drawn one by one as circles (the maximum filter gets slow)
 SCALEBAR_UM = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000)
 HOVER_RADIUS_PX = 9
@@ -87,6 +90,33 @@ def stamp_plus(img, px, py, rgb, arm):
             xx, yy = px + dx, py + dy
             ok = (xx >= 0) & (xx < w) & (yy >= 0) & (yy < h)
             img[yy[ok], xx[ok]] = rgb[ok] if per_point else rgb
+
+
+def blend_dots(img, px, py, rgb, d, opacity, kernel_cache):
+    """Draw dots of diameter `d` at (px, py) (already shifted by `d`, as in PointCanvas.draw) on `img` with the given opacity, so that dots
+    piled on each other show it: where n dots overlap, the pixel is their average color covering the background with 1 - (1 - opacity) ** n."""
+    h, w = img.shape[:2]
+    W, H = w + 2 * d, h + 2 * d
+    flat = py * W + px
+    size = H * W
+    st = np.empty((H, W, 4), np.float32)
+    for c in range(3):
+        st[..., c] = np.bincount(flat, weights=rgb[:, c], minlength=size).reshape(H, W)
+    st[..., 3] = np.bincount(flat, minlength=size).reshape(H, W)
+    if d > 1:
+        k = kernel_cache.get(d)
+        if k is None:
+            k = kernel_cache[d] = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d)).astype(np.float32)
+        st = cv2.filter2D(st, -1, k)
+    st = st[d:d + h, d:d + w]
+    n = st[..., 3]
+    hit = n > 0.5
+    if not hit.any():
+        return
+    n = n[hit]
+    cover = (1.0 - (1.0 - opacity) ** n)[:, None]
+    mean = st[hit][:, :3] / n[:, None]
+    img[hit] = (img[hit] * (1.0 - cover) + mean * cover + 0.5).astype(np.uint8)
 
 
 class HoverTip:
@@ -143,6 +173,8 @@ class PointCanvas:
         self.on_view = None                         # fn() after a redraw
         self.on_change = None                       # fn(zoom, dx, dy) after the user zoomed or panned (the view, relative to the whole view)
         self.pan_from = None
+        self.opacity = 1.0                          # of one cell's dot, below 1 overlapping dots add up (the Opacity slider)
+        self.kernels = {}                           # dot diameter -> the disc used to spread dots when they are blended
         self.marker_factor = 1.0                    # times the size of the hover ring and of the + marks
         self.dot_factor = 1.0                       # times the size of the dots that have a size on the tissue
         self.visible_fn = None                      # fn() -> whether this canvas is on screen; one that is not is only drawn once it is
@@ -300,6 +332,9 @@ class PointCanvas:
             rgb = lay["rgb"][idx]
             if lay.get("shape") == "plus":
                 stamp_plus(img, px, py, rgb, d)
+                continue
+            if self.opacity < 1.0 and lay.get("shape") != "half":
+                blend_dots(img, px + d, py + d, rgb, d, self.opacity, self.kernels)
                 continue
             if d > BIG_DOT_PX:                                             # (very big dots, so few on screen: each drawn as a circle, later ones on top)
                 r = d // 2
@@ -619,17 +654,15 @@ class UmapWindow(ExportsMixin):
         self.var_tile = tk.IntVar(bars, DEFAULT_TILE_INDEX)
         self.var_dot = tk.IntVar(bars, DEFAULT_DOT_INDEX)
         self.var_marker = tk.IntVar(bars, DEFAULT_MARKER_INDEX)
-        dot_names = list(DOT_SIZES)
-        self.dot_factors = list(DOT_SIZES.values())
+        self.dot_factors = [um / (DOT_MM * 1000) for um in CELL_SIZES_UM]          # (times DOT_MM)
         marker_names = ("Small", "Medium", "Large")
-        dot_um = lambda i: f"{self.dot_factors[i] * DOT_MM * 1000:g} \u00b5m"
         self.sliders = [
             self.add_slider(bars, 0, "Section map size:", self.var_tile, len(TILE_COLUMNS), self.layout_tiles,
                             lambda i: "full width" if TILE_COLUMNS[i] == 1 else f"1/{TILE_COLUMNS[i]} width", None),
-            self.add_slider(bars, 1, "Dot size:", self.var_dot, len(dot_names), self.apply_dot_size, lambda i: dot_names[i],
-                            lambda i: f"Dots are {dot_um(i)} across"),
+            self.add_slider(bars, 1, "Cell size:", self.var_dot, len(CELL_SIZES_UM), self.apply_dot_size,
+                            lambda i: f"{CELL_SIZE_NAMES[i]} ({CELL_SIZES_UM[i]}\u00b5m)", None),
             self.add_slider(bars, 2, "Marker size:", self.var_marker, len(MARKER_SIZES), self.apply_marker_size, lambda i: marker_names[i], None)]
-        ttk.Button(bars, text="Reset to default", command=self.reset_sliders).grid(row=0, column=0, rowspan=3, sticky="w")
+        ttk.Button(bars, text="Reset to default", command=self.reset_sliders).grid(row=0, column=0, rowspan=3, sticky="nsw")
         bars.columnconfigure(3, weight=1)
         self.tile_scroll = tk.Canvas(left, highlightthickness=0, bg="#f4f4f4")
         sb = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.tile_scroll.yview)
@@ -691,6 +724,12 @@ class UmapWindow(ExportsMixin):
         self.var_mode = tk.StringVar(f, "all")
         for value, text in (("all", "All groups"), ("single", "Specific group(s)"), ("gene", "Gene"), ("imputed", "Imputed Gene")):
             ttk.Radiobutton(f, text=text, value=value, variable=self.var_mode, command=self.on_mode).pack(anchor="w")
+        opacity_row = ttk.Frame(f)
+        opacity_row.pack(fill=tk.X, pady=(8, 0))
+        self.var_opacity = tk.IntVar(opacity_row, DEFAULT_OPACITY_INDEX)
+        self.opacity_slider = self.add_slider(opacity_row, 0, "Opacity:", self.var_opacity, len(OPACITIES), self.apply_opacity,
+                                              lambda i: f"{OPACITIES[i] * 100:g}%", None)
+        opacity_row.columnconfigure(0, weight=0)
         self.level_frame = ttk.LabelFrame(f, text="Level", padding=6)
         self.level_frame.pack(fill=tk.X, pady=(8, 0))
         self.var_level = tk.StringVar(f, self.level)
@@ -847,6 +886,7 @@ class UmapWindow(ExportsMixin):
             pc.add_marker("hover", 7)
             pc.plus_arm = 2
             pc.dot_factor = self.dot_factors[self.var_dot.get()]
+            pc.opacity = OPACITIES[self.var_opacity.get()]
             pc.marker_factor = MARKER_SIZES[self.var_marker.get()]
             pc.visible_fn = lambda fr=fr: self.frame_visible(fr)
             if not self.tiles:
@@ -865,7 +905,7 @@ class UmapWindow(ExportsMixin):
         """A slider with `n` stops (0 .. n-1): it jumps from stop to stop, shows `value_text(stop)` beside it, and calls `command()` when the
         stop changes. `tip_text(stop)`, if given, is shown in a tip while the pointer is over the slider. Returns the slider."""
         ttk.Label(parent, text=text).grid(row=row, column=1, sticky="w", padx=(12, 6))
-        shown = ttk.Label(parent, width=12)
+        shown = ttk.Label(parent, width=19)
         shown.grid(row=row, column=3, sticky="w", padx=(6, 0))
         scale = ttk.Scale(parent, from_=0, to=n - 1, orient=tk.HORIZONTAL, length=130)
         scale.grid(row=row, column=2, sticky="w")
@@ -916,10 +956,22 @@ class UmapWindow(ExportsMixin):
         self.root.after_idle(self.refresh_visible)
 
     def apply_dot_size(self):
-        """The Dot size buttons: redraw the section panels with bigger or smaller dots (the ones off screen when they come on screen)."""
+        """The Cell size slider: redraw the section panels with bigger or smaller dots (the ones off screen when they come on screen)."""
         f = self.dot_factors[self.var_dot.get()]
         for t in self.tiles:
             t["pc"].dot_factor = f
+            if self.frame_visible(t["frame"]):
+                t["pc"].request_draw()
+            else:
+                t["pc"].stale = True
+
+    def apply_opacity(self):
+        """The Opacity slider: the UMAP and the section panels are drawn again with dots that are more or less see-through."""
+        f = OPACITIES[self.var_opacity.get()]
+        self.umap.opacity = f
+        self.umap.request_draw()
+        for t in self.tiles:
+            t["pc"].opacity = f
             if self.frame_visible(t["frame"]):
                 t["pc"].request_draw()
             else:

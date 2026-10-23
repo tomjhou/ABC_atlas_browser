@@ -1,0 +1,26 @@
+# The libraries of the packaged ABC atlas browser (ABC_atlas_browser.py and the abc_*.py modules), as tested together (these are the versions
+# the browser was developed with). The program installs missing libraries itself when it runs from source; the packaged one has them inside,
+# so they are pinned here to build the same thing each time. To update: change the pins and let the build's self-test confirm the package.
+numpy==2.4.1
+pandas==2.3.3
+matplotlib==3.10.8
+pillow==12.1.0
+opencv-python==5.0.0.93
+scipy==1.16.3
+scikit-learn==1.9.0
+scikit-image==0.26.0
+anndata==0.12.9
+scanpy==1.12.1
+numba==0.65.1
+llvmlite==0.47.0
+umap-learn==0.5.12
+pynndescent==0.6.0
+igraph==1.0.0
+leidenalg==0.12.0
+pyarrow==23.0.0
+h5py==3.15.1
+plotly==7.1.0
+tkinterdnd2==0.6.4
+# The Allen Institute's access library is not on PyPI: it is installed from its repository, at the commit the browser was tested with.
+abc_atlas_access @ git+https://github.com/alleninstitute/abc_atlas_access.git@c23bb010c9bee8796489a49cdbf1209e77e61c92
+pyinstaller==6.22.3

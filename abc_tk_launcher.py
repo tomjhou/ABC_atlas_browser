@@ -1,62 +1,58 @@
-"""A Tk version of the atlas browser's launch screen: the cell type and output folder, then one of "Open Brain Browser / ROI Chooser", "Load
-Existing ROI Dataset" or "Open 3D Viewer". It is a function of the same shape as the matplotlib one (prompt_startup_panel in
+"""A Tk version of the atlas browser's launch screen: the output folder, then one of "Open Brain Browser / ROI Chooser", "Load
+Existing ROI Dataset" or "Open 3D Viewer". Which cells to analyze (Neurons, Non-neurons or All cells) is asked later, by
+choose_cells_to_analyze(), once the sections and ROIs are confirmed. It is a function of the same shape as the matplotlib one (prompt_startup_panel in
 ABC_atlas_browser.py): the browser passes in the few of its own functions it needs (recent folders, the check of a run folder, the 3D
 viewer launcher, the settings window), so this file has no start-up side effects of its own.
 
     outcome = prompt_startup_panel_tk(out_folder, abc_cache, helpers)
 
-`outcome` is (action, cell_type_selection, load_folder, out_folder) with action 'new_run', 'load_existing' or 'regenerate' (a new run made
-from the ROIs of the run in load_folder, for the chosen cell type), or None if the window was closed or Exit was clicked.
+`outcome` is (action, cell_type_selection, load_folder, out_folder) with action 'new_run' or 'load_existing', or None if the window was closed
+or Exit was clicked. The cell type is None for a new run (not chosen yet) and unused for an existing one (the run says which it is).
 """
 import os
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-CELL_TYPES = ("Neurons", "NonNeurons", "All")
+CELL_TYPES = (("Neurons", "Neurons"), ("NonNeurons", "Non-neurons"), ("All", "All cells"))      # (value, the words on the screen)
 ACCENT = "#1f5fa8"
-RUN_PREFIXES = (("umap_nonneurons_", "NonNeurons"), ("umap_neurons_", "Neurons"), ("umap_all_", "All"))      # (a run folder's name starts with its cell type)
 RECOVERABLE = {"ROI coordinates", "Processed AnnData"}      # (cached files of a run that can be made again: not required to load it)
 
 
-def run_cell_type(folder):
-    """The cell type ("Neurons" | "NonNeurons" | "All") a run folder was made for, from its name; None if the name doesn't say."""
-    name = Path(folder).name.lower()
-    for prefix, cell_type in RUN_PREFIXES:
-        if name.startswith(prefix):
-            return cell_type
-    return None
-
-
-def ask_cell_type_mismatch(parent, folder, run_type, chosen_type):
-    """The run was made for another cell type than the one checked. Returns "load" | "regenerate" | "cancel"."""
-    top = tk.Toplevel(parent)
-    top.title("Cell type mismatch")
-    top.transient(parent)
-    top.resizable(False, False)
-    answer = {"value": "cancel"}
-    f = ttk.Frame(top, padding=20)
+def choose_cells_to_analyze(current="Neurons"):
+    """A small window, after the sections and ROIs are confirmed: which cells the analysis (the UMAP and what follows) is made of. Returns
+    "Neurons" | "NonNeurons" | "All", or None if cancelled."""
+    root = tk.Tk()
+    root.title("Cells to analyze")
+    root.resizable(False, False)
+    choice = tk.StringVar(root, current)
+    answer = {"value": None}
+    f = ttk.Frame(root, padding=22)
     f.pack()
-    ttk.Label(f, text=f"This run was made for {run_type}, but {chosen_type} is checked on the launcher.", font=("Segoe UI", 11, "bold"),
-              wraplength=470, justify=tk.LEFT).pack(anchor="w")
-    ttk.Label(f, text=f"{Path(folder).name}", foreground="gray30", wraplength=470, justify=tk.LEFT).pack(anchor="w", pady=(4, 10))
-    ttk.Label(f, text=f"Load as is opens the {run_type} run unchanged. Regenerate makes a new run for {chosen_type} from the same ROI outlines "
-                      "(the old run is kept).", wraplength=470, justify=tk.LEFT).pack(anchor="w")
+    ttk.Label(f, text="Which cells do you want to analyze?", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+    ttk.Label(f, text="The cells in the sections and ROIs you chose, of this kind, are made into the UMAP.", foreground="gray30",
+              wraplength=330, justify=tk.LEFT).pack(anchor="w", pady=(2, 8))
+    for value, text in CELL_TYPES:
+        ttk.Radiobutton(f, text=text, value=value, variable=choice).pack(anchor="w", pady=(4, 0))
     row = ttk.Frame(f)
     row.pack(fill=tk.X, pady=(16, 0))
 
-    def choose(value):
-        answer["value"] = value
-        top.destroy()
+    def done(ok):
+        answer["value"] = choice.get() if ok else None
+        root.destroy()
 
-    ttk.Button(row, text=f"Regenerate as {chosen_type}", command=lambda: choose("regenerate")).pack(side=tk.LEFT)
-    ttk.Button(row, text="Cancel", command=lambda: choose("cancel")).pack(side=tk.RIGHT)
-    ttk.Button(row, text="Load as is", command=lambda: choose("load")).pack(side=tk.RIGHT, padx=(0, 8))
-    top.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
-    top.update_idletasks()
-    top.geometry(f"+{parent.winfo_rootx() + 40}+{parent.winfo_rooty() + 60}")
-    top.grab_set()
-    parent.wait_window(top)
+    ok_button = ttk.Button(row, text="Continue", command=lambda: done(True))
+    ok_button.pack(side=tk.RIGHT)
+    ttk.Button(row, text="Cancel", command=lambda: done(False)).pack(side=tk.RIGHT, padx=(0, 8))
+    root.bind("<Return>", lambda e: done(True))
+    root.bind("<Escape>", lambda e: done(False))
+    root.protocol("WM_DELETE_WINDOW", lambda: done(False))
+    root.update_idletasks()
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    root.geometry(f"+{(sw - root.winfo_width()) // 2}+{(sh - root.winfo_height()) // 3}")
+    root.attributes("-topmost", True)
+    ok_button.focus_force()
+    root.mainloop()
     return answer["value"]
 
 
@@ -74,13 +70,6 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
     top.pack(fill=tk.X)
     ttk.Label(top, text="AllenABC UMAP Explorer", font=("Segoe UI", 20, "bold")).pack(side=tk.LEFT)
     ttk.Button(top, text="Settings…", command=lambda: helpers["settings_dialog"](abc_cache)).pack(side=tk.RIGHT, anchor="n")
-
-    ttk.Label(outer, text="Cell type when choosing new section/ROI set", font=("Segoe UI", 11)).pack(anchor="w", pady=(18, 4))
-    cell_type = tk.StringVar(root, CELL_TYPES[0])
-    radios = ttk.Frame(outer)
-    radios.pack(anchor="w")
-    for name in CELL_TYPES:
-        ttk.Radiobutton(radios, text=name, value=name, variable=cell_type).pack(side=tk.LEFT, padx=(0, 22))
 
     ttk.Label(outer, text="Output folder (where runs are saved and loaded from):", font=("Segoe UI", 11)).pack(anchor="w", pady=(18, 4))
     row = ttk.Frame(outer)
@@ -127,7 +116,7 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
         if folder is None:
             return
         helpers["remember_recent_output_folder"](folder)
-        result["outcome"] = ("new_run", cell_type.get(), None, folder)
+        result["outcome"] = ("new_run", None, None, folder)
         root.destroy()
 
     def load_existing():
@@ -143,16 +132,8 @@ def prompt_startup_panel_tk(out_folder, abc_cache, helpers):
         if missing:
             messagebox.showerror("Missing cached files", "This folder is missing required cached file(s):\n\n" + "\n".join(missing), parent=root)
             return                                          # (stay here, so another folder can be picked)
-        action = "load_existing"
-        run_type = run_cell_type(chosen_path)
-        if run_type is not None and run_type != cell_type.get():
-            choice = ask_cell_type_mismatch(root, chosen_path, run_type, cell_type.get())
-            if choice == "cancel":
-                return
-            if choice == "regenerate":
-                action = "regenerate"
         helpers["remember_recent_output_folder"](folder)
-        result["outcome"] = (action, cell_type.get(), chosen_path, folder)
+        result["outcome"] = ("load_existing", "All", chosen_path, folder)
         root.destroy()
 
     def viewer3d():

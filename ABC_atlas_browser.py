@@ -99,6 +99,8 @@ REQUIRED_LIBRARIES = {
     'pandas': 'pandas',
     'matplotlib': 'matplotlib',
     'PIL': 'pillow',
+    'cv2': 'opencv-python',
+    'scipy': 'scipy',
     'anndata': 'anndata',
     'scanpy': 'scanpy',
     'abc_atlas_access': 'abc_atlas_access[notebooks] @ git+https://github.com/alleninstitute/abc_atlas_access.git',
@@ -116,6 +118,8 @@ OPTIONAL_LIBRARIES = {
 # script) instead of just listing the commands and quitting. Set False to get
 # the old list-the-commands-and-quit behavior.
 AUTO_INSTALL_LIBRARIES = True
+# The packaged program (packaging/atlas_entry.py) has every library inside and no pip to install more with.
+RUNNING_PACKAGED = getattr(sys, 'frozen', False)
 
 
 def _display_spec(spec):
@@ -366,7 +370,8 @@ def check_libraries_or_exit():
         sys.exit(1)
 
 
-check_libraries_or_exit()
+if not RUNNING_PACKAGED:
+    check_libraries_or_exit()
 
 startup_note("Loading the libraries (numpy, pandas, scanpy, matplotlib, ...). The first start after a reboot is the slowest.")
 import numpy as np
@@ -410,7 +415,7 @@ from abc_core import (
     Z_MODE_OPTIONS, _expr_column_cache, _get_full_gene_column, _read_section_coordinates, _spatial_csv_cache_path,
     build_neuron_class_colors, ccf_files_missing, class_id_to_color, ensure_spatial_load_started, extract_leading_numeric_id,
     find_gene_index, gene_expression_cache_paths, gene_symbol_list, generate_and_cache_section_image, generate_section_grid_image,
-    get_section_labels, load_coordinate_settings, load_imputed_adata, load_rois_csv, load_section_spatial_coords,
+    get_section_labels, load_annotations_aligned, load_coordinate_settings, load_imputed_adata, load_rois_csv, load_section_spatial_coords,
     load_valid_section_roi_cache, map_data_to_pixel, map_pixel_to_data, metadata_file_status, multi_gene_rgb, parse_gene_names,
     rank_gene_suggestions, render_gene_expression_array, render_group_highlight_array, render_multi_gene_expression_array,
     render_section_level_array, resolve_gene_names, sanitize_section_token, save_coordinate_settings, scatter_gray_then_colored,
@@ -10800,29 +10805,6 @@ def prompt_roi_run_label():
     return label
 
 
-def regenerate_selection(run_folder, section_series):
-    """The section/ROI selection of a saved run, so a new run (another cell type) can be made without the picker. Returns
-    (selected_sections, sections_suffix, rois, label) like the picker's result plus the run's own label (the part of its folder name after
-    the ROI hash, '' if none): selected_sections is None for every section, else the whole-section picks (with ROIs: the ones that have
-    no ROI of their own)."""
-    run_folder = Path(run_folder)
-    label = ''
-    m = re.search(r'_rois\d+-[0-9a-f]{8}(?:_(?!sub\d+$)(?P<label>.*?))?(?:_sub\d+)?$', run_folder.name)
-    if m and m.group('label'):
-        label = m.group('label')
-    roi_csv = run_folder / 'roi_coords.csv'
-    rois, whole = (load_rois_csv(roi_csv) if roi_csv.exists() else ([], []))
-    if rois:
-        return (whole or None), 'sections', rois, label
-    if '_allsections' in run_folder.name:
-        return None, 'allsections', [], label
-    # sections only: the sections the run's cells are in
-    ids = pd.read_csv(run_folder / 'umap_coords.csv', index_col=0, usecols=[0], converters={0: str}).index
-    sections = sorted_sections_descending(section_series.reindex(ids).dropna().unique().tolist())
-    tokens = '-'.join(sanitize_section_token(x) for x in sections)
-    return sections, f'sections-{tokens}', [], label
-
-
 def confirm_overwrite(path):
     """If `path` already exists, ask the user whether to overwrite it.
     Returns True if the caller should proceed with writing the file."""
@@ -18620,8 +18602,11 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         cell_type_selection = prompt_cell_type_selection()
         startup_action, load_existing_folder = 'new_run', None
 
-    subset_suffix = CELL_TYPE_SUFFIXES[cell_type_selection]
-    print(f"Selected cell type subset: {cell_type_selection}")
+    # The Tk launch screen doesn't ask for the cell type: it is asked once the sections and ROIs are confirmed (below), and the picker
+    # shows every cell until then.
+    if cell_type_selection is not None:
+        subset_suffix = CELL_TYPE_SUFFIXES[cell_type_selection]
+        print(f"Selected cell type subset: {cell_type_selection}")
 
     if startup_action == 'load_existing':
         # Skips section/ROI selection and UMAP computation (Steps 1-8) entirely
@@ -18720,20 +18705,12 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
     # ---------------------------------------------------------------------------
     # Section subset selection
     # ---------------------------------------------------------------------------
-    regenerate_label = None
     try:
-        if startup_action == 'regenerate':
-            # a new run for another cell type, from the sections and ROIs of the run chosen on the launcher: no picker
-            selected_sections, sections_suffix, rois, regenerate_label = regenerate_selection(load_existing_folder, section_series)
-            imputed_adata_from_picker = None
-            print(f"Regenerating {Path(load_existing_folder).name} as {cell_type_selection}: "
-                  f"{len(rois)} ROI(s), sections {'all' if selected_sections is None else len(selected_sections)}.")
-        else:
-            print("Attempting to open the clickable section-thumbnail picker...")
-            selected_sections, sections_suffix, rois, imputed_adata_from_picker = prompt_section_selection_gui(
-                adata, abc_cache, section_series, out_folder=out_folder, cell_type_selection=cell_type_selection,
-                imputed_state=imputed_state,
-            )
+        print("Attempting to open the clickable section-thumbnail picker...")
+        selected_sections, sections_suffix, rois, imputed_adata_from_picker = prompt_section_selection_gui(
+            adata, abc_cache, section_series, out_folder=out_folder, cell_type_selection=cell_type_selection or 'All',
+            imputed_state=imputed_state,
+        )
     except UserCancelledSelection:
         print("Section/ROI selection cancelled; returning to the startup panel.")
         return
@@ -18742,6 +18719,14 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         selected_sections, sections_suffix = prompt_section_selection(section_series)
         rois = []
         imputed_adata_from_picker = None
+    if cell_type_selection is None:
+        from abc_tk_launcher import choose_cells_to_analyze
+        cell_type_selection = choose_cells_to_analyze()
+        if cell_type_selection is None:
+            print("No cell type chosen; returning to the startup panel.")
+            return
+        subset_suffix = CELL_TYPE_SUFFIXES[cell_type_selection]
+        print(f"Selected cell type subset: {cell_type_selection}")
     # Reference point for log_status()'s elapsed-time prefix, used from here on
     # for every status update in the processing pipeline below.
     selection_confirmed_at = time.perf_counter()
@@ -18776,7 +18761,7 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         region_suffix = f'_rois{len(rois)}-{roi_hash}'
         log_status(f"Using {len(rois)} ROI(s) across {len(roi_sections)} section(s) "
                    "(overrides whole-section selection above).")
-        run_label = regenerate_label if startup_action == 'regenerate' else prompt_roi_run_label()
+        run_label = prompt_roi_run_label()
         if run_label:
             region_suffix += f'_{run_label}'
             log_status(f"Adding label '{run_label}' to this run's folder name.")
@@ -18841,24 +18826,20 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
     else:
         log_status("Step 2: Attempting to load and merge cell type metadata...")
         try:
-            cell_metadata_path = abc_cache.get_metadata_path(
-                directory='MERFISH-C57BL6J-638850',
-                file_name='cell_metadata_with_cluster_annotation'
-            )
-            # converters={0: str} keeps the cell-ID index as text (see note above
-            # about float64 precision loss on long numeric-looking IDs).
-            cell_meta = pd.read_csv(cell_metadata_path, index_col=0, converters={0: str})
-            metadata_cols = [
-                c for c in ['class', 'subclass', 'supertype', 'cluster', SECTION_COL]
-                if c in cell_meta.columns and c not in adata.obs.columns
-            ]
-            # A left join onto adata.obs (rather than subsetting adata to the
+            # The table is read from the CSV only the first time (a gigabyte; the better part of a minute): after that from a cache that
+            # is already in the order of adata.obs, so the columns are simply added (see load_annotations_aligned).
+            annotations = load_annotations_aligned(adata.obs.index, abc_cache)
+            metadata_cols = [c for c in annotations.columns if c not in adata.obs.columns]
+            # Adding columns to adata.obs (rather than subsetting adata to the
             # intersection first) keeps adata backed — subsetting a backed AnnData
             # with .copy() isn't allowed (see materialize_subset's note), and would
             # force a full disk read here regardless, before any filtering has had
             # a chance to shrink what needs to be read.
-            n_matched = adata.obs.index.isin(cell_meta.index).sum()
-            adata.obs = adata.obs.join(cell_meta[metadata_cols])
+            n_matched = int(annotations[SECTION_COL if SECTION_COL in annotations.columns else annotations.columns[0]].notna().sum())
+            new_obs = adata.obs.copy()
+            for c in metadata_cols:
+                new_obs[c] = annotations[c].to_numpy()
+            adata.obs = new_obs
             color_key = 'class' if 'class' in adata.obs.columns else None
             log_status(f"Step 2: Merged metadata for {n_matched} of {adata.n_obs} cells. Coloring by '{color_key}'.")
         except Exception as e:
@@ -19284,7 +19265,7 @@ _recent_folders = load_recent_output_folders()
 # First launch: a folder next to this repository (so, next to the default atlas
 # location), which needs no drive letter or user name and isn't cloud-synced
 # the way Documents often is. After that, the most recently used folder.
-DEFAULT_OUTPUT_FOLDER = SCRIPT_DIR.parent / 'ABC_atlas_browser_output'
+DEFAULT_OUTPUT_FOLDER = (Path.home() / 'Documents' if RUNNING_PACKAGED else SCRIPT_DIR.parent) / 'ABC_atlas_browser_output'
 _initial_out_folder = resolve_out_folder(_recent_folders[0] if _recent_folders else str(DEFAULT_OUTPUT_FOLDER))
 session_state = {'out_folder': _initial_out_folder}
 startup_note("Opening the launch screen...")
