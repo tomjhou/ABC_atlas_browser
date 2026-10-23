@@ -18,6 +18,7 @@ from pathlib import Path
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk
 
 import cv2
@@ -41,11 +42,17 @@ MAX_COLORED_CATEGORIES = 400
 LEVEL_NAMES = {"class": "Class", "subclass": "Subclass", "supertype": "Supertype", "cluster": "Cluster", "leiden": "Leiden"}
 TILE_PX = 230
 MIN_TILE_PX = 50
-TILE_COLUMNS = {"Very small": 5, "Small": 3, "Medium": 2, "Large": 1}     # the section panels' size choices: how many fit across the pane (a fifth, a third, a half, all of its width)
-DEFAULT_TILE_SIZE = "Medium"
+TILE_COLUMNS = (6, 5, 4, 3, 2, 1)         # the Section map size slider's stops: how many panels fit across the pane (1/6 of its width ... all of it)
+DEFAULT_TILE_INDEX = 4                    # (two across)
 DOT_SIZES = {"Small": 0.5, "Medium": 1.0, "Large": 1.5}      # the section panels' dot size choices: times DOT_MM (15, 30 and 60 um)
 OTHER_CELLS_DOT_RATIO = 0.5       # the dots of the cells of the other kind (e.g. the non-neurons of a neuron run), relative to the others'
-DEFAULT_DOT_SIZE = "Medium"
+DEFAULT_DOT_INDEX = 1                     # (the middle of DOT_SIZES)
+MARKER_SIZES = (0.5, 1.0, 2.0)            # the Marker size slider's stops: times the size of the hover ring and of the red + marks in the section panels
+DEFAULT_MARKER_INDEX = 1
+GROUP_SORT_DESCENDING_FIRST = {"count"}     # the group list's columns whose first click sorts largest first (the others: smallest / A first)
+LABEL_SIZES = (0.7, 1.0, 1.4, 2.0)         # the UMAP's Label size slider's stops: times the group numbers' font size
+LABEL_SIZE_NAMES = ("Small", "Medium", "Large", "Very large")
+DEFAULT_LABEL_INDEX = 1
 LABEL_ZOOM_CAP = 5.0               # the group numbers grow with the zoom up to this, then stay the same size
 HOVER_HOLD_MS = 250                # the pointer must rest this long before the plots dim
 GROUP_HOLD_MS = 500                # ...and this long before the cell's group is marked
@@ -82,6 +89,31 @@ def stamp_plus(img, px, py, rgb, arm):
             img[yy[ok], xx[ok]] = rgb[ok] if per_point else rgb
 
 
+class HoverTip:
+    """A small tip beside the pointer while it is over `widget`; `text_fn()` gives the text (asked again as the pointer moves)."""
+
+    def __init__(self, widget, text_fn):
+        self.widget, self.text_fn, self.tip, self.label = widget, text_fn, None, None
+        widget.bind("<Enter>", self.show, add="+")
+        widget.bind("<Motion>", self.show, add="+")
+        widget.bind("<Leave>", self.hide, add="+")
+        widget.bind("<ButtonPress>", self.show, add="+")
+
+    def show(self, e):
+        if self.tip is None:
+            self.tip = tk.Toplevel(self.widget)
+            self.tip.wm_overrideredirect(True)
+            self.label = tk.Label(self.tip, bg="#ffffe0", relief="solid", borderwidth=1, font=("Segoe UI", 9), padx=4, pady=1)
+            self.label.pack()
+        self.label.config(text=self.text_fn())
+        self.tip.wm_geometry(f"+{e.x_root + 12}+{e.y_root + 18}")
+
+    def hide(self, e=None):
+        if self.tip is not None:
+            self.tip.destroy()
+            self.tip = self.label = None
+
+
 class PointCanvas:
     """Points drawn straight onto a Tk canvas: wheel zoom about the pointer, left- or right-drag pan, never out past the whole (`home`)
     view and never off its edges. `layers` are drawn in order; each is {'x','y','rgb','size'}. Markers (the hover ring), rectangles
@@ -104,12 +136,14 @@ class PointCanvas:
         self.markers = {}                           # name -> [item, x, y] (x None: hidden)
         self.rects = []                             # [item, x0, y0, x1, y1]
         self.labels = []                            # [item, x, y]
+        self.label_factor = 1.0                     # the Label size slider
         self.label_size = 8                         # the group labels' font size: grows with the zoom up to LABEL_ZOOM_CAP, then stops
         self.scalebar = None                        # (line item, text item) once enabled: data units are mm
         self.on_motion = None                       # fn(cx, cy) ; fn(None, None) on leave
         self.on_view = None                         # fn() after a redraw
         self.on_change = None                       # fn(zoom, dx, dy) after the user zoomed or panned (the view, relative to the whole view)
         self.pan_from = None
+        self.marker_factor = 1.0                    # times the size of the hover ring and of the + marks
         self.dot_factor = 1.0                       # times the size of the dots that have a size on the tissue
         self.visible_fn = None                      # fn() -> whether this canvas is on screen; one that is not is only drawn once it is
         self.stale = False                          # needs drawing (it was not on screen when asked)
@@ -311,7 +345,7 @@ class PointCanvas:
             dy = (y - self.cy) * self.scale
             py = ((-dy if self.flip_y else dy) + h / 2).astype(np.int32)
             zoom = self.scale / self.fit_scale()
-            stamp_plus(img, px, py, np.array([255, 0, 0], np.uint8), int(min(self.plus_arm + zoom ** 0.4, 14)))
+            stamp_plus(img, px, py, np.array([255, 0, 0], np.uint8), max(int(min((self.plus_arm + zoom ** 0.4) * self.marker_factor, 14 * self.marker_factor)), 1))
         self.photo = ImageTk.PhotoImage(Image.fromarray(np.ascontiguousarray(img)), master=self.canvas)
         self.canvas.itemconfig(self.item, image=self.photo)
 
@@ -364,7 +398,7 @@ class PointCanvas:
             self.canvas.itemconfig(m[0], state="hidden")
             return
         px, py = self.to_canvas(m[1], m[2])
-        r = m[3]
+        r = m[3] * self.marker_factor
         self.canvas.coords(m[0], px - r, py - r, px + r, py + r)
         self.canvas.itemconfig(m[0], state="normal")
         self.canvas.tag_raise(m[0])
@@ -398,9 +432,14 @@ class PointCanvas:
         item = self.canvas.create_text(0, 0, text=text, font=("Segoe UI", self.label_size, "bold"), fill=color)
         self.labels.append([item, x, y])
 
+    def set_label_factor(self, factor):
+        self.label_factor = factor
+        self.label_size = None                      # (so the next update applies the new size)
+        self.update_label_size()
+
     def update_label_size(self):
         zoom = min(self.scale / self.fit_scale(), LABEL_ZOOM_CAP)
-        size = int(round(8 * (1 + 0.75 * (zoom - 1))))
+        size = max(int(round(8 * self.label_factor * (1 + 0.75 * (zoom - 1)))), 1)
         if size != self.label_size:
             self.label_size = size
             for it in self.labels:
@@ -468,6 +507,9 @@ class UmapWindow(ExportsMixin):
         self.gene_cache = None             # ((genes, imputed, scale), values read) of the genes shown, so a legend click re-uses them
         self.hidden = set()                # the genes switched off by a legend click
         self.multi_rows = None
+        self.last_group_click = None       # (group, whether it was switched to gray) of the last click on a legend row: where a shift-click starts
+        self.hover_group = None            # the legend row the pointer is on
+        self.single_names = {}             # Single group(s): number -> full name of each group
         self.off_groups = set()            # the groups switched to gray by a click on their legend swatch (All groups: their names; Single group(s): their numbers)
         self.last_ids = None               # the groups typed in Single group(s): level, targets, colors, cells
         self.export_cat = None             # what the categorical colours mean (for a saved legend)
@@ -574,13 +616,21 @@ class UmapWindow(ExportsMixin):
         left = ttk.Frame(pw)
         bars = ttk.Frame(left, padding=(6, 4))
         bars.pack(side=tk.TOP, fill=tk.X)
-        self.var_tile_size = tk.StringVar(bars, DEFAULT_TILE_SIZE)
-        self.var_dot_size = tk.StringVar(bars, DEFAULT_DOT_SIZE)
-        for r, (text, var, choices, command) in enumerate((("Section map size:", self.var_tile_size, TILE_COLUMNS, self.layout_tiles),
-                                                           ("Dot size:", self.var_dot_size, DOT_SIZES, self.apply_dot_size))):
-            ttk.Label(bars, text=text, width=16).grid(row=r, column=0, sticky="w")
-            for k, name in enumerate(choices):
-                ttk.Radiobutton(bars, text=name, value=name, variable=var, command=command).grid(row=r, column=k + 1, sticky="w", padx=(8, 0))
+        self.var_tile = tk.IntVar(bars, DEFAULT_TILE_INDEX)
+        self.var_dot = tk.IntVar(bars, DEFAULT_DOT_INDEX)
+        self.var_marker = tk.IntVar(bars, DEFAULT_MARKER_INDEX)
+        dot_names = list(DOT_SIZES)
+        self.dot_factors = list(DOT_SIZES.values())
+        marker_names = ("Small", "Medium", "Large")
+        dot_um = lambda i: f"{self.dot_factors[i] * DOT_MM * 1000:g} \u00b5m"
+        self.sliders = [
+            self.add_slider(bars, 0, "Section map size:", self.var_tile, len(TILE_COLUMNS), self.layout_tiles,
+                            lambda i: "full width" if TILE_COLUMNS[i] == 1 else f"1/{TILE_COLUMNS[i]} width", None),
+            self.add_slider(bars, 1, "Dot size:", self.var_dot, len(dot_names), self.apply_dot_size, lambda i: dot_names[i],
+                            lambda i: f"Dots are {dot_um(i)} across"),
+            self.add_slider(bars, 2, "Marker size:", self.var_marker, len(MARKER_SIZES), self.apply_marker_size, lambda i: marker_names[i], None)]
+        ttk.Button(bars, text="Reset to default", command=self.reset_sliders).grid(row=0, column=0, rowspan=3, sticky="w")
+        bars.columnconfigure(3, weight=1)
         self.tile_scroll = tk.Canvas(left, highlightthickness=0, bg="#f4f4f4")
         sb = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.tile_scroll.yview)
         self.tile_scroll.configure(yscrollcommand=lambda a, b: (sb.set(a, b), self.root.after_idle(self.refresh_visible)))
@@ -595,6 +645,13 @@ class UmapWindow(ExportsMixin):
         pw.add(left, weight=2)
         # the UMAP
         mid = ttk.Frame(pw)
+        umap_bar = ttk.Frame(mid, padding=(6, 4))
+        umap_bar.pack(side=tk.TOP, fill=tk.X)
+        self.var_label = tk.IntVar(umap_bar, DEFAULT_LABEL_INDEX)
+        self.umap_sliders = [self.add_slider(umap_bar, 0, "Label size:", self.var_label, len(LABEL_SIZES), self.apply_label_size,
+                                             lambda i: LABEL_SIZE_NAMES[i], None)]
+        ttk.Button(umap_bar, text="Reset to default", command=self.reset_umap_sliders).grid(row=0, column=0, sticky="w")
+        umap_bar.columnconfigure(3, weight=1)
         c = self.coords
         padx = (c[:, 0].max() - c[:, 0].min()) * 0.05 or 1.0
         pady = (c[:, 1].max() - c[:, 1].min()) * 0.05 or 1.0
@@ -673,14 +730,22 @@ class UmapWindow(ExportsMixin):
         # the legend for Single group(s)
         self.legend = tk.Canvas(f, width=300, height=10, highlightthickness=0)
         self.group_list = ttk.Frame(f)                      # the groups' numbers and colors (All groups), scrollable
+        self.group_header = tk.Canvas(self.group_list, height=20, highlightthickness=0, cursor="hand2")      # the column headings: click to sort
+        self.group_header.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
+        self.group_header.bind("<Button-1>", self.on_group_header_click)
+        self.group_sort = ("id", False)                    # (column, descending): kept when the level changes
         self.group_canvas = tk.Canvas(self.group_list, width=300, height=40, highlightthickness=0, bg="white")
         gsb = ttk.Scrollbar(self.group_list, orient=tk.VERTICAL, command=self.group_canvas.yview)
         self.group_canvas.configure(yscrollcommand=gsb.set)
         gsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.group_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.group_canvas.bind("<Button-1>", self.on_group_list_click)
+        self.group_canvas.bind("<Motion>", self.on_group_list_motion)
+        self.group_canvas.bind("<Leave>", lambda e: self.show_legend_group(None))
         self.group_canvas.config(cursor="hand2")
         self.legend.bind("<Button-1>", self.on_single_legend_click)
+        self.legend.bind("<Motion>", self.on_single_legend_motion)
+        self.legend.bind("<Leave>", lambda e: self.show_legend_group(None))
         self.legend.config(cursor="hand2")
         self.group_canvas.bind("<MouseWheel>", lambda e: self.group_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
         self.build_buttons(f)
@@ -781,7 +846,8 @@ class UmapWindow(ExportsMixin):
             pc.canvas.bind("<Shift-MouseWheel>", lambda e: self.tile_scroll.yview_scroll(-1 if e.delta > 0 else 1, "units"))     # (the plain wheel zooms)
             pc.add_marker("hover", 7)
             pc.plus_arm = 2
-            pc.dot_factor = DOT_SIZES[self.var_dot_size.get()]
+            pc.dot_factor = self.dot_factors[self.var_dot.get()]
+            pc.marker_factor = MARKER_SIZES[self.var_marker.get()]
             pc.visible_fn = lambda fr=fr: self.frame_visible(fr)
             if not self.tiles:
                 pc.enable_scalebar()                       # (the first section's panel carries the scale bar)
@@ -795,12 +861,50 @@ class UmapWindow(ExportsMixin):
         self.tile_cols = self.tile_px = 0
         self.layout_tiles()
 
+    def add_slider(self, parent, row, text, var, n, command, value_text, tip_text):
+        """A slider with `n` stops (0 .. n-1): it jumps from stop to stop, shows `value_text(stop)` beside it, and calls `command()` when the
+        stop changes. `tip_text(stop)`, if given, is shown in a tip while the pointer is over the slider. Returns the slider."""
+        ttk.Label(parent, text=text).grid(row=row, column=1, sticky="w", padx=(12, 6))
+        shown = ttk.Label(parent, width=12)
+        shown.grid(row=row, column=3, sticky="w", padx=(6, 0))
+        scale = ttk.Scale(parent, from_=0, to=n - 1, orient=tk.HORIZONTAL, length=130)
+        scale.grid(row=row, column=2, sticky="w")
+
+        def moved(v):
+            i = int(round(float(v)))
+            if abs(float(v) - i) > 1e-6:
+                scale.set(i)                               # (snaps to the stop, which calls this again)
+                return
+            shown.config(text=value_text(i))
+            if var.get() != i:
+                var.set(i)
+                command()
+
+        scale.config(command=moved)
+        scale.set(var.get())
+        shown.config(text=value_text(var.get()))
+        if tip_text is not None:
+            HoverTip(scale, lambda: tip_text(var.get()))
+        return scale
+
+    def apply_label_size(self):
+        """The UMAP's Label size slider: the group numbers drawn on the UMAP, bigger or smaller."""
+        self.umap.set_label_factor(LABEL_SIZES[self.var_label.get()])
+
+    def reset_umap_sliders(self):
+        for scale, default in zip(self.umap_sliders, (DEFAULT_LABEL_INDEX,)):
+            scale.set(default)
+
+    def reset_sliders(self):
+        for scale, default in zip(self.sliders, (DEFAULT_TILE_INDEX, DEFAULT_DOT_INDEX, DEFAULT_MARKER_INDEX)):
+            scale.set(default)
+
     def layout_tiles(self):
         """The panels are a third, a half or all of the pane's width (the Section map size buttons), as many to a row as that gives; the
         pane scrolls to the rest."""
         if not getattr(self, "tiles", None):
             return
-        cols = TILE_COLUMNS[self.var_tile_size.get()]
+        cols = TILE_COLUMNS[self.var_tile.get()]
         w = max(self.tile_scroll.winfo_width(), 100)
         px = int(max((w - 4) // cols - 8 - 2, MIN_TILE_PX))          # (8: the gaps either side of a panel; 2: its canvas border)
         if cols == self.tile_cols and px == self.tile_px:
@@ -813,13 +917,24 @@ class UmapWindow(ExportsMixin):
 
     def apply_dot_size(self):
         """The Dot size buttons: redraw the section panels with bigger or smaller dots (the ones off screen when they come on screen)."""
-        f = DOT_SIZES[self.var_dot_size.get()]
+        f = self.dot_factors[self.var_dot.get()]
         for t in self.tiles:
             t["pc"].dot_factor = f
             if self.frame_visible(t["frame"]):
                 t["pc"].request_draw()
             else:
                 t["pc"].stale = True
+
+    def apply_marker_size(self):
+        """The Marker size slider: the hover ring and the + marks of the section panels, bigger or smaller."""
+        f = MARKER_SIZES[self.var_marker.get()]
+        for t in self.tiles:
+            pc = t["pc"]
+            pc.marker_factor = f
+            for m in pc.markers.values():
+                pc.place_marker(m)
+            if pc.pluses is not None:
+                pc.request_compose()
 
     def link_tiles(self, source, zoom, dx, dy):
         """Zooming or panning one section does the same to all the others."""
@@ -864,6 +979,7 @@ class UmapWindow(ExportsMixin):
 
     def recolor(self, keep_off=False):
         if not keep_off:
+            self.last_group_click = None
             self.off_groups = set()                      # (a new level, mode or list of groups starts with every group colored)
         self.var_status.set("")
         self.legend.pack_forget()
@@ -1000,24 +1116,83 @@ class UmapWindow(ExportsMixin):
         self.values = None
         self.draw_group_list(ranked, uniques, counts)
 
+    def draw_legend_rows(self, canvas, rows, x0):
+        """The rows of a group legend, in columns: swatch, number, cell count (right-aligned) and the group's name (all names start at the same x).
+        `rows`: (swatch color, number, count text, name, grayed out). Returns the width used."""
+        font = tkfont.Font(root=canvas, family="Segoe UI", size=9)
+        w_num = max((font.measure(r[1]) for r in rows), default=0)
+        w_cnt = max((font.measure(r[2]) for r in rows), default=0)
+        x_num, x_cnt, x_name = x0 + 22, x0 + 22 + w_num + 8 + w_cnt, x0 + 22 + w_num + 8 + w_cnt + 10
+        self.legend_cols = (x_num, x_cnt - w_cnt, x_cnt, x_name)          # (where the number, count and name columns start; the count's right edge)
+        for k, (col, num, cnt, name, off) in enumerate(rows):
+            cy = 4 + 22 * k + 11
+            fill = "gray55" if off else "black"
+            canvas.create_rectangle(x0, cy - 6, x0 + 12, cy + 6, fill=col, outline="")
+            canvas.create_text(x_num, cy, anchor="w", text=num, font=font, fill=fill)
+            canvas.create_text(x_cnt, cy, anchor="e", text=cnt, font=font, fill=fill)
+            canvas.create_text(x_name, cy, anchor="w", text=name, font=font, fill=fill)
+        return x_name + max((font.measure(r[3]) for r in rows), default=0) + 8
+
     def draw_group_list(self, ranked, uniques, counts):
-        """The colored groups by number, each with its swatch and cell count (the ones past the colored cap are gray and not listed)."""
+        """The colored groups, each with its swatch, number, cell count and name (the ones past the colored cap are gray and not listed),
+        in the order of the Sort by buttons."""
+        self.group_list_args = (ranked, uniques, counts)
         c = self.group_canvas
         c.delete("all")
         rows = []
         for r, u in enumerate(ranked):
             m = re.match(r"^\s*(\d+)", str(uniques[u]))
             off = str(uniques[u]) in self.off_groups
-            rows.append((int(m.group(1)) if m else 10 ** 9, m.group(1) if m else str(uniques[u]), hexcolor(GREY if off else rank_color(r)), int(counts[u]),
-                         str(uniques[u]), off))
-        rows.sort()
-        self.group_rows = [row[4] for row in rows]
-        for k, (_n, label, col, cnt, _key, off) in enumerate(rows):
-            cy = 4 + 22 * k + 11
-            c.create_rectangle(6, cy - 6, 18, cy + 6, fill=col, outline="")
-            c.create_text(26, cy, anchor="w", text=f"{label}  ({cnt})", font=("Segoe UI", 9), fill="gray55" if off else "black")
-        c.configure(scrollregion=(0, 0, 300, 8 + 22 * len(rows)))
+            name = re.sub(r"^\s*\d+\s*", "", str(uniques[u])) if m else ""
+            rows.append({"id": int(m.group(1)) if m else 10 ** 9, "color": hexcolor(GREY if off else rank_color(r)),
+                         "num": m.group(1) if m else str(uniques[u]), "count": int(counts[u]), "name": name, "off": off, "key": str(uniques[u])})
+        column, descending = self.group_sort
+        rows.sort(key=lambda r: (r["id"], r["key"]))                      # (ties stay in ID order)
+        if column == "count":
+            rows.sort(key=lambda r: r["count"], reverse=descending)
+        elif column == "name":
+            rows.sort(key=lambda r: (r["name"] or r["num"]).lower(), reverse=descending)
+        elif descending:
+            rows.reverse()
+        self.group_rows = [r["key"] for r in rows]
+        width = self.draw_legend_rows(c, [(r["color"], r["num"], f"({r['count']})", r["name"], r["off"]) for r in rows], 6)
+        c.configure(scrollregion=(0, 0, max(300, width), 8 + 22 * len(rows)))
+        self.draw_group_header()
         self.group_list.pack(fill=tk.BOTH, expand=True, pady=(6, 0), after=self.box)
+
+    def draw_group_header(self):
+        """The headings of the group list's columns, over the columns, each with an arrow: dark on the column it is sorted by (pointing the way it
+        is sorted), light gray on the others (pointing the way a click on them would sort)."""
+        h = self.group_header
+        h.delete("all")
+        x_num, x_cnt_left, x_cnt, x_name = self.legend_cols
+        column, descending = self.group_sort
+        font = tkfont.Font(root=h, family="Segoe UI", size=9, weight="bold")
+        gap = font.measure(" ")
+        for key, text, x, right in (("id", "#", x_num, False), ("count", "Cells", x_cnt, True), ("name", "Name", x_name, False)):
+            active = key == column
+            down = descending if active else key in GROUP_SORT_DESCENDING_FIRST
+            arrow = "\u25bc" if down else "\u25b2"
+            color = "gray20" if active else "gray75"
+            w_arrow = font.measure(arrow)
+            if right:                                     # (the text ends at the column's right edge, with the arrow there)
+                h.create_text(x, 10, anchor="e", text=arrow, font=font, fill=color)
+                h.create_text(x - w_arrow - gap, 10, anchor="e", text=text, font=font, fill="gray30")
+                self.count_head_left = min(x_cnt_left, x - w_arrow - gap - font.measure(text)) - 2      # (where a click counts for Cells, not #)
+            else:
+                h.create_text(x, 10, anchor="w", text=text, font=font, fill="gray30")
+                h.create_text(x + font.measure(text) + gap, 10, anchor="w", text=arrow, font=font, fill=color)
+
+    def on_group_header_click(self, e):
+        """Click a heading to sort by that column; click it again to reverse the order."""
+        if self.mode != "all" or getattr(self, "group_list_args", None) is None:
+            return
+        x_num, x_cnt_left, x_cnt, x_name = self.legend_cols
+        key = "id" if e.x < getattr(self, "count_head_left", x_cnt_left) else "count" if e.x < x_name else "name"
+        column, descending = self.group_sort
+        self.group_sort = (key, not descending) if key == column else (key, key in GROUP_SORT_DESCENDING_FIRST)
+        self.draw_group_list(*self.group_list_args)
+        self.group_canvas.yview_moveto(0)
 
     def parse_ids(self):
         ids, bad = [], []
@@ -1085,21 +1260,19 @@ class UmapWindow(ExportsMixin):
         if bad:
             parts.append("ignored: " + ", ".join(bad))
         self.var_status.set("; ".join(parts) + ".")
-        self.draw_legend(ids, colors, counts)
+        self.single_names = full
+        self.draw_legend(ids, colors, counts, full)
         self.values = None
 
-    def draw_legend(self, ids, colors, counts):
+    def draw_legend(self, ids, colors, counts, names=None):
         if len(ids) < 2:
             return
         self.legend.pack(fill=tk.X, pady=(6, 0), after=self.box)
         self.legend.delete("all")
         self.legend.config(height=22 * len(ids) + 8)
-        for k, t in enumerate(ids):
-            col = "#%02x%02x%02x" % tuple(int(v) for v in colors[t])
-            cy = 4 + 22 * k + 11
-            self.legend.create_rectangle(4, cy - 6, 18, cy + 6, fill=col, outline="")
-            self.legend.create_text(26, cy, anchor="w", text=f"{t}  ({counts[t]} cells)", font=("Segoe UI", 9),
-                                    fill="gray55" if t in self.off_groups else "black")
+        rows = [("#%02x%02x%02x" % tuple(int(v) for v in colors[t]), str(t), f"({counts[t]})",
+                 re.sub(r"^\s*\d+\s*", "", (names or {}).get(t, "")), t in self.off_groups) for t in ids]
+        self.draw_legend_rows(self.legend, rows, 4)
 
     # ---- genes
 
@@ -1351,24 +1524,87 @@ class UmapWindow(ExportsMixin):
         c.create_text(150, 8 + row * len(genes) + 2, anchor="n", text="click a gene to hide / show it", fill="#888888", font=("Segoe UI", 8, "italic"))
         self.multi_rows = (8, row, len(genes))
 
-    def toggle_group(self, key):
-        """Switch a group between its color and gray (a click on its legend swatch); the cells, the swatch and the labels follow."""
+    def toggle_group(self, key, shift=False, order=()):
+        """Switch a group between its color and gray (a click on its legend swatch); the cells, the swatch and the labels follow. With the shift
+        key, every group in the legend from the one last clicked to this one is put in the state the last-clicked one was left in."""
         if self.busy:
             return
-        self.off_groups.symmetric_difference_update({key})
+        order = list(order)
+        last = self.last_group_click
+        if shift and last is not None and last[0] in order and key in order:
+            a, b = sorted((order.index(last[0]), order.index(key)))
+            if last[1]:
+                self.off_groups.update(order[a:b + 1])
+            else:
+                self.off_groups.difference_update(order[a:b + 1])
+            self.last_group_click = (key, last[1])
+        else:
+            self.off_groups.symmetric_difference_update({key})
+            self.last_group_click = (key, key in self.off_groups)
         self.recolor(keep_off=True)
 
     def on_group_list_click(self, e):
         rows = getattr(self, "group_rows", [])
         i = int((self.group_canvas.canvasy(e.y) - 4) // 22)
         if self.mode == "all" and 0 <= i < len(rows):
-            self.toggle_group(rows[i])
+            self.toggle_group(rows[i], bool(e.state & 0x1), rows)
 
     def on_single_legend_click(self, e):
         ids = (self.last_ids or {}).get("targets", [])
         i = int((e.y - 4) // 22)
         if self.mode == "single" and len(ids) > 1 and 0 <= i < len(ids):
-            self.toggle_group(ids[i])
+            self.toggle_group(ids[i], bool(e.state & 0x1), ids)
+
+    # ---- the legend rows under the pointer
+
+    def group_info_rows(self, level, label):
+        """A group as table rows like a cell's: its place in the taxonomy (the levels above it, then its own), how many cells it has in the run and
+        in how many sections. None if the run has no such group."""
+        values = self.info.get(level)
+        if values is None:
+            return None
+        mask = values == label
+        if not mask.any():
+            return None
+        i0 = int(np.flatnonzero(mask)[0])
+        levels = list(LEVEL_NAMES)
+        chain = [level] if level == "leiden" else levels[:levels.index(level) + 1]
+        rows = []
+        for k in chain:
+            v = self.info[k][i0] if self.info.get(k) is not None else None
+            if v is None or str(v) == "nan":
+                continue
+            m = re.match(r"^\s*(\d+)\s*(.*)$", str(v))
+            rows.append((LEVEL_NAMES[k], m.group(1) if m else "", m.group(2) if m else str(v)))
+        rows.append(("Cells", f"{int(mask.sum())}", "in this run"))
+        if self.section_of is not None:
+            rows.append(("Sections", f"{len(np.unique(self.section_of[mask]))}", ""))
+        return rows
+
+    def show_legend_group(self, key):
+        """Describe the legend row's group in the 'Under the pointer' box (key None: the pointer left the rows)."""
+        if key == self.hover_group:
+            return
+        self.hover_group = key
+        if key is None:
+            self.show_info(None)
+            return
+        label = key if self.mode == "all" else self.single_names.get(key)
+        rows = self.group_info_rows(self.level, label) if label is not None else None
+        if rows is None:
+            self.show_info(None)
+        else:
+            self.show_cell_rows(rows)
+
+    def on_group_list_motion(self, e):
+        rows = getattr(self, "group_rows", [])
+        i = int((self.group_canvas.canvasy(e.y) - 4) // 22)
+        self.show_legend_group(rows[i] if self.mode == "all" and 0 <= i < len(rows) else None)
+
+    def on_single_legend_motion(self, e):
+        ids = (self.last_ids or {}).get("targets", [])
+        i = int((e.y - 4) // 22)
+        self.show_legend_group(ids[i] if self.mode == "single" and len(ids) > 1 and 0 <= i < len(ids) else None)
 
     def on_legend_click(self, e):
         if self.mode not in ("gene", "imputed") or self.multi_rows is None or self.gene_cache is None:
