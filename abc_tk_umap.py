@@ -468,6 +468,7 @@ class UmapWindow(ExportsMixin):
         self.gene_cache = None             # ((genes, imputed, scale), values read) of the genes shown, so a legend click re-uses them
         self.hidden = set()                # the genes switched off by a legend click
         self.multi_rows = None
+        self.off_groups = set()            # the groups switched to gray by a click on their legend swatch (All groups: their names; Single group(s): their numbers)
         self.last_ids = None               # the groups typed in Single group(s): level, targets, colors, cells
         self.export_cat = None             # what the categorical colours mean (for a saved legend)
         self.label_info = []
@@ -677,6 +678,10 @@ class UmapWindow(ExportsMixin):
         self.group_canvas.configure(yscrollcommand=gsb.set)
         gsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.group_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.group_canvas.bind("<Button-1>", self.on_group_list_click)
+        self.group_canvas.config(cursor="hand2")
+        self.legend.bind("<Button-1>", self.on_single_legend_click)
+        self.legend.config(cursor="hand2")
         self.group_canvas.bind("<MouseWheel>", lambda e: self.group_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
         self.build_buttons(f)
         hov = ttk.LabelFrame(f, text="Under the pointer", padding=6)
@@ -857,7 +862,9 @@ class UmapWindow(ExportsMixin):
         if self.mode in ("gene", "imputed") and self.var_gene.get().strip():
             self.recolor()
 
-    def recolor(self):
+    def recolor(self, keep_off=False):
+        if not keep_off:
+            self.off_groups = set()                      # (a new level, mode or list of groups starts with every group colored)
         self.var_status.set("")
         self.legend.pack_forget()
         self.group_list.pack_forget()
@@ -956,7 +963,7 @@ class UmapWindow(ExportsMixin):
         ranked = np.argsort(-counts, kind="stable")[:MAX_COLORED_CATEGORIES]
         lut = np.tile(GREY, (len(uniques), 1))
         for r, u in enumerate(ranked):
-            lut[u] = rank_color(r)
+            lut[u] = GREY if str(uniques[u]) in self.off_groups else rank_color(r)
         rgb = lut[codes]
         self.rank_run = np.zeros(self.n, np.int32)
         bgc = self.bg_codes(level) if self.bg else None
@@ -973,7 +980,8 @@ class UmapWindow(ExportsMixin):
 
         # each coloured group's number at its centre
         cent = pd.DataFrame({"g": codes, "x": self.coords[:, 0], "y": self.coords[:, 1]})
-        cent = cent[cent["g"].isin(ranked)].groupby("g").median()
+        on = [u for u in ranked if str(uniques[u]) not in self.off_groups]
+        cent = cent[cent["g"].isin(on)].groupby("g").median()
         labels = []
         for g, row in cent.iterrows():
             m = re.match(r"^\s*(\d+)", str(uniques[g]))
@@ -985,10 +993,10 @@ class UmapWindow(ExportsMixin):
         rank_of = np.full(len(uniques), -1)
         rank_of[ranked] = np.arange(len(ranked))
         self.export_cat = {"rank": np.where(codes >= 0, rank_of[np.maximum(codes, 0)], -1), "title": LEVEL_NAMES[level],
-                           "entries": [(hexcolor(rank_color(r)), str(uniques[u]), int(counts[u])) for r, u in enumerate(ranked)]}
+                           "entries": [(hexcolor(GREY if str(uniques[u]) in self.off_groups else rank_color(r)), str(uniques[u]), int(counts[u])) for r, u in enumerate(ranked)]}
         self.shown_values = None
         n_cat = int((counts > 0).sum())
-        self.var_status.set(f"Showing all {n_cat} {LEVEL_NAMES[level].lower()}s" + (f"; the {len(ranked)} largest colored, the rest gray." if n_cat > len(ranked) else " (numbers at each center)."))
+        self.var_status.set(f"Showing all {n_cat} {LEVEL_NAMES[level].lower()}s" + (f"; the {len(ranked)} largest colored, the rest gray." if n_cat > len(ranked) else " (numbers at each center).") + " Click a group in the list to gray it or color it again.")
         self.values = None
         self.draw_group_list(ranked, uniques, counts)
 
@@ -999,12 +1007,15 @@ class UmapWindow(ExportsMixin):
         rows = []
         for r, u in enumerate(ranked):
             m = re.match(r"^\s*(\d+)", str(uniques[u]))
-            rows.append((int(m.group(1)) if m else 10 ** 9, m.group(1) if m else str(uniques[u]), hexcolor(rank_color(r)), int(counts[u])))
+            off = str(uniques[u]) in self.off_groups
+            rows.append((int(m.group(1)) if m else 10 ** 9, m.group(1) if m else str(uniques[u]), hexcolor(GREY if off else rank_color(r)), int(counts[u]),
+                         str(uniques[u]), off))
         rows.sort()
-        for k, (_n, label, col, cnt) in enumerate(rows):
+        self.group_rows = [row[4] for row in rows]
+        for k, (_n, label, col, cnt, _key, off) in enumerate(rows):
             cy = 4 + 22 * k + 11
             c.create_rectangle(6, cy - 6, 18, cy + 6, fill=col, outline="")
-            c.create_text(26, cy, anchor="w", text=f"{label}  ({cnt})", font=("Segoe UI", 9))
+            c.create_text(26, cy, anchor="w", text=f"{label}  ({cnt})", font=("Segoe UI", 9), fill="gray55" if off else "black")
         c.configure(scrollregion=(0, 0, 300, 8 + 22 * len(rows)))
         self.group_list.pack(fill=tk.BOTH, expand=True, pady=(6, 0), after=self.box)
 
@@ -1030,7 +1041,7 @@ class UmapWindow(ExportsMixin):
         ids, bad = self.parse_ids()
         codes, uniques = self.category_codes(level)
         uid = core.extract_leading_numeric_id(pd.Series(uniques)).to_numpy()
-        colors = {t: (np.array([255, 0, 0], np.uint8) if len(ids) == 1 else rank_color(i)) for i, t in enumerate(ids)}
+        colors = {t: (GREY if t in self.off_groups else np.array([255, 0, 0], np.uint8) if len(ids) == 1 else rank_color(i)) for i, t in enumerate(ids)}
         lut = np.tile(GREY, (len(uniques), 1))
         for t, col in colors.items():
             lut[uid == t] = col
@@ -1087,7 +1098,8 @@ class UmapWindow(ExportsMixin):
             col = "#%02x%02x%02x" % tuple(int(v) for v in colors[t])
             cy = 4 + 22 * k + 11
             self.legend.create_rectangle(4, cy - 6, 18, cy + 6, fill=col, outline="")
-            self.legend.create_text(26, cy, anchor="w", text=f"{t}  ({counts[t]} cells)", font=("Segoe UI", 9))
+            self.legend.create_text(26, cy, anchor="w", text=f"{t}  ({counts[t]} cells)", font=("Segoe UI", 9),
+                                    fill="gray55" if t in self.off_groups else "black")
 
     # ---- genes
 
@@ -1333,11 +1345,30 @@ class UmapWindow(ExportsMixin):
                 c.create_oval(18 - r, y + 11 - r, 18 + r, y + 11 + r, outline="#999999")
             else:
                 c.create_oval(18 - r, y + 11 - r, 18 + r, y + 11 + r, fill=color, outline="")
-            c.create_text(34, y + 2, anchor="nw", text=g, fill=color, font=("Segoe UI", 10, "bold"), tags=f"row{i}")
+            c.create_text(34, y + 11, anchor="w", text=g, fill=color, font=("Segoe UI", 10, "bold"), tags=f"row{i}")      # (centered on the circle)
             c.create_text(34, y + 22, anchor="nw", text="hidden" if off else f"{'' if scale == 'linear' else 'log2: '}{lo:.1f}–{hi:.1f}",
                           fill="#666666", font=("Segoe UI", 8))
         c.create_text(150, 8 + row * len(genes) + 2, anchor="n", text="click a gene to hide / show it", fill="#888888", font=("Segoe UI", 8, "italic"))
         self.multi_rows = (8, row, len(genes))
+
+    def toggle_group(self, key):
+        """Switch a group between its color and gray (a click on its legend swatch); the cells, the swatch and the labels follow."""
+        if self.busy:
+            return
+        self.off_groups.symmetric_difference_update({key})
+        self.recolor(keep_off=True)
+
+    def on_group_list_click(self, e):
+        rows = getattr(self, "group_rows", [])
+        i = int((self.group_canvas.canvasy(e.y) - 4) // 22)
+        if self.mode == "all" and 0 <= i < len(rows):
+            self.toggle_group(rows[i])
+
+    def on_single_legend_click(self, e):
+        ids = (self.last_ids or {}).get("targets", [])
+        i = int((e.y - 4) // 22)
+        if self.mode == "single" and len(ids) > 1 and 0 <= i < len(ids):
+            self.toggle_group(ids[i])
 
     def on_legend_click(self, e):
         if self.mode not in ("gene", "imputed") or self.multi_rows is None or self.gene_cache is None:

@@ -40,7 +40,7 @@ def ask_cell_type_mismatch(parent, folder, run_type, chosen_type):
     ttk.Label(f, text=f"This run was made for {run_type}, but {chosen_type} is checked on the launcher.", font=("Segoe UI", 11, "bold"),
               wraplength=470, justify=tk.LEFT).pack(anchor="w")
     ttk.Label(f, text=f"{Path(folder).name}", foreground="gray30", wraplength=470, justify=tk.LEFT).pack(anchor="w", pady=(4, 10))
-    ttk.Label(f, text=f"Load anyway shows the run as it is ({run_type}). Regenerate makes a new run for {chosen_type} from the same ROI outlines "
+    ttk.Label(f, text=f"Load as is opens the {run_type} run unchanged. Regenerate makes a new run for {chosen_type} from the same ROI outlines "
                       "(the old run is kept).", wraplength=470, justify=tk.LEFT).pack(anchor="w")
     row = ttk.Frame(f)
     row.pack(fill=tk.X, pady=(16, 0))
@@ -51,7 +51,7 @@ def ask_cell_type_mismatch(parent, folder, run_type, chosen_type):
 
     ttk.Button(row, text=f"Regenerate as {chosen_type}", command=lambda: choose("regenerate")).pack(side=tk.LEFT)
     ttk.Button(row, text="Cancel", command=lambda: choose("cancel")).pack(side=tk.RIGHT)
-    ttk.Button(row, text="Load anyway", command=lambda: choose("load")).pack(side=tk.RIGHT, padx=(0, 8))
+    ttk.Button(row, text="Load as is", command=lambda: choose("load")).pack(side=tk.RIGHT, padx=(0, 8))
     top.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
     top.update_idletasks()
     top.geometry(f"+{parent.winfo_rootx() + 40}+{parent.winfo_rooty() + 60}")

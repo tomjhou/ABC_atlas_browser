@@ -23,6 +23,7 @@ from abc_tk_picker import ZoomView, prompt_subregion_selection_tk
 
 SECTION_Z_LABEL_FONTSIZE = 8          # points: the z label at the top-right of each thumbnail
 SELECT_COLOR, ROI_COLOR = "#ff0000", "#ff8c00"
+HOVER_COLOR = "#3b8eea"              # the outline of the section under the pointer
 DOUBLE_CLICK_MS = 450                 # a double-click's second press this soon after a toggle undoes that toggle
 
 
@@ -106,11 +107,15 @@ class GridWindow:
         self.roi_items = {}            # section -> [border item, roi rect items...]
         for sec in self.sections:
             self.z_items[sec] = c.create_text(0, 0, text="", anchor="se", fill="#444444", font=("Segoe UI", SECTION_Z_LABEL_FONTSIZE), tags="overlay")
+        self.hover_sec = None
+        self.hover_item = c.create_rectangle(0, 0, 0, 0, outline=HOVER_COLOR, width=2, state="hidden", tags="overlay")
+        self.view.idle_cursor = "arrow"        # (whole sections are picked here, not exact spots: no crosshair)
+        c.config(cursor="arrow")
         self.view.listeners.append(self.place_overlays)
         c.bind("<ButtonPress-1>", self.on_press)
         c.bind("<Double-Button-1>", self.on_double)
         c.bind("<Motion>", self.on_motion)
-        c.bind("<Leave>", lambda e: self.var_hover.set("Point at a section."))
+        c.bind("<Leave>", lambda e: (self.var_hover.set("Point at a section."), self.set_hover(None)))
         self.view.set_image(img)
         self.z_ready = False
         core.start_section_coordinate_load(abc_cache)
@@ -188,7 +193,24 @@ class GridWindow:
                 p1 = core.map_data_to_pixel(self.layout[sec], roi["x_max"], roi["y_max"])
                 (ax, ay), (bx, by) = self.view.to_canvas(p0[0], self.img_h - p0[1]), self.view.to_canvas(p1[0], self.img_h - p1[1])
                 c.coords(item, ax, ay, bx, by)
+        if self.hover_sec is not None:
+            c.coords(self.hover_item, *self.box_on_canvas(self.hover_sec))
         c.tag_raise("overlay")
+
+    def set_hover(self, sec):
+        """Outline the section under the pointer and show a hand over it (an arrow elsewhere)."""
+        if self.view.pan_from is None:
+            self.view.canvas.config(cursor="hand2" if sec is not None else self.view.idle_cursor)
+        if sec == self.hover_sec:
+            return
+        self.hover_sec = sec
+        c = self.view.canvas
+        if sec is None:
+            c.itemconfig(self.hover_item, state="hidden")
+        else:
+            c.coords(self.hover_item, *self.box_on_canvas(sec))
+            c.itemconfig(self.hover_item, state="normal")
+            c.tag_raise(self.hover_item)
 
     def refresh_marks(self, section):
         """The red outline of a picked section (only while it has no ROI: an ROI takes priority) and the orange marks of its ROIs."""
@@ -237,6 +259,7 @@ class GridWindow:
 
     def on_motion(self, e):
         sec = self.section_at(e.x, e.y)
+        self.set_hover(sec)
         if sec is None:
             self.var_hover.set("Point at a section.")
             return

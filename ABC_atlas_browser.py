@@ -53,6 +53,14 @@ import subprocess
 from pathlib import Path
 import importlib.util
 
+_STARTUP_T0 = time.perf_counter()
+
+
+def startup_note(message):
+    """One line on the console while the app is starting up, with the seconds since it started: the first window can take a while to appear
+    (the libraries are large), and a silent console looks like a hang."""
+    print(f"[{time.perf_counter() - _STARTUP_T0:5.1f}s] {message}", flush=True)
+
 
 def _make_windows_dpi_aware():
     """On Windows, declare this process DPI-aware before any Tk window gets
@@ -360,6 +368,7 @@ def check_libraries_or_exit():
 
 check_libraries_or_exit()
 
+startup_note("Loading the libraries (numpy, pandas, scanpy, matplotlib, ...). The first start after a reboot is the slowest.")
 import numpy as np
 import pandas as pd
 import scanpy as sc
@@ -923,8 +932,11 @@ def offer_atlas_release_update(cache):
         print(f"Keeping ABC atlas release {current}.")
 
 
+startup_note("Libraries loaded. Looking for the ABC atlas download...")
 download_base = choose_atlas_cache_location()
+startup_note(f"Atlas download: {download_base}. Checking the internet connection...")
 if _has_internet_connection():
+    startup_note("Online: reading the atlas manifest (this also checks for a newer release)...")
     with warnings.catch_warnings():
         # The library's own "a newer release exists" warning; offer_atlas_release_update asks instead.
         warnings.simplefilter('ignore', OutdatedManifestWarning)
@@ -940,6 +952,7 @@ else:
     # at all still fails fast here, just with a real Python traceback
     # instead of a silent freeze.
     abc_cache = AbcProjectCache.from_local_cache(download_base)
+startup_note("Atlas manifest ready.")
 
 CELL_TYPE_OPTIONS = {'1': 'Neurons', '2': 'NonNeurons', '3': 'All'}
 CELL_TYPE_SUFFIXES = {'Neurons': 'neurons', 'NonNeurons': 'nonneurons', 'All': 'all'}
@@ -19274,5 +19287,6 @@ _recent_folders = load_recent_output_folders()
 DEFAULT_OUTPUT_FOLDER = SCRIPT_DIR.parent / 'ABC_atlas_browser_output'
 _initial_out_folder = resolve_out_folder(_recent_folders[0] if _recent_folders else str(DEFAULT_OUTPUT_FOLDER))
 session_state = {'out_folder': _initial_out_folder}
+startup_note("Opening the launch screen...")
 while True:
     run_session(abc_cache, session_state, raw_backed_cache, session_imputed_state)

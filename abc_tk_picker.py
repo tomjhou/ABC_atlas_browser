@@ -38,7 +38,8 @@ class ZoomView:
     MAX_SCREEN_PX_PER_PX = 40.0        # most zoomed in: one picture pixel is this many screen pixels
 
     def __init__(self, parent, bg="black"):
-        self.canvas = tk.Canvas(parent, bg=bg, highlightthickness=0, cursor="crosshair")
+        self.idle_cursor = "crosshair"       # the pointer when not panning (a window that picks whole things can choose another)
+        self.canvas = tk.Canvas(parent, bg=bg, highlightthickness=0, cursor=self.idle_cursor)
         self.src = None                # H x W x 3 uint8
         self.levels = []               # the picture and, for a big one, halved copies of it (zoomed out, a smaller one is resized: faster)
         self.scale, self.ox, self.oy = 1.0, 0.0, 0.0     # screen px per picture px; where picture pixel (0, 0) is on the canvas
@@ -160,7 +161,7 @@ class ZoomView:
 
     def pan_end(self, e):
         self.pan_from = None
-        self.canvas.config(cursor="crosshair")
+        self.canvas.config(cursor=self.idle_cursor)
 
     # ---- drawing
 
@@ -245,6 +246,7 @@ class RoiLayer:
     HIT = 9                  # how close, in screen pixels, the pointer must be to a handle
     MIN_DRAG = 5             # a drag smaller than this is a stray click, not a new ROI
     COLOR = "#ff8c00"
+    SELECTED_COLOR = "#e00000"   # the selected region (the last one clicked or drawn): the one the Delete key removes
     LINE_WIDTH = 4           # thickness of an ROI's dashed outline, in screen pixels (raise it to make the regions stand out more)
     DASH = (10, 5)
     HANDLES = [(hx, hy) for hy in (-1, 0, 1) for hx in (-1, 0, 1) if (hx, hy) != (0, 0)]   # (-1 = left/top edge, 0 = middle, 1 = right/bottom)
@@ -255,6 +257,7 @@ class RoiLayer:
         self.w, self.view, self.canvas = window, window.view, window.view.canvas
         self.rois = {}                 # id -> {"kind": "existing"|"new", "orig": index or None, "box": [x0, y0, x1, y1] in picture px, items}
         self.deleted = []              # indices of existing ROIs that were deleted
+        self.selected = None           # id of the selected ROI
         self.next_id = 1
         self.drag = None
         self.right_press = None
@@ -264,6 +267,7 @@ class RoiLayer:
         c.bind("<ButtonPress-1>", self.press)
         c.bind("<B1-Motion>", self.move)
         c.bind("<ButtonRelease-1>", self.release)
+        c.bind("<Delete>", lambda e: self.delete_selected())
         c.bind("<ButtonPress-3>", self.right_down, add="+")
         c.bind("<ButtonRelease-3>", self.right_up, add="+")
         c.bind("<Motion>", self.hover_cursor, add="+")
@@ -300,7 +304,22 @@ class RoiLayer:
         self.changed()
         return rid
 
+    def select(self, rid):
+        """Make `rid` (or None) the selected ROI, shown in red."""
+        if rid == self.selected:
+            return
+        for r, color in ((self.selected, self.COLOR), (rid, self.SELECTED_COLOR)):
+            if r in self.rois:
+                self.canvas.itemconfig(self.rois[r]["rect"], outline=color)
+        self.selected = rid
+
+    def delete_selected(self):
+        if self.selected in self.rois:
+            self.remove(self.selected)
+
     def remove(self, rid, forget=True):
+        if rid == self.selected:
+            self.selected = None
         roi = self.rois.pop(rid)
         self.canvas.delete(roi["rect"])
         for h in roi["handles"].values():
@@ -373,6 +392,7 @@ class RoiLayer:
             self.drag = {"mode": "move", "id": hit[1], "from": (ix, iy), "box": list(self.rois[hit[1]]["box"])}
         else:
             self.drag = {"mode": "draw", "start": (ix, iy), "start_px": (e.x, e.y), "id": self.add([ix, iy, ix, iy], "new")}
+        self.select(self.drag["id"])
 
     def move(self, e):
         d = self.drag
@@ -549,7 +569,7 @@ class SectionWindow:
         roi_box = ttk.LabelFrame(f, text="Regions of interest", padding=6)
         roi_box.pack(fill=tk.X, pady=(6, 0))
         ttk.Label(roi_box, textvariable=self.var_rois, wraplength=300, justify=tk.LEFT).pack(anchor="w")
-        ttk.Label(roi_box, text="drag: draw   inside: move   handles: resize   right-click: delete\n"
+        ttk.Label(roi_box, text="drag: draw   inside: move   handles: resize   right-click or Delete key: delete the selected (red) one\n"
                                 "wheel: zoom   right-drag: pan   Home: whole section", foreground="gray40",
                   wraplength=300, justify=tk.LEFT).pack(anchor="w", pady=(4, 0))
 
