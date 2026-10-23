@@ -22,7 +22,7 @@ REM Required
 "%PYTHON_CMD%" -m pip install pillow
 "%PYTHON_CMD%" -m pip install anndata
 "%PYTHON_CMD%" -m pip install scanpy
-"%PYTHON_CMD%" -m pip install "abc_atlas_access[notebooks] @ git+https://github.com/alleninstitute/abc_atlas_access.git"
+"%PYTHON_CMD%" -m pip install "abc_atlas_access[notebooks] @ https://github.com/alleninstitute/abc_atlas_access/archive/refs/heads/main.zip"
 
 REM Optional: Leiden clustering of new UMAP runs
 "%PYTHON_CMD%" -m pip install igraph

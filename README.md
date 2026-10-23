@@ -23,7 +23,7 @@ This program is available as a Windows .exe program with everything inside it, s
 2. Unzip it anywhere and run `SectionAssembler\SectionAssembler.exe`.
 
 Windows may warn "Windows protected your PC" the first time, because the program is not code-signed: choose More info, then Run anyway.
-To update, download the zip again. `SHA256SUMS.txt` on the release page lets you check the download. How it is built: `packaging/README.md`.
+To update, download the zip again. How it is built: `packaging/README.md`.
 
 
 ## 2. Allen ABC atlas browser
@@ -33,28 +33,26 @@ Interactive browser for the Allen Brain Cell (ABC) atlas MERFISH dataset
 of the selected cells, and explore it alongside spatial section maps, colored by
 taxonomy level or gene expression (including the imputed gene dataset).
 
-### Windows program (nothing to install)
+### Windows standalone .exe program (easiest way to run)
 
 1. Download [ABCAtlasBrowser-1.0.0-windows.zip](https://github.com/tomjhou/Brain-anatomy-tools/releases/download/atlas-v1.0.0/ABCAtlasBrowser-1.0.0-windows.zip)
-   (about 290 MB; the [release page](https://github.com/tomjhou/Brain-anatomy-tools/releases/tag/atlas-v1.0.0) has its notes and a
-   `SHA256SUMS-atlas.txt` to check the download; newer versions will be on the [Releases](https://github.com/tomjhou/Brain-anatomy-tools/releases)
-   page, as `atlas-v...`).
+   (about 290 MB; the [release page](https://github.com/tomjhou/Brain-anatomy-tools/releases/tag/atlas-v1.0.0) has its notes;
+   newer versions will be on the [Releases](https://github.com/tomjhou/Brain-anatomy-tools/releases) page, as `atlas-v...`).
 2. Unzip it anywhere and run `ABCAtlasBrowser\ABCAtlasBrowser.exe`. A console window opens and stays open: the program prints its progress
-   there and asks a few things there now and then, so keep it visible.
+   there and occasionally asks a yes/no question there (for example, to confirm a run with no sections selected), so keep it visible.
 
 Windows may warn "Windows protected your PC" the first time, because the program is not code-signed: choose More info, then Run anyway.
-The first time, it asks where to keep the atlas download (see "Data locations" below). Its caches and settings are kept in
-`%LOCALAPPDATA%\JhouLab\ABCAtlasBrowser`, and the default output folder is `Documents\ABC_atlas_browser_output`. To update, download the new
-zip and unzip it over the old folder or beside it. How it is built: `packaging/README.md`.
+The first time, it asks where to keep the atlas download and suggests a drive with enough free space.
+Since the atlas cache can reach about 100 GB, make sure the drive you choose has room.
 
 
 ### Running from the source
 
-On Windows, double click RUN_ABC_ATLAS_BROWSER.bat. The first time you run it, it installs everything it needs into the
-shared `.venv` (see above). For the section assembler that takes about 30 seconds; the ABC browser's libraries (scanpy,
-anndata and others) are much larger, so expect it to take longer, and the `.venv` grows to about 1.1 GB with them. This only
-happens once, and it does not alter any Python environment you might already have. The ABC browser also needs `git`
-installed, to fetch the Allen Institute's `abc_atlas_access` library; if git is missing, the program says so.
+If you plan to edit or debug code, you'll need to run from source. The easiest way on Windows is to
+double click RUN_ABC_ATLAS_BROWSER.bat. The first time you run it, it creates and installs a
+shared `.venv` (see above), which takes about 30 seconds for the section assembler, and longer for the
+ABC browser. The `.venv` will be about 300MB with the assembler, and grow to about 1.1 GB with the ABC
+browser. This only happens once, and it does not alter existing Python environments.
 
 On other systems, or to use your own Python environment, install Python and run `python ABC_atlas_browser.py` from that
 environment (e.g. after `conda activate <env>`): at startup it checks for missing libraries and pip-installs them into it.
@@ -62,22 +60,23 @@ environment (e.g. after `conda activate <env>`): at startup it checks for missin
 
 ### Data locations
 
-- **ABC atlas download:** by default `abc_atlas_cache`, in the folder *containing*
-  this repository (e.g. `D:/repos/JhouLab/abc_atlas_cache` when this repository
-  is `D:/repos/JhouLab/Brain-anatomy-tools`). It can reach about 100 GB. If it isn't
-  there at startup, the app lists your local drives and their free space, and
-  asks once where to put it (or where an existing download is), suggesting a
-  drive with enough room. The choice is saved in
+- **ABC atlas download:** The packaged Windows ABC browser program keeps the
+  ABC atlas cache in locations described under "Windows standalone .exe program" above.
+  When run from source (using `.bat` files or `python ABC_atlas_browser.py`)
+  for the first time, the app looks for a folder abc_atlas_cache in the PARENT
+  folder of the repository. If not found, the app lists your local drives and their
+  free space, and asks once where to put it (or where an existing download is),
+  suggesting a drive with enough room. The choice is saved in
   `cache_local/abc_atlas_cache_location.json`; delete that file to be asked again.
   Atlas files are downloaded on first use.
 - **Local cache:** `cache_local` inside this repository (git-ignored). Section
-  images and processed files are regenerated as needed.
-- **Output folder:** `ABC_atlas_browser_output`, next to this repository, on first
-  launch. It can be changed in the startup panel, and the most recently used
-  folder is remembered.
+  images and processed files are regenerated as needed. The packaged Windows program has no repository
+  folder of its own to write in (a new version replaces its files), so its `cache_local` is
+  `%LOCALAPPDATA%\JhouLab\ABCAtlasBrowser\program\cache_local`, and the Settings file
+  `viewer_settings.json` is in the `program` folder beside it.
 
-These locations are relative to the script itself, so the app can be launched
-from any working directory.
+These default locations are relative to the script itself, so the app can be launched
+from any working directory. If you choose your own cache location, this may not apply.
 
 
 ## 3. CCF browser

@@ -3,7 +3,7 @@ REM Builds the packaged ABC atlas browser on this computer, as the release workf
 REM   packaging\dist\ABCAtlasBrowser\ABCAtlasBrowser.exe   (Python and every library inside; it keeps its console window)
 REM   packaging\dist\ABCAtlasBrowser.zip                   (what is handed to users)
 REM It uses the repository's virtual environment (the .venv folder: see ensure_python.bat) and installs the pinned libraries of
-REM packaging\requirements-atlas.txt into it (about a gigabyte the first time; git is needed for the Allen Institute's access library).
+REM packaging\requirements-atlas.txt into it (about a gigabyte the first time).
 setlocal
 title Building the packaged ABC atlas browser
 cd /d "%~dp0.."

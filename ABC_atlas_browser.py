@@ -103,7 +103,8 @@ REQUIRED_LIBRARIES = {
     'scipy': 'scipy',
     'anndata': 'anndata',
     'scanpy': 'scanpy',
-    'abc_atlas_access': 'abc_atlas_access[notebooks] @ git+https://github.com/alleninstitute/abc_atlas_access.git',
+    # (installed from GitHub's zip of the repository's main branch, so that git is not needed: pip reads the zip like a package file)
+    'abc_atlas_access': 'abc_atlas_access[notebooks] @ https://github.com/alleninstitute/abc_atlas_access/archive/refs/heads/main.zip',
 }
 # The app runs without these; only the named feature is unavailable.
 # Import name -> (pip spec, what it's needed for).
@@ -320,9 +321,6 @@ def check_libraries_or_exit():
             lines += [f"pip install {_display_spec(spec)} failed:"]
             lines += [f"    {row}" for row in error_tail.splitlines()[-4:]]
             lines += [""]
-        if any('git+' in spec for spec, _ in failures) and shutil.which('git') is None:
-            lines += ["abc_atlas_access installs from GitHub and needs git, which was not found",
-                      "on PATH. Install git (https://git-scm.com), then relaunch.", ""]
     if missing_required:
         lines += ["These required Python libraries are not installed:", ""]
         lines += [f"    {name}" for name in missing_required]

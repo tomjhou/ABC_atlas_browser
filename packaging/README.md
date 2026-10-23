@@ -64,7 +64,7 @@ browser link names a specific release (`atlas-v1.0.0`): change it when a new ver
 ## Building it on this computer
 
 `packaging\build_atlas_browser.bat` does what the workflow does, in the shared `.venv` (see `ensure_python.bat`): it installs the pinned libraries
-of `requirements-atlas.txt` (about a gigabyte; git is needed for the Allen Institute's access library), runs the self-test from the source,
+of `requirements-atlas.txt` (about a gigabyte), runs the self-test from the source,
 builds, runs the self-test on the package and zips it into `packaging\dist\ABCAtlasBrowser.zip`.
 
 ## What is where

@@ -21,6 +21,7 @@ pyarrow==23.0.0
 h5py==3.15.1
 plotly==7.1.0
 tkinterdnd2==0.6.4
-# The Allen Institute's access library is not on PyPI: it is installed from its repository, at the commit the browser was tested with.
-abc_atlas_access @ git+https://github.com/alleninstitute/abc_atlas_access.git@c23bb010c9bee8796489a49cdbf1209e77e61c92
+# The Allen Institute's access library is not on PyPI: it is installed from GitHub's zip of its repository (no git needed), at the commit the
+# browser was tested with.
+abc_atlas_access @ https://github.com/alleninstitute/abc_atlas_access/archive/c23bb010c9bee8796489a49cdbf1209e77e61c92.zip
 pyinstaller==6.22.3
