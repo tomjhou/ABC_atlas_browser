@@ -3292,6 +3292,37 @@ def imputed_file_attributes(abc_cache):
         return None, None
 
 
+def start_imputed_load_thread(imputed_state, abc_cache):
+    """Starts loading the imputed gene dataset into imputed_state['adata'] on a thread of its own, and keeps the thread in
+    imputed_state['load_thread'] (whoever wants the dataset meanwhile waits for it: see ensure_imputed_gene_dataset_loaded)."""
+    def worker():
+        try:
+            imputed_state['adata'] = load_imputed_adata(abc_cache)
+        except Exception as e:
+            imputed_state['load_error'] = e
+            # Cleared (not left pointing at this now-finished thread) so a
+            # later attempt retries fresh instead of treating this as
+            # permanent — same reasoning as ensure_spatial_load_started.
+            imputed_state['load_thread'] = None
+
+    thread = threading.Thread(target=worker, daemon=True)
+    imputed_state['load_thread'] = thread
+    thread.start()
+
+
+def preload_imputed_gene_dataset(imputed_state, abc_cache):
+    """Starts loading the imputed gene dataset in the background, so that it is ready by the time someone chooses Imputed Gene (the UMAP
+    viewer calls this once its window is drawn). Only when the file is already in the local cache: this never starts a download of its own
+    (a download is what ensure_imputed_gene_dataset_loaded asks first about). Returns True if a load was started."""
+    if imputed_state['adata'] is not None or imputed_state['load_thread'] is not None:
+        return False
+    if is_data_file_cached(abc_cache, IMPUTED_DATASET_DIRECTORY, IMPUTED_DATASET_FILE_NAME) is not True:
+        return False
+    print("Loading the imputed gene dataset in the background...", flush=True)
+    start_imputed_load_thread(imputed_state, abc_cache)
+    return True
+
+
 def ensure_imputed_gene_dataset_loaded(imputed_state, abc_cache):
     """Loads the imputed gene dataset into imputed_state['adata'] if it
     isn't already (or already in flight). Warns the user first that this
@@ -3341,19 +3372,7 @@ def ensure_imputed_gene_dataset_loaded(imputed_state, abc_cache):
             if not confirmed:
                 return False
 
-        def worker():
-            try:
-                imputed_state['adata'] = load_imputed_adata(abc_cache)
-            except Exception as e:
-                imputed_state['load_error'] = e
-                # Cleared (not left pointing at this now-finished thread) so a
-                # later attempt retries fresh instead of treating this as
-                # permanent — same reasoning as ensure_spatial_load_started.
-                imputed_state['load_thread'] = None
-
-        thread = threading.Thread(target=worker, daemon=True)
-        imputed_state['load_thread'] = thread
-        thread.start()
+        start_imputed_load_thread(imputed_state, abc_cache)
 
     thread = imputed_state['load_thread']
     # Hourglass over the app's other windows (e.g. the section window that
@@ -10960,6 +10979,7 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             'open_3d_group_view', 'build_3d_edges', 'write_3d_group_html', 'category_rank_shape', 'visible_points_only', 'sc')
         host = {name: globals()[name] for name in host_names}
         host['settings_dialog'] = prompt_viewer_settings_dialog
+        host['preload_imputed'] = preload_imputed_gene_dataset
         host['umap_circle_sizes'] = UMAP_CIRCLE_SIZE_REGISTRY
         show_umap_window_tk(adata, abc_cache, imputed_state=imputed_state, adata_backed=adata_backed, rois=rois, run_folder=run_folder,
                             ensure_imputed=ensure_imputed_gene_dataset_loaded, title=tk_title, host=host, params=tk_params)

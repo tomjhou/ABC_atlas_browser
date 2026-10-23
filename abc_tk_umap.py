@@ -119,6 +119,109 @@ def blend_dots(img, px, py, rgb, d, opacity, kernel_cache):
     img[hit] = (img[hit] * (1.0 - cover) + mean * cover + 0.5).astype(np.uint8)
 
 
+class GeneBox(tk.Text):
+    """A one-line text box, looking like an entry, in which the gene names that were rejected can be shown in red (an entry can only color
+    all of its text, or none)."""
+    BAD = "bad"
+
+    def __init__(self, parent):
+        super().__init__(parent, height=1, wrap="none", undo=True, font="TkDefaultFont", relief="solid", borderwidth=1, padx=4, pady=3,
+                         highlightthickness=1, highlightcolor="#4a90d9", highlightbackground="#a0a0a0")
+        self.tag_configure(self.BAD, foreground="#d00000")
+        self.bind("<Tab>", lambda e: (self.tk_focusNext().focus_set(), "break")[1])
+        self.bind("<Control-a>", lambda e: (self.tag_add("sel", "1.0", "end-1c"), "break")[1])
+
+    def get_text(self):
+        return self.get("1.0", "end-1c")
+
+    def set_text(self, text):
+        self.delete("1.0", tk.END)
+        self.insert("1.0", text)
+
+    def clear_bad(self):
+        self.tag_remove(self.BAD, "1.0", tk.END)
+
+    def mark_bad(self, names):
+        """Show the gene names `names` (as typed, any case) in red wherever they are in the box."""
+        self.clear_bad()
+        bad = {n.lower() for n in names}
+        pos = 0
+        for part in self.get_text().split(","):
+            word = part.strip()
+            if word and word.lower() in bad:
+                start = pos + part.index(word)
+                self.tag_add(self.BAD, f"1.{start}", f"1.{start + len(word)}")
+            pos += len(part) + 1
+
+
+class GeneVar:
+    """What a StringVar is to an entry, for a GeneBox: get() and set()."""
+
+    def __init__(self, box):
+        self.box = box
+
+    def get(self):
+        return self.box.get_text()
+
+    def set(self, text):
+        self.box.set_text(text)
+
+
+class RangeSlider(tk.Canvas):
+    """A track with two handles, for the lowest and the highest end of a range (0 to 1): the black level (left, a black dot) and the white level
+    (right, a white dot) of a color scale. It is as wide as the color bar above it (the track runs between the same margins), calls
+    `command(low, high)` as a handle is dragged, and a double-click puts both back at the ends."""
+    MIN_GAP = 0.02            # the handles keep at least this much of the track between them
+
+    def __init__(self, parent, command, margin=10, height=26):
+        super().__init__(parent, height=height, highlightthickness=0)
+        self.low, self.high, self.margin, self.command, self.dragging = 0.0, 1.0, margin, command, None
+        self.bind("<Configure>", lambda e: self.draw())
+        self.bind("<ButtonPress-1>", self.press)
+        self.bind("<B1-Motion>", self.move)
+        self.bind("<ButtonRelease-1>", lambda e: setattr(self, "dragging", None))
+        self.bind("<Double-Button-1>", lambda e: self.set(0.0, 1.0, notify=True))
+
+    def x_of(self, fraction):
+        return self.margin + fraction * max(self.winfo_width() - 2 * self.margin, 1)
+
+    def fraction_of(self, x):
+        return min(max((x - self.margin) / max(self.winfo_width() - 2 * self.margin, 1), 0.0), 1.0)
+
+    def set(self, low, high, notify=False):
+        self.low, self.high = low, high
+        self.draw()
+        if notify:
+            self.command(low, high)
+
+    def draw(self):
+        self.delete("all")
+        y, r = 11, 6
+        x0, x1 = self.x_of(0), self.x_of(1)
+        a, b = self.x_of(self.low), self.x_of(self.high)
+        self.create_line(x0, y, x1, y, fill="#c8c8c8", width=3, capstyle="round")
+        self.create_line(a, y, b, y, fill="#707070", width=3)
+        self.create_oval(a - r, y - r, a + r, y + r, fill="black", outline="#707070", width=1)
+        self.create_oval(b - r, y - r, b + r, y + r, fill="white", outline="black", width=1)
+
+    def press(self, e):
+        a, b = self.x_of(self.low), self.x_of(self.high)
+        self.dragging = "low" if abs(e.x - a) <= abs(e.x - b) and not (a == b and e.x > a) else "high"
+        self.move(e)
+
+    def move(self, e):
+        if self.dragging is None:
+            return
+        f = self.fraction_of(e.x)
+        if self.dragging == "low":
+            self.low = min(f, self.high - self.MIN_GAP)
+        else:
+            self.high = max(f, self.low + self.MIN_GAP)
+        self.low, self.high = max(self.low, 0.0), min(self.high, 1.0)
+        self.draw()
+        self.command(self.low, self.high)
+
+
 class HoverTip:
     """A small tip beside the pointer while it is over `widget`; `text_fn()` gives the text (asked again as the pointer moves)."""
 
@@ -561,6 +664,16 @@ class UmapWindow(ExportsMixin):
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.bind("<Escape>", lambda e: self.close())
         self.poll()
+        self.root.after(1500, self.preload_imputed)         # (once the window has been drawn)
+
+    def preload_imputed(self):
+        """Start loading the imputed gene dataset in the background, if it is already on this computer: the choice "Imputed Gene" is common."""
+        start = self.host.get("preload_imputed")
+        if start is not None:
+            try:
+                start(self.imputed_state, self.abc_cache)
+            except Exception as e:
+                print(f"Could not start loading the imputed genes in the background: {e}", flush=True)
 
     # ---- data
 
@@ -747,12 +860,13 @@ class UmapWindow(ExportsMixin):
         # the gene box
         self.gene_frame = ttk.LabelFrame(self.box, text="Gene(s)", padding=6)
         ttk.Label(self.gene_frame, text="Up to six, separated by commas: the first three red / green / blue circles, the next three the same as small dots:", foreground="gray30", wraplength=300).pack(anchor="w")
-        self.var_gene = tk.StringVar(f, "")
-        self.gene_entry = ttk.Entry(self.gene_frame, textvariable=self.var_gene)
+        self.gene_entry = GeneBox(self.gene_frame)
+        self.var_gene = GeneVar(self.gene_entry)
         self.gene_entry.pack(fill=tk.X)
         self.gene_entry.bind("<KeyRelease>", self.on_gene_key)
-        self.gene_entry.bind("<Return>", lambda ev: self.recolor())
+        self.gene_entry.bind("<Return>", lambda ev: (self.recolor(), "break")[1])
         self.gene_entry.bind("<Down>", lambda ev: self.focus_suggestions())
+        self.gene_warning = ttk.Label(self.gene_frame, text="", foreground="#c00000", wraplength=300, justify=tk.LEFT)       # (shown under the box when a gene is rejected)
         self.sugg = tk.Listbox(self.gene_frame, height=6, exportselection=False, activestyle="none")
         self.sugg.bind("<ButtonRelease-1>", lambda ev: self.pick_suggestion())
         self.sugg.bind("<Return>", lambda ev: self.pick_suggestion())
@@ -766,6 +880,13 @@ class UmapWindow(ExportsMixin):
         self.cbar.pack(fill=tk.X, pady=(6, 0))
         self.cbar_photo = None
         self.cbar.bind("<Button-1>", self.on_legend_click)
+        self.gene_levels = (0.0, 1.0)          # the black and white levels of a gene shown in linear scale, as fractions of its range (the slider under the color bar)
+        self.multi_levels = {}                 # the same for each of several genes (gene number -> (low, high)): the sliders in the legend
+        self.multi_sliders = []
+        self.multi_windows = []
+        self.levels_job = None
+        self.cbar_slider = RangeSlider(self.gene_frame, self.on_gene_levels)
+        HoverTip(self.cbar_slider, lambda: "Drag the black and white handles to set the lowest and the highest value of the color scale. Double-click to reset.")
         # the legend for Single group(s)
         self.legend = tk.Canvas(f, width=300, height=10, highlightthickness=0)
         self.group_list = ttk.Frame(f)                      # the groups' numbers and colors (All groups), scrollable
@@ -1331,8 +1452,42 @@ class UmapWindow(ExportsMixin):
     def symbols(self):
         return core.gene_symbol_list(self.adata, self.imputed_state, self.mode == "imputed")
 
+    def show_gene_warning(self, text):
+        """The explanation under the gene box of what was wrong with the genes typed (nothing: the line is hidden)."""
+        self.gene_warning.config(text=text)
+        if text:
+            self.gene_warning.pack(fill=tk.X, pady=(4, 0), after=self.gene_entry)
+        else:
+            self.gene_warning.pack_forget()
+
+    def explain_missing_genes(self, missing, imputed):
+        """Why each of the genes `missing` from the shown dataset could not be shown: it may be in the other dataset (switch to it), or in neither."""
+        here, there = ("imputed", "standard") if imputed else ("standard", "imputed")
+        there_choice = "Gene" if imputed else "Imputed Gene"          # (the choice above that shows the other dataset)
+        other_adata = self.adata if imputed else self.imputed_state["adata"]
+        other = None
+        if other_adata is not None:
+            other = {str(g).lower() for g in other_adata.var["gene_symbol"]}
+        elsewhere = [g for g in missing if other is not None and g.lower() in other]
+        nowhere = [g for g in missing if g not in elsewhere]
+        lines = []
+        if elsewhere:
+            lines.append(f"{', '.join(elsewhere)}: not in the {here} dataset, but it is in the {there} dataset: choose \u201c{there_choice}\u201d above.")
+        if nowhere:
+            hint = " Check the spelling." if other is not None else \
+                " Check the spelling (the imputed genes can be checked once that dataset is loaded: choose \u201cImputed Gene\u201d)."
+            lines.append(f"{', '.join(nowhere)}: not found in the {here} dataset.{hint}")
+        return "\n".join(lines)
+
     def on_gene_key(self, e):
-        self.gene_entry.config(foreground="")
+        text = self.var_gene.get()
+        if text == getattr(self, "rejected_text", None):          # (the key that asked for the genes, or one that moves the cursor: the red and the warning stay)
+            return
+        self.rejected_text = None
+        self.gene_entry.clear_bad()
+        self.show_gene_warning("")
+        if "\n" in text:                                       # (a pasted line break: names are separated by commas)
+            self.var_gene.set(text.replace("\n", " "))
         if e.keysym in ("Return", "Up", "Down", "Escape", "Tab"):
             return
         token = self.var_gene.get().rsplit(",", 1)[-1].strip()
@@ -1370,6 +1525,7 @@ class UmapWindow(ExportsMixin):
         names = core.parse_gene_names(text)
         if not names:
             self.cbar.delete("all")
+            self.show_levels_slider(False)
             self.var_status.set("Enter a gene name.")
             self.color_all_quiet()
             return
@@ -1383,10 +1539,14 @@ class UmapWindow(ExportsMixin):
         source = self.imputed_state["adata"] if imputed else self.adata
         _cols, resolved, missing = core.resolve_gene_names(source, names)
         if missing:
-            self.gene_entry.config(foreground="red")
+            self.gene_entry.mark_bad(missing)
+            self.rejected_text = self.var_gene.get()
+            self.show_gene_warning(self.explain_missing_genes(missing, imputed))
             self.var_status.set(f"Not found in the {'imputed' if imputed else 'standard'} dataset: {', '.join(missing)}.")
             return
-        self.gene_entry.config(foreground="")
+        self.rejected_text = None
+        self.gene_entry.clear_bad()
+        self.show_gene_warning("")
         self.var_gene.set(", ".join(resolved))
         scale = self.var_scale.get()
         key = (tuple(resolved), imputed, scale)
@@ -1444,6 +1604,8 @@ class UmapWindow(ExportsMixin):
                 return
             self.gene_cache = (key, res)
             self.hidden = set()                    # (a different query: every gene shown again)
+            self.gene_levels = (0.0, 1.0)          # (and the full range of values)
+            self.multi_levels = {}
             self.show_genes(resolved, imputed, scale, res)
 
         self.job(f"Reading {', '.join(resolved)}...", work, done)
@@ -1474,7 +1636,15 @@ class UmapWindow(ExportsMixin):
     def show_single(self, gene, dataset, scale, vals, bg_vals):
         fin = np.isfinite(vals)
         vmin, vmax = (float(np.nanmin(vals)), float(np.nanmax(vals))) if fin.any() else (0.0, 1.0)
-        t = (vals - vmin) / (vmax - vmin) if vmax > vmin else np.zeros_like(vals)
+        # In linear scale the black and white levels can be moved (the slider under the color bar): they cut the range the colors cover.
+        linear = scale == "linear"
+        self.clear_multi_sliders()
+        low, high = self.gene_levels if linear else (0.0, 1.0)
+        vmin, vmax = vmin + low * (vmax - vmin), vmin + high * (vmax - vmin)
+        self.show_levels_slider(linear)
+        if linear:
+            self.cbar_slider.set(low, high)
+        t = np.clip((vals - vmin) / (vmax - vmin), 0, 1) if vmax > vmin else np.zeros_like(vals)
         rgb = viridis_rgb(np.where(fin, t, 0))
         rgb[~fin] = GREY
         order = np.argsort(np.where(fin, vals, -np.inf), kind="stable")
@@ -1504,11 +1674,15 @@ class UmapWindow(ExportsMixin):
     # ---- several genes: red / green / blue circles for the first three, the same three colors as small dots on top for the next three
 
     def show_multi(self, genes, dataset, scale, per_gene):
+        self.show_levels_slider(False)
         n = len(genes)
         norm = []
-        for vals, _bg in per_gene:
+        for i, (vals, _bg) in enumerate(per_gene):
             fin = np.isfinite(vals)
             lo, hi = (float(np.nanmin(vals)), float(np.nanmax(vals))) if fin.any() else (0.0, 1.0)
+            if scale == "linear":                  # (the black and white levels set with the legend's sliders cut the range)
+                low, high = self.multi_levels.get(i, (0.0, 1.0))
+                lo, hi = lo + low * (hi - lo), lo + high * (hi - lo)
             norm.append((np.clip((vals - lo) / (hi - lo), 0, 1) if hi > lo else np.zeros_like(vals), lo, hi))
         hidden = self.hidden
         zero = np.zeros(self.n)
@@ -1557,9 +1731,17 @@ class UmapWindow(ExportsMixin):
 
     def draw_multi_legend(self, genes, ranges, scale):
         c = self.cbar
-        c.delete("all")
         self.cbar_photo = None
-        row = 44
+        linear = scale == "linear"
+        row = 68 if linear else 44                                  # (in linear scale each gene has the slider of its black and white levels below its range)
+        if len(self.multi_sliders) != (len(genes) if linear else 0):
+            c.delete("all")
+            self.clear_multi_sliders()                              # (the sliders are kept while they are dragged: only made again for other genes)
+            if linear:
+                self.multi_sliders = [RangeSlider(c, lambda lo, hi, i=i: self.on_multi_levels(i, lo, hi)) for i in range(len(genes))]
+                self.multi_windows = [c.create_window(0, 0, anchor="nw", window=sl, height=26) for sl in self.multi_sliders]
+        else:
+            c.delete("legend")                                      # (only the texts and circles: the sliders stay where they are, so that a drag in progress goes on)
         c.config(height=8 + row * len(genes) + 22)
         for i, (g, (lo, hi)) in enumerate(zip(genes, ranges)):
             y = 8 + row * i
@@ -1567,14 +1749,32 @@ class UmapWindow(ExportsMixin):
             color = "#999999" if off else CHANNEL_HEX[i]
             r = 6 if i < 3 else 3                                  # (genes 4-6 are the small dots)
             if off:
-                c.create_oval(18 - r, y + 11 - r, 18 + r, y + 11 + r, outline="#999999")
+                c.create_oval(18 - r, y + 11 - r, 18 + r, y + 11 + r, outline="#999999", tags="legend")
             else:
-                c.create_oval(18 - r, y + 11 - r, 18 + r, y + 11 + r, fill=color, outline="")
-            c.create_text(34, y + 11, anchor="w", text=g, fill=color, font=("Segoe UI", 10, "bold"), tags=f"row{i}")      # (centered on the circle)
-            c.create_text(34, y + 22, anchor="nw", text="hidden" if off else f"{'' if scale == 'linear' else 'log2: '}{lo:.1f}–{hi:.1f}",
-                          fill="#666666", font=("Segoe UI", 8))
-        c.create_text(150, 8 + row * len(genes) + 2, anchor="n", text="click a gene to hide / show it", fill="#888888", font=("Segoe UI", 8, "italic"))
+                c.create_oval(18 - r, y + 11 - r, 18 + r, y + 11 + r, fill=color, outline="", tags="legend")
+            c.create_text(34, y + 11, anchor="w", text=g, fill=color, font=("Segoe UI", 10, "bold"), tags=("legend", f"row{i}"))      # (centered on the circle)
+            c.create_text(34, y + 22, anchor="nw", text="hidden" if off else f"{'' if scale == 'linear' else 'log2: '}{lo:.1f}\u2013{hi:.1f}",
+                          fill="#666666", font=("Segoe UI", 8), tags="legend")
+            if linear:
+                self.multi_sliders[i].set(*self.multi_levels.get(i, (0.0, 1.0)))
+                c.coords(self.multi_windows[i], 0, y + 38)
+                c.itemconfig(self.multi_windows[i], width=max(c.winfo_width(), 200))
+        c.create_text(150, 8 + row * len(genes) + 2, anchor="n",
+                      text="click a gene to hide / show it" + ("; drag the handles for its black and white levels" if linear else ""),
+                      fill="#888888", font=("Segoe UI", 8, "italic"), tags="legend")
         self.multi_rows = (8, row, len(genes))
+
+    def clear_multi_sliders(self):
+        for slider in self.multi_sliders:
+            slider.destroy()
+        self.multi_sliders = []
+        self.multi_windows = []
+
+    def on_multi_levels(self, gene_index, low, high):
+        """A legend slider moved: the colors are redrawn (as for the single gene's slider: see on_gene_levels)."""
+        self.multi_levels[gene_index] = (low, high)
+        if self.levels_job is None:
+            self.levels_job = self.root.after(60, self.apply_gene_levels)
 
     def toggle_group(self, key, shift=False, order=()):
         """Switch a group between its color and gray (a click on its legend swatch); the cells, the swatch and the labels follow. With the shift
@@ -1668,6 +1868,28 @@ class UmapWindow(ExportsMixin):
         self.hidden.symmetric_difference_update({i})
         key = self.gene_cache[0]
         self.show_genes(list(key[0]), key[1], key[2], self.gene_cache[1])
+
+    def on_gene_levels(self, low, high):
+        """The levels slider moved: the colors are redrawn (at most about 15 times a second while it is dragged)."""
+        self.gene_levels = (low, high)
+        if self.levels_job is None:
+            self.levels_job = self.root.after(60, self.apply_gene_levels)
+
+    def apply_gene_levels(self):
+        self.levels_job = None
+        if self.gene_cache is None or self.mode not in ("gene", "imputed"):
+            return
+        if self.busy:                                           # (something else is being read: try again shortly)
+            self.levels_job = self.root.after(200, self.apply_gene_levels)
+            return
+        key = self.gene_cache[0]
+        self.show_genes(list(key[0]), key[1], key[2], self.gene_cache[1])
+
+    def show_levels_slider(self, on):
+        if on:
+            self.cbar_slider.pack(fill=tk.X, after=self.cbar)
+        else:
+            self.cbar_slider.pack_forget()
 
     def draw_colorbar(self, vmin, vmax, scale, dataset):
         c = self.cbar
