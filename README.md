@@ -83,6 +83,7 @@ from any working directory. If you choose your own cache location, this may not 
 
 Scroll through the Allen CCF annotation volume (coronal, sagittal or horizontal slices) and plot cells from CSV files on it:
 the coordinates exported by the ABC browser's "Export coordinates" button, or a marker export from NeuroInfo. On Windows, double
-click RUN_CCF_BROWSER.bat (it uses the same `.venv`). The 25 um annotation volume (3.6 MB) comes from the ABC atlas cache, and is
-downloaded on first use, after asking, if it is not there yet. Making surface meshes of regions needs the `vtk` library, which the
+click RUN_CCF_BROWSER.bat (it uses the same `.venv`; if that lacks pandas or Pillow they are installed first, and the Allen Institute's
+`abc_atlas_access` library, which brings about 300 MB of dependencies, is installed the first time the atlas is needed; neither needs git). The
+25 um annotation volume (3.6 MB) comes from the ABC atlas cache, and is downloaded on first use, after asking, if it is not there yet. Making surface meshes of regions needs the `vtk` library, which the
 program offers to install the first time (a download of about 100 MB).

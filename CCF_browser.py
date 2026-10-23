@@ -21,6 +21,7 @@ Run:  python CCF_browser.py
 Mouse: shift+wheel = next/previous slice (ctrl+shift: 10 slices); wheel = zoom about the cursor (Settings can swap it
 with ctrl+wheel); +/- also zoom; drag = pan; 0 = fit to window.
 """
+import importlib.util
 import json
 import os
 import queue
@@ -30,11 +31,30 @@ import threading
 import time
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-from PIL import Image, ImageTk
+
+def ensure_libraries(required):
+    """Install, with pip into this Python, the libraries ({import name: pip name}) that are missing, as the other tools do: the shared .venv of
+    the RUN_*.bat files has only those of whichever tool was run first, so the browser must not assume the rest are there. A packaged
+    program has its libraries inside."""
+    missing = [pip for module, pip in required.items() if importlib.util.find_spec(module) is None]
+    if not missing or getattr(sys, 'frozen', False):
+        return
+    print(f"Installing missing libraries ({', '.join(missing)}) into {sys.executable}...", flush=True)
+    subprocess.run([sys.executable, '-m', 'pip', 'install', '--only-binary', ':all:', *missing])
+    importlib.invalidate_caches()
+    still = [pip for module, pip in required.items() if importlib.util.find_spec(module) is None]
+    if still:
+        sys.exit(f"Couldn't install {', '.join(still)} for Python {sys.version.split()[0]}; a very new Python often has no prebuilt libraries "
+                 f"yet (use Python 3.13: see ensure_python.bat). To install them by hand:  python -m pip install {' '.join(still)}")
+
+
+ensure_libraries({'numpy': 'numpy', 'pandas': 'pandas', 'PIL': 'pillow'})
+
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+import tkinter as tk  # noqa: E402
+from tkinter import filedialog, messagebox, ttk  # noqa: E402
+from PIL import Image, ImageTk  # noqa: E402
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CACHE_DIR = SCRIPT_DIR / 'cache_local'
@@ -165,6 +185,32 @@ def find_atlas_cache_dir():
     return chosen
 
 
+ABC_ATLAS_ACCESS = 'abc_atlas_access @ https://github.com/alleninstitute/abc_atlas_access/archive/refs/heads/main.zip'   # (the zip: no git needed)
+_abc_atlas_access_problem = None      # why it could not be installed, once that has been tried (it is not tried again in the same run)
+
+
+def import_project_cache():
+    """AbcProjectCache from the Allen Institute's abc_atlas_access, installing that first if it is missing (it comes from GitHub, not PyPI).
+    Raises ImportError, saying why, if it cannot be had; only the first failure tries to install."""
+    global _abc_atlas_access_problem
+    try:
+        from abc_atlas_access.abc_atlas_cache.abc_project_cache import AbcProjectCache
+        return AbcProjectCache
+    except ImportError:
+        pass
+    if _abc_atlas_access_problem is None and not getattr(sys, 'frozen', False):
+        print(f"Installing abc_atlas_access (the Allen Institute's atlas download library) into {sys.executable}...", flush=True)
+        result = subprocess.run([sys.executable, '-m', 'pip', 'install', ABC_ATLAS_ACCESS])
+        importlib.invalidate_caches()
+        try:
+            from abc_atlas_access.abc_atlas_cache.abc_project_cache import AbcProjectCache
+            return AbcProjectCache
+        except ImportError:
+            _abc_atlas_access_problem = (f"abc_atlas_access could not be installed (pip said {result.returncode}); install it by hand with  "
+                                         f"python -m pip install \"{ABC_ATLAS_ACCESS}\"")
+    raise ImportError(_abc_atlas_access_problem or 'abc_atlas_access is not installed')
+
+
 def volume_status(base):
     """(local path or None, expected size in bytes or None, is_present) of the annotation volume under `base`,
     without downloading anything."""
@@ -187,7 +233,7 @@ def load_atlas(base, download):
     if not present:
         if not download:
             raise FileNotFoundError("the CCF annotation volume is not in the atlas cache")
-        from abc_atlas_access.abc_atlas_cache.abc_project_cache import AbcProjectCache
+        AbcProjectCache = import_project_cache()
         cache = AbcProjectCache.from_cache_dir(base)
         path = Path(cache.get_data_path(directory=VOLUME_DIRECTORY, file_name=VOLUME_FILE_NAME))
     volume = np.ascontiguousarray(read_nifti_volume(path))
@@ -196,7 +242,7 @@ def load_atlas(base, download):
 
     table = None
     try:
-        from abc_atlas_access.abc_atlas_cache.abc_project_cache import AbcProjectCache
+        AbcProjectCache = import_project_cache()
         if cache is None:
             try:
                 cache = AbcProjectCache.from_local_cache(base)
