@@ -10030,6 +10030,23 @@ def prompt_subregion_selection(adata, abc_cache, section_series, section_label,
     return pending
 
 
+def region_naming(sections_suffix, rois):
+    """The sections and ROIs parts of a run folder's name: (sections_suffix, region_suffix, roi_sections). With ROIs they name the sections
+    the ROIs are on and carry a short hash of the exact ROI bounds, which keeps the name unique per distinct ROI configuration without making
+    it unreasonably long; without, the sections_suffix is the picker's (e.g. 'allsections') and the region_suffix is empty."""
+    if not rois:
+        return sections_suffix, '', None
+    roi_sections = sorted_sections_descending(list({roi['section'] for roi in rois}))
+    roi_key = json.dumps(
+        sorted(
+            [{k: (round(v, 3) if isinstance(v, float) else v) for k, v in roi.items()} for roi in rois],
+            key=lambda r: (r['section'], r['x_min'], r['y_min']),
+        )
+    )
+    roi_hash = hashlib.md5(roi_key.encode()).hexdigest()[:8]
+    return 'sections-' + '-'.join(sanitize_section_token(s) for s in roi_sections), f'_rois{len(rois)}-{roi_hash}', roi_sections
+
+
 def count_selected_cells(adata, abc_cache, section_series, selected_sections, rois):
     """How many cells a selection holds, without filtering anything: {'Neurons': n, 'NonNeurons': n, 'All': n} for the sections / ROIs chosen
     (as filter_by_sections / filter_by_rois would select them: ROIs, if any, replace the whole-section choice), from the cached annotation and
@@ -18442,7 +18459,18 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         print(f"Could not count the cells in the selection ({e}); the large-project question will be asked regardless.")
     try:
         from abc_tk_launcher import choose_run_options
-        run_options = choose_run_options(cell_type_selection or 'Neurons', counts=selection_counts)
+        def folder_for(cell_type, project_name, cap):
+            """The folder a project with these choices is saved in (as the analysis below will name it), for the options window to show."""
+            sections_part, region_part, _roi_sections = region_naming(sections_suffix, rois)
+            name = f'umap_{CELL_TYPE_SUFFIXES[cell_type]}_{sections_part}{region_part}'
+            if sanitize_run_label(project_name):
+                name += f'_{sanitize_run_label(project_name)}'
+            n = selection_counts.get(cell_type) if selection_counts else None
+            if cap is not None and n is not None and n > cap:
+                name += f'_sub{cap}'
+            return Path(out_folder) / name
+
+        run_options = choose_run_options(cell_type_selection or 'Neurons', counts=selection_counts, folder_for=folder_for)
         if run_options is None:
             print("Analysis options cancelled; returning to the startup panel.")
             return
@@ -18472,21 +18500,9 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
     # they take priority over the whole-section selection above: the run
     # processes exactly the ROI cells, across however many sections they span.
     # ---------------------------------------------------------------------------
-    region_suffix = ''
+    sections_suffix, region_suffix, roi_sections = region_naming(sections_suffix, rois)
     if rois:
-        roi_sections = sorted_sections_descending(list({roi['section'] for roi in rois}))
         selected_sections = roi_sections
-        sections_suffix = 'sections-' + '-'.join(sanitize_section_token(s) for s in roi_sections)
-        # A short hash of the exact ROI bounds keeps the cache filename unique
-        # per distinct ROI configuration without making it unreasonably long.
-        roi_key = json.dumps(
-            sorted(
-                [{k: (round(v, 3) if isinstance(v, float) else v) for k, v in roi.items()} for roi in rois],
-                key=lambda r: (r['section'], r['x_min'], r['y_min']),
-            )
-        )
-        roi_hash = hashlib.md5(roi_key.encode()).hexdigest()[:8]
-        region_suffix = f'_rois{len(rois)}-{roi_hash}'
         log_status(f"Using {len(rois)} ROI(s) across {len(roi_sections)} section(s) "
                    "(overrides whole-section selection above).")
     # The project name (typed in the options window; at the console, asked for ROI runs only, as it always was) ends the folder name.

@@ -23,14 +23,16 @@ SUBSAMPLE_CAPS = (("200,000 cells (recommended)", 200_000), ("No limit: every ce
 LARGE_PROJECT_CELLS = 200_000            # a selection of more cells than this is a "large project": the dialog asks how to handle it
 
 
-def choose_run_options(current="Neurons", counts=None):
+def choose_run_options(current="Neurons", counts=None, folder_for=None):
     """The one window between confirming the sections and ROIs and the long analysis that follows, so that the analysis then runs without
     asking anything more: which cells to analyze, how to handle a large project (a selection of more than LARGE_PROJECT_CELLS cells: use a
     random subset, or all), the project name that is added to the folder name, and whether to make the optional subclass / supertype plots.
     `counts`: {"Neurons": n, "NonNeurons": n, "All": n}, the cells in the selection, if known (they are shown, and the large-project question
     is asked only when the chosen kind has more than LARGE_PROJECT_CELLS; if not known it is always asked).
     Returns a dict {"cell_type": "Neurons" | "NonNeurons" | "All", "cap": the most cells to use, or None for no limit, "label": the project
-    name (may be empty), "optional_plots": bool}, or None if cancelled."""
+    name (may be empty), "optional_plots": bool}, or None if cancelled.
+    `folder_for(cell_type, project_name, cap)`, if given, returns the path of the project's folder for those choices (`cap`: the most cells
+    to use, None for no limit): it is shown, read-only, under the project name, and follows the choices as they are made."""
     root = tk.Tk()
     root.title("Analysis options")
     root.resizable(False, False)
@@ -63,16 +65,20 @@ def choose_run_options(current="Neurons", counts=None):
     ttk.Radiobutton(custom_row, text="At most", value="custom", variable=cap_choice).pack(side=tk.LEFT)
     custom_entry = ttk.Entry(custom_row, textvariable=custom_cap, width=10)
     custom_entry.pack(side=tk.LEFT, padx=(6, 6))
-    ttk.Label(custom_row, text="cells").pack(side=tk.LEFT)
+    ttk.Label(custom_row, text="cells (randomly chosen)").pack(side=tk.LEFT)
     custom_cap.trace_add("write", lambda *args: cap_choice.set("custom") if custom_cap.get() else None)         # (typing a number picks "At most")
 
     ttk.Label(f, text="Project name (optional)", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(16, 0))
     ttk.Label(f, text="Added to the end of the project's folder name, to remember what it is, e.g. RMTg-VTA.", foreground="gray30",
               wraplength=400, justify=tk.LEFT).pack(anchor="w", pady=(2, 4))
     ttk.Entry(f, textvariable=label, width=44).pack(anchor="w")
+    if folder_for is not None:
+        ttk.Label(f, text="The project will be saved in this folder:", foreground="gray30").pack(anchor="w", pady=(10, 2))
+        folder_text = tk.StringVar(f, "")
+        ttk.Entry(f, textvariable=folder_text, width=70, state="readonly").pack(anchor="w", fill=tk.X)
 
-    ttk.Checkbutton(f, text="Also make the optional subclass / supertype UMAP plots and spatial maps (slower)", variable=optional).pack(
-        anchor="w", pady=(16, 0))
+    ttk.Checkbutton(f, text="Also make optional subclass / supertype UMAP plots and spatial maps (may be very time consuming)",
+                    variable=optional).pack(anchor="w", pady=(16, 0))
 
     row = ttk.Frame(f)
     row.pack(fill=tk.X, pady=(18, 0))
@@ -90,22 +96,38 @@ def choose_run_options(current="Neurons", counts=None):
         else:
             large.pack_forget()
 
+    def chosen_cap(complain=False):
+        """The most cells the choices allow (None: no limit); LARGE_PROJECT_CELLS for a selection that is not large (it is not limited by it).
+        With a custom number that is not a number: None if not complaining, else the complaint and 0."""
+        if not is_large():
+            return LARGE_PROJECT_CELLS
+        cap = dict(SUBSAMPLE_CAPS).get(cap_choice.get(), "custom")
+        if cap == "custom":
+            try:
+                cap = int(custom_cap.get().replace(",", "").strip())
+                if cap < 1:
+                    raise ValueError
+            except ValueError:
+                if complain:
+                    messagebox.showerror("How to handle large projects", "Enter a whole number of cells, or pick one of the other choices.", parent=root)
+                    return 0
+                return "unknown"
+        return cap
+
+    def show_folder(*args):
+        if folder_for is None:
+            return
+        cap = chosen_cap()
+        folder_text.set(str(folder_for(cell_type.get(), label.get().strip(), LARGE_PROJECT_CELLS if cap == "unknown" else cap)))
+
     def done(ok):
         if not ok:
             answer["value"] = None
             root.destroy()
             return
-        cap = LARGE_PROJECT_CELLS            # (a selection that is not large is not limited by this)
-        if is_large():
-            cap = dict(SUBSAMPLE_CAPS).get(cap_choice.get(), "custom")
-            if cap == "custom":
-                try:
-                    cap = int(custom_cap.get().replace(",", "").strip())
-                    if cap < 1:
-                        raise ValueError
-                except ValueError:
-                    messagebox.showerror("How to handle large projects", "Enter a whole number of cells, or pick one of the other choices.", parent=root)
-                    return
+        cap = chosen_cap(complain=True)
+        if cap == 0:
+            return
         answer["value"] = {"cell_type": cell_type.get(), "cap": cap, "label": label.get().strip(), "optional_plots": bool(optional.get())}
         root.destroy()
 
@@ -116,6 +138,9 @@ def choose_run_options(current="Neurons", counts=None):
     root.bind("<Escape>", lambda e: done(False))
     root.protocol("WM_DELETE_WINDOW", lambda: done(False))
     cell_type.trace_add("write", show_large)
+    for var in (cell_type, label, cap_choice, custom_cap):
+        var.trace_add("write", show_folder)
+    show_folder()
     root.update_idletasks()
     show_large()
     root.update_idletasks()
