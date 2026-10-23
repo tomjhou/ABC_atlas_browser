@@ -67,3 +67,4 @@ jobs:
             ABCAtlasBrowser-*.zip
             SHA256SUMS-atlas.txt
           generate_release_notes: true
+          make_latest: false        # (the assembler's releases keep the "Latest" mark that the README's assembler link relies on)

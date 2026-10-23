@@ -57,7 +57,9 @@ inside, so a user needs nothing installed: they unzip `ABCAtlasBrowser-<version>
 `.github/workflows/release-atlas-browser.yml` builds it on a Windows runner, checks that every library is inside (`ABCAtlasBrowser.exe --selftest`,
 which includes a small neighbors / UMAP / Leiden run), zips it and attaches `ABCAtlasBrowser-<version>-windows.zip` and `SHA256SUMS-atlas.txt` to
 a release for that tag. (The assembler's tags are `v1.2.0`; the two products do not trigger each other's workflow.) Because both products publish
-releases in this repository, `.../releases/latest` points to whichever was published last: link to a specific release's page for the atlas browser.
+releases in this repository, and GitHub has only one "Latest" release, the workflow does not mark atlas browser releases as latest
+(`make_latest: false`): `.../releases/latest` stays the assembler's, which the root README's assembler link relies on. The root README's atlas
+browser link names a specific release (`atlas-v1.0.0`): change it when a new version is published.
 
 ## Building it on this computer
 

@@ -4,8 +4,8 @@ This repository has several tools for analyzing brain anatomy data.
 
 Although written in Python, you do NOT need to install anything yourself. Just run the .exe or .bat files according to the
 instructions below, and the computer sets up what it needs on its own. The .exe has Python and every library inside it. Currently
-only the assembler program has a .exe release; the other tools need to be run from .bat files (but I'm in the process of adding
-.exe files). The first time you run a .bat file, it finds Python (installing Python 3.13 if there is none), builds a private `.venv` folder next
+the section assembler (section 1) and the ABC atlas browser (section 2) have .exe releases; the other tools need to be run from .bat
+files. The first time you run a .bat file, it finds Python (installing Python 3.13 if there is none), builds a private `.venv` folder next
 to it, and installs the libraries it needs into that; this needs an internet connection, and it leaves any Python you already
 have untouched. All the .bat files share the one `.venv`.
 
@@ -33,7 +33,22 @@ Interactive browser for the Allen Brain Cell (ABC) atlas MERFISH dataset
 of the selected cells, and explore it alongside spatial section maps, colored by
 taxonomy level or gene expression (including the imputed gene dataset).
 
-### Running
+### Windows program (nothing to install)
+
+1. Download [ABCAtlasBrowser-1.0.0-windows.zip](https://github.com/tomjhou/Brain-anatomy-tools/releases/download/atlas-v1.0.0/ABCAtlasBrowser-1.0.0-windows.zip)
+   (about 290 MB; the [release page](https://github.com/tomjhou/Brain-anatomy-tools/releases/tag/atlas-v1.0.0) has its notes and a
+   `SHA256SUMS-atlas.txt` to check the download; newer versions will be on the [Releases](https://github.com/tomjhou/Brain-anatomy-tools/releases)
+   page, as `atlas-v...`).
+2. Unzip it anywhere and run `ABCAtlasBrowser\ABCAtlasBrowser.exe`. A console window opens and stays open: the program prints its progress
+   there and asks a few things there now and then, so keep it visible.
+
+Windows may warn "Windows protected your PC" the first time, because the program is not code-signed: choose More info, then Run anyway.
+The first time, it asks where to keep the atlas download (see "Data locations" below). Its caches and settings are kept in
+`%LOCALAPPDATA%\JhouLab\ABCAtlasBrowser`, and the default output folder is `Documents\ABC_atlas_browser_output`. To update, download the new
+zip and unzip it over the old folder or beside it. How it is built: `packaging/README.md`.
+
+
+### Running from the source
 
 On Windows, double click RUN_ABC_ATLAS_BROWSER.bat. The first time you run it, it installs everything it needs into the
 shared `.venv` (see above). For the section assembler that takes about 30 seconds; the ABC browser's libraries (scanpy,
