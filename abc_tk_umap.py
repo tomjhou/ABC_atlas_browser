@@ -619,7 +619,7 @@ class UmapWindow(ExportsMixin):
             self.bg_under = "nonneuron" if frac < 0.5 else "neuron"           # (the minority kind is drawn underneath)
         # ...unless the run says which cell type it was made for: the launch screen's choice is in the run folder's name
         name = Path(self.run_folder).name.lower() if self.run_folder is not None else ""
-        for prefix, under in (("umap_neurons_", "nonneuron"), ("umap_nonneurons_", "neuron"), ("umap_all_", None)):
+        for prefix, under in (("umap_neurons_", "nonneuron"), ("umap_nonneurons_", "neuron"), ("umap_all-cells_", None), ("umap_all_", None)):         # (umap_all_: the older name of an all-cells run)
             if name.startswith(prefix):
                 self.bg_under = under
 
@@ -1132,7 +1132,7 @@ class UmapWindow(ExportsMixin):
         lut = np.tile(GREY, (len(uniques), 1))
         for r, u in enumerate(ranked):
             lut[u] = GREY if str(uniques[u]) in self.off_groups else rank_color(r)
-        rgb = lut[codes]
+        rgb = np.where((codes >= 0)[:, None], lut[np.maximum(codes, 0)], LIGHT_GREY).astype(np.uint8)         # (code -1: a cell with no annotation at this level: gray)
         self.rank_run = np.zeros(self.n, np.int32)
         bgc = self.bg_codes(level) if self.bg else None
 
@@ -1272,11 +1272,11 @@ class UmapWindow(ExportsMixin):
         lut = np.tile(GREY, (len(uniques), 1))
         for t, col in colors.items():
             lut[uid == t] = col
-        rgb = lut[codes]
+        rgb = np.where((codes >= 0)[:, None], lut[np.maximum(codes, 0)], LIGHT_GREY).astype(np.uint8)         # (code -1: a cell with no annotation at this level: gray)
         hit = np.zeros(len(uniques), np.int32)
         for i, t in enumerate(ids):
             hit[uid == t] = i + 1
-        self.rank_run = hit[codes].astype(np.int32)
+        self.rank_run = np.where(codes >= 0, hit[np.maximum(codes, 0)], 0).astype(np.int32)
         order = np.argsort(self.rank_run, kind="stable")
         bgc = self.bg_codes(level) if self.bg else None
 

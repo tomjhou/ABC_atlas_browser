@@ -960,7 +960,7 @@ else:
 startup_note("Atlas manifest ready.")
 
 CELL_TYPE_OPTIONS = {'1': 'Neurons', '2': 'NonNeurons', '3': 'All'}
-CELL_TYPE_SUFFIXES = {'Neurons': 'neurons', 'NonNeurons': 'nonneurons', 'All': 'all'}
+CELL_TYPE_SUFFIXES = {'Neurons': 'neurons', 'NonNeurons': 'nonneurons', 'All': 'all-cells'}      # (the words in a run folder's name: umap_all-cells_sections-...)
 
 
 # obs column holding scanpy's own Leiden clustering (Step 6), computed from
