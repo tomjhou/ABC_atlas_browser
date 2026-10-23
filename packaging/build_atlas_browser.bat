@@ -16,6 +16,10 @@ if not defined PYTHON_CMD (
   goto :fail
 )
 
+REM Nothing may be running from the environment: Windows keeps the libraries of a running program locked, and pip could not replace them.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0venv_in_use.ps1" -VenvDir "%~dp0..\.venv"
+if errorlevel 1 goto :fail
+
 echo Installing the libraries (the first time takes a while) ...
 "%PYTHON_CMD%" -m pip install --quiet --only-binary :all: -r packaging\requirements-atlas.txt
 if errorlevel 1 (
