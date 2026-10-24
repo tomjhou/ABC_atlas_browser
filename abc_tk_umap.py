@@ -1532,6 +1532,8 @@ class UmapWindow(ExportsMixin):
         """The rows of a group legend, in columns: swatch, number, cell count (right-aligned) and the group's name (all names start at the same x).
         `rows`: (swatch color, number, count text, name, grayed out). Returns the width used."""
         font = tkfont.Font(root=canvas, family="Segoe UI", size=9)
+        canvas.legend_fonts = (font, tkfont.Font(root=canvas, family="Segoe UI", size=9, weight="bold"))      # (kept: the bold one is for the row of the hovered cell)
+        self.bold_row = None
         w_num = max((font.measure(r[1]) for r in rows), default=0)
         w_cnt = max((font.measure(r[2]) for r in rows), default=0)
         x_num, x_cnt, x_name = x0 + 22, x0 + 22 + w_num + 8 + w_cnt, x0 + 22 + w_num + 8 + w_cnt + 10
@@ -1540,9 +1542,9 @@ class UmapWindow(ExportsMixin):
             cy = 4 + 22 * k + 11
             fill = "gray55" if off else "black"
             draw_marker(canvas, x0 + 6, cy, more[0] if more else 0, col)                               # (the shape the group's cells have in the UMAP)
-            canvas.create_text(x_num, cy, anchor="w", text=num, font=font, fill=fill)
-            canvas.create_text(x_cnt, cy, anchor="e", text=cnt, font=font, fill=fill)
-            canvas.create_text(x_name, cy, anchor="w", text=name, font=font, fill=fill)
+            canvas.create_text(x_num, cy, anchor="w", text=num, font=font, fill=fill, tags=f"row{k}")
+            canvas.create_text(x_cnt, cy, anchor="e", text=cnt, font=font, fill=fill, tags=f"row{k}")
+            canvas.create_text(x_name, cy, anchor="w", text=name, font=font, fill=fill, tags=f"row{k}")
         return x_name + max((font.measure(r[3]) for r in rows), default=0) + 8
 
     def draw_group_list(self, ranked, uniques, counts):
@@ -2085,6 +2087,9 @@ class UmapWindow(ExportsMixin):
         if key == self.hover_group:
             return
         self.hover_group = key
+        self.cancel_hover_jobs()
+        self.hover_key = None
+        self.clear_highlights()
         if key is None:
             self.show_info(None)
             return
@@ -2093,7 +2098,10 @@ class UmapWindow(ExportsMixin):
         if rows is None:
             self.show_info(None)
         else:
+            self.show_info(None)
             self.show_cell_rows(rows)
+            self.set_dim(True)                       # (as when the pointer rests on one of the group's cells)
+            self.mark_group(label)
 
     def on_group_list_motion(self, e):
         rows = getattr(self, "group_rows", [])
@@ -2279,8 +2287,48 @@ class UmapWindow(ExportsMixin):
         """A cell of the section that is not in the run (so not in the UMAP)."""
         return {"key": ("bg", g), "umap_idx": None, "bg_idx": g, "sec": sec, "x": self.bg["x"][g], "y": self.bg["y"][g], "source": "section"}
 
+    def bold_legend_row(self, canvas, k):
+        """Show the legend row k of `canvas` in bold (None: no row); the row bold before goes back to normal."""
+        old = getattr(self, "bold_row", None)
+        if old is not None and old == (canvas, k):
+            return
+        if old is not None:
+            try:
+                old[0].itemconfigure(f"row{old[1]}", font=old[0].legend_fonts[0])
+            except (tk.TclError, AttributeError):
+                pass
+        self.bold_row = None
+        if k is None or not hasattr(canvas, "legend_fonts"):
+            return
+        canvas.itemconfigure(f"row{k}", font=canvas.legend_fonts[1])
+        self.bold_row = (canvas, k)
+
+    def bold_group_of(self, info):
+        """The group list's row (or Single group(s) legend's) of the group the cell `info` belongs to, in bold; none if there isn't one."""
+        canvas = k = None
+        level = self.level
+        if info is not None and self.mode in ("all", "single") and self.info.get(level) is not None:
+            i = info["umap_idx"]
+            if i is not None:
+                label = self.info[level][i]
+            else:
+                arr = self.bg["levels"].get(level) if self.bg else None
+                label = arr[info["bg_idx"]] if arr is not None else None
+            if label is not None and str(label) != "nan":
+                if self.mode == "all":
+                    rows = getattr(self, "group_rows", [])
+                    if str(label) in rows:
+                        canvas, k = self.group_canvas, rows.index(str(label))
+                else:
+                    ids = (self.last_ids or {}).get("targets", [])
+                    m = re.match(r"^\s*(\d+)", str(label))
+                    if len(ids) > 1 and m and int(m.group(1)) in ids:
+                        canvas, k = self.legend, ids.index(int(m.group(1)))
+        self.bold_legend_row(canvas, k)
+
     def show_info(self, info):
         """Ring the cell where the pointer is, mirror it in the other plot, and describe it."""
+        self.bold_group_of(info)
         if info is None:
             self.umap.set_marker("hover", None, None)
             for t in self.tiles:
@@ -2360,11 +2408,17 @@ class UmapWindow(ExportsMixin):
             label = arr[info["bg_idx"]]
         if label is None or str(label) == "nan":
             return
+        self.mark_group(label, skip=i)
+
+    def mark_group(self, label, skip=None):
+        """Red '+' signs on every cell of the group `label` (at the Group level), in the UMAP and in every section. `skip`: a UMAP cell that
+        keeps its own ring instead."""
+        level = self.level
         run_mask = self.info[level] == label
         if not run_mask.any():
             return                                   # (a group none of the run's cells is in: nothing in the UMAP to relate to)
-        if i is not None:
-            run_mask[i] = False                      # (the hovered cell keeps its own ring)
+        if skip is not None:
+            run_mask[skip] = False                   # (the hovered cell keeps its own ring)
         self.umap.set_pluses((self.coords[run_mask, 0], self.coords[run_mask, 1]))
         number = re.match(r"^\s*(\d+)", str(label))               # (the group's number is what the UMAP shows at its center: bigger while it is marked)
         self.umap.boost_label(number.group(1) if number else None)

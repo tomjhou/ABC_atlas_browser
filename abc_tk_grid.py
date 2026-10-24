@@ -19,7 +19,7 @@ import numpy as np
 from PIL import Image
 
 import abc_core as core
-from abc_tk_picker import ZoomView, prompt_subregion_selection_tk
+from abc_tk_picker import SectionData, ZoomView, prompt_subregion_selection_tk
 
 SECTION_Z_LABEL_FONTSIZE = 8          # points: the z label at the top-right of each thumbnail
 SELECT_COLOR, ROI_COLOR = "#ff0000", "#ff8c00"
@@ -30,7 +30,7 @@ DOUBLE_CLICK_MS = 450                 # a double-click's second press this soon 
 class ProgressWindow:
     """A small window with a progress bar and a Cancel button, for the waits before a section opens."""
 
-    def __init__(self, parent, title, text):
+    def __init__(self, parent, title, text, modal=False):
         self.top = tk.Toplevel(parent)
         self.top.title(title)
         self.top.transient(parent)
@@ -47,6 +47,11 @@ class ProgressWindow:
         self.top.protocol("WM_DELETE_WINDOW", self.cancel)
         self.top.update_idletasks()
         self.top.geometry(f"+{parent.winfo_rootx() + 200}+{parent.winfo_rooty() + 200}")
+        if modal:                          # (over a window that holds the grab, as the section window does: or its Cancel could not be clicked)
+            try:
+                self.top.grab_set()
+            except tk.TclError:
+                pass
 
     def cancel(self):
         self.cancelled = True
@@ -274,9 +279,10 @@ class GridWindow:
 
     # ---- the single-section window
 
-    def wait_for(self, thread_alive, title, text, progress=None):
-        """Wait (the window keeps running) for something in the background, with a Cancel. True if it finished."""
-        win = ProgressWindow(self.root, title, text)
+    def wait_for(self, thread_alive, title, text, progress=None, over=None):
+        """Wait (the window keeps running) for something in the background, with a Cancel. True if it finished. `over`: a window (a section
+        window) that is open, and that holds the grab: the wait is shown over it, and the grab goes back to it."""
+        win = ProgressWindow(over or self.root, title, text, modal=over is not None)
         try:
             while thread_alive():
                 self.root.update()
@@ -289,58 +295,94 @@ class GridWindow:
                 time.sleep(0.03)
         finally:
             win.close()
+            if over is not None:
+                try:
+                    over.grab_set()
+                except tk.TclError:
+                    pass
         return True
+
+    def prepare_section(self, section, over=None):
+        """What a section's window needs before it shows the section: the cells' positions read, and the section's picture drawn once and kept.
+        True if it is ready (False: cancelled, or it could not be done: the status line says which)."""
+        cache = self.spatial_cache
+        if cache["df"] is None:
+            core.ensure_spatial_load_started(cache, self.adata, self.abc_cache)
+            thread = cache["load_thread"]
+            if thread is not None:
+                prog = cache["load_progress"]
+                ok = self.wait_for(thread.is_alive, "Loading", "Loading the cell metadata (the first time takes a while)...",
+                                   progress=lambda: prog["rows"] / prog["total"] if prog.get("total") else None, over=over)
+                if not ok:
+                    self.var_status.set("Cancelled: the load carries on in the background.")
+                    return False
+            if cache["df"] is None:
+                self.var_status.set(f"Could not load the spatial data: {cache['load_error']}")
+                return False
+        if core.load_valid_section_roi_cache(section) is None:
+            state = {"fraction": 0.0, "error": None}
+
+            def work():
+                try:
+                    core.generate_and_cache_section_image(self.adata, self.abc_cache, self.section_series, section, cache["df"], (15, 10),
+                                                          progress_callback=lambda f: state.__setitem__("fraction", f))
+                except Exception as e:
+                    state["error"] = e
+
+            t = threading.Thread(target=work, daemon=True)
+            t.start()
+            if not self.wait_for(t.is_alive, "Rendering", f"Drawing section {core.sanitize_section_token(section)} (the first time only)...",
+                                 progress=lambda: state["fraction"], over=over):
+                self.var_status.set("Cancelled.")
+                return False
+            if state["error"] is not None:
+                self.var_status.set(f"Could not render section {section}: {state['error']}")
+                return False
+        return True
+
+    def existing_rois(self, section):
+        return [(i, (r["x_min"], r["x_max"], r["y_min"], r["y_max"])) for i, r in enumerate(self.rois) if r["section"] == section]
 
     def open_section(self, section):
         if self.busy:
             return
         self.busy = True
         try:
+            if not self.prepare_section(section):
+                return
             cache = self.spatial_cache
-            if cache["df"] is None:
-                core.ensure_spatial_load_started(cache, self.adata, self.abc_cache)
-                thread = cache["load_thread"]
-                if thread is not None:
-                    prog = cache["load_progress"]
-                    ok = self.wait_for(thread.is_alive, "Loading", "Loading the cell metadata (the first time takes a while)...",
-                                       progress=lambda: prog["rows"] / prog["total"] if prog.get("total") else None)
-                    if not ok:
-                        self.var_status.set("Cancelled: the load carries on in the background.")
-                        return
-                if cache["df"] is None:
-                    self.var_status.set(f"Could not load the spatial data: {cache['load_error']}")
-                    return
-            if core.load_valid_section_roi_cache(section) is None:
-                state = {"fraction": 0.0, "error": None}
+            current = {"section": section}          # (the section the window is on now: it can move to the next or the previous one)
+            window = []
 
-                def work():
-                    try:
-                        core.generate_and_cache_section_image(self.adata, self.abc_cache, self.section_series, section, cache["df"], (15, 10),
-                                                              progress_callback=lambda f: state.__setitem__("fraction", f))
-                    except Exception as e:
-                        state["error"] = e
+            def neighbors(label):
+                """(the previous section's label, the next's): in the order the grid shows them (None past either end)."""
+                i = self.sections.index(label)
+                return (self.sections[i - 1] if i > 0 else None, self.sections[i + 1] if i + 1 < len(self.sections) else None)
 
-                t = threading.Thread(target=work, daemon=True)
-                t.start()
-                if not self.wait_for(t.is_alive, "Rendering", f"Drawing section {core.sanitize_section_token(section)} (the first time only)...",
-                                     progress=lambda: state["fraction"]):
-                    self.var_status.set("Cancelled.")
-                    return
-                if state["error"] is not None:
-                    self.var_status.set(f"Could not render section {section}: {state['error']}")
-                    return
-            existing = [(i, (r["x_min"], r["x_max"], r["y_min"], r["y_max"])) for i, r in enumerate(self.rois) if r["section"] == section]
+            def move(label, direction, actions):
+                """The window's Next / Previous: the section it goes to is made ready first, and only then are the regions of the one it leaves
+                kept, as with Done (so a failure leaves everything as it was)."""
+                target = neighbors(label)[1 if direction > 0 else 0]
+                if target is None:
+                    return None
+                if not self.prepare_section(target, over=window[0].root if window else None):
+                    return None
+                data = SectionData.load(self.adata, self.abc_cache, self.section_series, cache["df"], target)
+                self.apply_actions(label, actions)
+                current["section"] = target
+                return data, self.existing_rois(target)
+
             self.root.config(cursor="watch")
             try:
                 actions = prompt_subregion_selection_tk(
-                    self.adata, self.abc_cache, self.section_series, section, existing_rois=existing, spatial=cache["df"],
+                    self.adata, self.abc_cache, self.section_series, section, existing_rois=self.existing_rois(section), spatial=cache["df"],
                     initial_view={"mode": self.session_view_settings["mode"], "gene": self.session_view_settings["gene"] or None},
                     session_view_settings=self.session_view_settings, cell_type_selection=self.cell_type_selection,
                     session_color_scale=self.session_color_scale, imputed_state=self.imputed_state, ensure_imputed=self.ensure_imputed,
-                    parent=self.root)
+                    parent=self.root, navigator=(neighbors, move), on_window=window.append)
             finally:
                 self.root.config(cursor="")
-            self.apply_actions(section, actions)
+            self.apply_actions(current["section"], actions)
         finally:
             self.busy = False
 

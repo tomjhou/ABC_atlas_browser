@@ -275,6 +275,16 @@ class RoiLayer:
         for orig, bounds in existing:
             self.add_from_data(bounds, "existing", orig)
 
+    def reset(self, existing=()):
+        """Another section is shown: its own regions replace these (the window has handed the actions of the old ones on already)."""
+        for rid in list(self.rois):
+            self.remove(rid, forget=False)
+        self.deleted = []
+        self.selected = None
+        self.drag = self.right_press = None
+        for orig, bounds in existing:
+            self.add_from_data(bounds, "existing", orig)
+
     # ---- conversions: picture pixels <-> data (mm)
 
     def data_to_box(self, bounds):
@@ -483,8 +493,12 @@ class SectionWindow:
     CHANNEL_COLORS = ("#e53935", "#43a047", "#4a6cff")        # the red, green and blue of a multi-gene overlay
 
     def __init__(self, data, abc_cache, spatial=None, section_series=None, adata=None, root=None, on_close=None, existing_rois=(),
-                 imputed_state=None, ensure_imputed=None, session_color_scale=None, cell_type_selection="All"):
+                 imputed_state=None, ensure_imputed=None, session_color_scale=None, cell_type_selection="All", navigator=None):
         self.data, self.abc_cache, self.spatial, self.section_series, self.adata = data, abc_cache, spatial, section_series, adata
+        # navigator: (neighbors, move) from the window that opened this one. neighbors(label) -> (the previous section's label or None, the next's);
+        # move(label, direction, actions) -> (the new section's data, its existing ROIs) or None: it takes the ROI actions of the section being left.
+        self.navigator = navigator
+        self.generation = 0            # counts the sections shown: a read that was started for an earlier one is ignored when it ends
         self.imputed_state = imputed_state if imputed_state is not None else {"adata": None, "load_thread": None, "load_error": None}
         self.ensure_imputed = ensure_imputed
         self.color_scale = session_color_scale if session_color_scale is not None else {"mode": "log"}
@@ -537,16 +551,26 @@ class SectionWindow:
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.bind("<Escape>", lambda e: self.close())
         self.update_mode_frames()
+        self.update_nav_buttons()
         self.poll()
 
     # ---- the side panel
 
     def build_side(self, f):
         d = self.data
-        ttk.Label(f, text=f"Section {core.sanitize_section_token(d.label)}", font=("Segoe UI", 15, "bold")).pack(anchor="w")
+        if self.navigator is not None:
+            nav = ttk.Frame(f)
+            nav.pack(fill=tk.X, pady=(0, 8))
+            self.btn_prev = ttk.Button(nav, text="\u25c0 Previous section", command=lambda: self.go(-1))
+            self.btn_prev.pack(side=tk.LEFT, expand=True, fill=tk.X)
+            self.btn_next = ttk.Button(nav, text="Next section \u25b6", command=lambda: self.go(1))
+            self.btn_next.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(6, 0))
+        self.var_title = tk.StringVar(f, f"Section {core.sanitize_section_token(d.label)}")
+        ttk.Label(f, textvariable=self.var_title, font=("Segoe UI", 15, "bold")).pack(anchor="w")
         self.var_z = tk.StringVar(f, core.section_z_text(d.label, self.abc_cache, wait=False))
         ttk.Label(f, textvariable=self.var_z, foreground="gray30", wraplength=310).pack(anchor="w")
-        ttk.Label(f, text=f"{len(d.xs):,} cells", foreground="gray30").pack(anchor="w", pady=(0, 6))
+        self.var_cells = tk.StringVar(f, f"{len(d.xs):,} cells")
+        ttk.Label(f, textvariable=self.var_cells, foreground="gray30").pack(anchor="w", pady=(0, 6))
 
         show = ttk.LabelFrame(f, text="Show", padding=6)
         show.pack(fill=tk.X)
@@ -613,11 +637,24 @@ class SectionWindow:
 
     def build_find_controls(self, parent):
         f = self.find_frame = ttk.LabelFrame(parent, text="Find group", padding=6)
-        ttk.Label(f, text="A group's number, at the Group level above (Enter):", foreground="gray30", wraplength=310).pack(anchor="w")
+        ttk.Label(f, text="One or more groups' numbers, at the Group level above, e.g. 12, 15, 31 (Enter):", foreground="gray30",
+                  wraplength=310).pack(anchor="w")
         self.var_find = tk.StringVar(f, "")
-        self.find_entry = ttk.Entry(f, textvariable=self.var_find, width=12)
+        self.find_entry = ttk.Entry(f, textvariable=self.var_find, width=28)
         self.find_entry.pack(anchor="w", pady=(2, 0))
         self.find_entry.bind("<Return>", lambda e: self.apply_find())
+        self.var_find.trace_add("write", lambda *a: self.check_find_text())
+        self.find_legend = ttk.Frame(f)
+        self.find_legend.pack(fill=tk.X, pady=(4, 0))
+
+    def clear_find_legend(self):
+        for w in self.find_legend.winfo_children():
+            w.destroy()
+
+    def check_find_text(self):
+        """The text turns red while it holds anything that isn't a whole number."""
+        bad = core.parse_group_numbers(self.var_find.get())[1]
+        self.find_entry.configure(foreground="red" if bad else "")
 
     def update_mode_frames(self):
         self.gene_frame.pack_forget()
@@ -658,7 +695,9 @@ class SectionWindow:
                     self.root.config(cursor="")
                     done(res)
                 elif kind == "expr":
-                    key, values = payload
+                    key, values, generation = payload
+                    if generation != self.generation:
+                        continue                                 # (read for a section that is no longer shown)
                     self.cell_expr[key] = values
                     if self.hover_idx is not None:
                         self.update_hover()
@@ -915,7 +954,7 @@ class SectionWindow:
                 continue
             self.cell_expr[key] = None                  # (being read)
             source = self.imputed_state["adata"] if dataset == "imputed" else self.adata
-            rows, adata = self.data.rows, self.adata
+            rows, adata, generation = self.data.rows, self.adata, self.generation
 
             def work(gene=gene, key=key, source=source):
                 try:
@@ -931,7 +970,7 @@ class SectionWindow:
                 except Exception as e:
                     print(f"Could not read the expression of {gene}: {e}", flush=True)
                     values = False
-                self.msgs.put(("expr", (key, values)))
+                self.msgs.put(("expr", (key, values, generation)))
 
             threading.Thread(target=work, daemon=True).start()
 
@@ -965,13 +1004,16 @@ class SectionWindow:
             return
         text = self.var_find.get().strip()
         if not text:
+            self.clear_find_legend()
             self.show_groups()
             return
-        if not text.isdigit():
-            self.var_status.set(f"'{text}' isn't a number: type a {self.level} number, e.g. 12.")
+        numbers, bad = core.parse_group_numbers(text)
+        if bad or not numbers:
+            self.find_entry.configure(foreground="red")
+            self.var_status.set(f"Not a number: {', '.join(bad)}. Type {self.level} numbers separated by commas, e.g. 12, 15.")
             return
-        number, level = int(text), self.level
-        key = (level, number)
+        level = self.level
+        key = (level, tuple(numbers))
         if key in self.finds:
             self.show_find(key, self.finds[key])
             return
@@ -981,25 +1023,31 @@ class SectionWindow:
         d, spatial, series = self.data, self.spatial, self.section_series
 
         def work():
-            return core.render_group_highlight_array(series, d.label, spatial, level, number, d.layout, d.img_w, d.img_h)
+            return core.render_groups_highlight_array(series, d.label, spatial, level, numbers, d.layout, d.img_w, d.img_h)
 
         def done(res):
             self.var_status.set("")
             if isinstance(res, BaseException):
-                self.var_status.set(f"Could not mark {level} {number}: {res}")
+                self.var_status.set(f"Could not mark {level} {', '.join(map(str, numbers))}: {res}")
                 return
+            if key[1] != tuple(core.parse_group_numbers(self.var_find.get())[0]) or level != self.level:
+                return                      # (the text or the level changed while this was drawn)
             self.finds[key] = res
             self.show_find(key, res)
 
-        self.job(f"Finding {level} {number}...", work, done)
+        self.job(f"Finding {level} {', '.join(map(str, numbers))}...", work, done)
 
     def show_find(self, key, res):
         if self.mode != "find":
             return
-        rgba, count, name = res
+        rgba, found = res
         self.show_picture(rgba)
-        level, number = key
-        self.var_status.set(f"{level} {name}: {count:,} cells in gold." if count else f"No cell of {level} {number} in this section.")
+        level = key[0]
+        self.clear_find_legend()
+        for number, count, name, (r, g, b) in found:
+            text = f"{level} {name}: {count:,} cells" if count else f"{level} {number}: none in this section"
+            tk.Label(self.find_legend, text="● " + text, fg="#%02x%02x%02x" % (int(r * 255), int(g * 255), int(b * 255)), bg="black",
+                     anchor="w", padx=4).pack(fill=tk.X, pady=1)
 
     # ---- hover
 
@@ -1132,6 +1180,60 @@ class SectionWindow:
         self.result = self.roi.actions()
         self.close()
 
+    # ---- the next and previous section: the same window, everything as it is set, on another section
+
+    def update_nav_buttons(self):
+        if self.navigator is None:
+            return
+        previous, following = self.navigator[0](self.data.label)
+        self.btn_prev.state(["!disabled" if previous is not None else "disabled"])
+        self.btn_next.state(["!disabled" if following is not None else "disabled"])
+
+    def go(self, direction):
+        """Next (+1) or previous (-1) section, in the order of the section grid. This section's regions are kept, as with Done; what is shown
+        (Groups, Gene, Find group, the level, the genes, the scale) stays as it is."""
+        if self.navigator is None:
+            return
+        if self.busy:
+            self.var_status.set("Wait for the picture to finish, then try again.")
+            return
+        self.root.config(cursor="watch")
+        try:
+            moved = self.navigator[1](self.data.label, direction, self.roi.actions())
+        except Exception as e:
+            moved = None
+            self.var_status.set(f"Could not open the {'next' if direction > 0 else 'previous'} section: {e}")
+        finally:
+            self.root.config(cursor="")
+        if moved is None:
+            self.update_nav_buttons()
+            return
+        self.switch_section(*moved)
+
+    def switch_section(self, data, existing_rois):
+        """Show another section in this window: its picture, its cells, its regions; and the picture the current choice calls for."""
+        self.generation += 1
+        self.data = data
+        self.pictures = data.pictures
+        self.renders, self.cell_expr, self.finds = {}, {}, {}
+        self.shown_genes, self.shown_dataset = [], "standard"
+        self.clear_hover()
+        self.hide_marks()
+        self.clear_colorbar()
+        self.clear_find_legend()
+        self.root.title(f"Section {core.sanitize_section_token(data.label)}")
+        self.var_title.set(f"Section {core.sanitize_section_token(data.label)}")
+        self.var_z.set(core.section_z_text(data.label, self.abc_cache, wait=False))
+        self.var_cells.set(f"{len(data.xs):,} cells")
+        from scipy.spatial import cKDTree
+        self.tree = cKDTree(np.column_stack([data.xs, data.ys]))
+        pb, dx = data.layout["pixel_bbox"], data.layout["data_xlim"]
+        self.px_per_mm = abs(pb[1] - pb[0]) / abs(dx[1] - dx[0]) if dx[1] != dx[0] else 1.0
+        self.view.set_image(data.rgba, keep_view=False)
+        self.roi.reset(existing_rois)
+        self.update_nav_buttons()
+        self.refresh_picture()
+
     # ---- closing
 
     def close(self):
@@ -1161,7 +1263,7 @@ class SectionWindow:
 def prompt_subregion_selection_tk(adata, abc_cache, section_series, section_label, existing_rois=None, on_ready=None, spatial=None,
                                   initial_view=None, cell_type_selection="All", precomputed_gene_open=None, session_color_scale=None,
                                   shared_spatial_cache=None, imputed_state=None, session_view_settings=None, ensure_imputed=None,
-                                  parent=None):
+                                  parent=None, navigator=None, on_window=None):
     """The same call, and the same result, as ABC_atlas_browser.prompt_subregion_selection (the matplotlib window): the single-section ROI
     picker. Returns a list of {'action': 'add'|'edit'|'delete', ...} (empty if cancelled). The section's picture must already be cached
     (the caller makes it first, as for the matplotlib window). `ensure_imputed(imputed_state, abc_cache)`, if given, loads the imputed gene
@@ -1171,7 +1273,9 @@ def prompt_subregion_selection_tk(adata, abc_cache, section_series, section_labe
     data = SectionData.load(adata, abc_cache, section_series, spatial, section_label)
     win = SectionWindow(data, abc_cache, spatial=spatial, section_series=section_series, adata=adata, root=parent, existing_rois=existing_rois or (),
                         imputed_state=imputed_state, ensure_imputed=ensure_imputed, session_color_scale=session_color_scale,
-                        cell_type_selection=cell_type_selection)
+                        cell_type_selection=cell_type_selection, navigator=navigator)
+    if on_window:
+        on_window(win)                  # (the grid shows its waits over this window when it moves to another section)
     try:
         win.root.state("zoomed")        # (opens full-screen, as the matplotlib window does)
     except tk.TclError:

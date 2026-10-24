@@ -910,6 +910,68 @@ def render_group_highlight_array(section_series, section_label, spatial, level, 
     return np.asarray(fig.canvas.buffer_rgba()).copy(), int(in_group.sum()), label
 
 
+GROUP_HIGHLIGHT_COLORS = [(1.0, 0.84, 0.0), (0.0, 0.85, 1.0), (1.0, 0.25, 0.85), (0.35, 1.0, 0.25), (1.0, 0.45, 0.1), (0.65, 0.5, 1.0),
+                          (1.0, 0.2, 0.2), (0.0, 1.0, 0.7)]
+
+
+def parse_group_numbers(text):
+    """The group numbers in `text` ('12', or '12, 15 31': commas and/or spaces between). Returns (the numbers in order, without repeats; the
+    pieces that are not whole numbers)."""
+    numbers, bad = [], []
+    for piece in text.replace(',', ' ').replace(';', ' ').split():
+        if piece.isdigit():
+            if int(piece) not in numbers:
+                numbers.append(int(piece))
+        else:
+            bad.append(piece)
+    return numbers, bad
+
+
+def render_groups_highlight_array(section_series, section_label, spatial, level, numbers, cached_layout, img_w, img_h, dpi=150):
+    """Like render_group_highlight_array, for several groups: each is drawn in its own color (GROUP_HIGHLIGHT_COLORS, in the order of
+    `numbers`; they repeat past eight), every other cell dim grey. Returns (RGBA uint8 array, [(number, cells in this section, the group's
+    label or '', its color)])."""
+    if spatial is None or 'x' not in spatial.columns or 'y' not in spatial.columns:
+        raise ValueError("spatial x/y coordinates not available")
+    if level not in spatial.columns:
+        raise ValueError(f"'{level}' labels not available in the cell metadata")
+    section_spatial = spatial[(section_series == section_label).to_numpy()]
+    xs = pd.to_numeric(section_spatial['x'], errors='coerce').to_numpy()
+    ys = pd.to_numeric(section_spatial['y'], errors='coerce').to_numpy()
+    ids = extract_leading_numeric_id(section_spatial[level]).to_numpy()
+    names = section_spatial[level].astype(str).to_numpy()
+    valid = ~(np.isnan(xs) | np.isnan(ys))
+    xs, ys, ids, names = xs[valid], ys[valid], ids[valid], names[valid]
+    if len(xs) == 0:
+        raise ValueError(f"no spatial coordinates for section {section_label}")
+    masks = [ids == float(n) for n in numbers]
+    any_group = np.zeros(len(xs), dtype=bool)
+    for m in masks:
+        any_group |= m
+
+    fig = Figure(figsize=(img_w / dpi, img_h / dpi), dpi=dpi)
+    FigureCanvasAgg(fig)
+    fig.patch.set_facecolor('black')
+    px_x0, px_x1, px_y0, px_y1 = cached_layout['pixel_bbox']
+    ax = fig.add_axes([px_x0 / img_w, px_y0 / img_h, (px_x1 - px_x0) / img_w, (px_y1 - px_y0) / img_h])
+    ax.set_facecolor('black')
+    ax.scatter(xs[~any_group], ys[~any_group], c=[[0.28, 0.28, 0.28]], s=3, linewidths=0)
+    found = []
+    for k, (n, m) in enumerate(zip(numbers, masks)):
+        color = GROUP_HIGHLIGHT_COLORS[k % len(GROUP_HIGHLIGHT_COLORS)]
+        if m.any():
+            ax.scatter(xs[m], ys[m], c=[list(color)], s=10, linewidths=0)
+        found.append((n, int(m.sum()), str(names[m][0]).strip() if m.any() else '', color))
+    ax.set_xlim(cached_layout['data_xlim'])
+    ax.set_ylim(cached_layout['data_ylim'])
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    fig.canvas.draw()
+    return np.asarray(fig.canvas.buffer_rgba()).copy(), found
+
+
 def load_rois_csv(path):
     """Load a previously saved roi_coords.csv file. Returns (rois,
     whole_sections): rois is a list of ROI dicts ({'section','x_min',
