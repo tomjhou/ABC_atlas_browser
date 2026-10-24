@@ -46,7 +46,7 @@ def selftest():
     import numpy as np
 
     def imports():
-        import abc_core, abc_tk_grid, abc_tk_launcher, abc_tk_picker, abc_tk_umap, abc_tk_umap_export  # noqa: F401,E401
+        import abc_core, abc_tk_ccf, abc_tk_grid, abc_tk_launcher, abc_tk_picker, abc_tk_umap, abc_tk_umap_export  # noqa: F401,E401
 
     def numpy_pandas():
         import pandas as pd

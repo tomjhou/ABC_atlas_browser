@@ -12,7 +12,7 @@ root = os.path.abspath(os.path.join(SPECPATH, ".."))
 # great deal lazily, numba and llvmlite carry their own compiler, tkinterdnd2 has its tkdnd binaries, plotly its JavaScript, ...), so everything
 # of them is taken.
 datas, binaries, hiddenimports = [], [], [
-    "abc_core", "abc_tk_grid", "abc_tk_launcher", "abc_tk_picker", "abc_tk_umap", "abc_tk_umap_export", "atlas_meshes", "atlas_version",
+    "abc_core", "abc_tk_ccf", "abc_tk_grid", "abc_tk_launcher", "abc_tk_picker", "abc_tk_umap", "abc_tk_umap_export", "atlas_meshes", "atlas_version",
     "matplotlib.backends.backend_tkagg", "PIL.ImageTk",
 ]
 for package in ("scanpy", "anndata", "umap", "pynndescent", "numba", "llvmlite", "igraph", "leidenalg", "plotly", "skimage", "tkinterdnd2",

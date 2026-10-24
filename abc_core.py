@@ -250,8 +250,8 @@ GRID_CACHE_LAYOUT = CACHE_DIR / f'{DATASET_NAME}_section_picker_grid_layout.json
 GRID_CACHE_DPI = 375  # 300 * 1.25
 
 
-ANNOTATION_COLUMNS = ('class', 'subclass', 'supertype', 'cluster', SECTION_COL)     # what load_annotations_aligned() gives
-ANNOTATION_CACHE_VERSION = 1
+ANNOTATION_COLUMNS = ('class', 'subclass', 'supertype', 'cluster', 'neurotransmitter', SECTION_COL)     # what load_annotations_aligned() gives
+ANNOTATION_CACHE_VERSION = 2  # v2: adds the neurotransmitter
 
 
 def _index_fingerprint(index):
@@ -349,7 +349,7 @@ def sorted_sections_descending(unique_sections):
 SPATIAL_CSV_CHUNK_SIZE = 200_000  # see the chunked read in load_section_spatial_coords()
 
 
-SPATIAL_CSV_CACHE_VERSION = 2  # v2: adds the section 'z' column
+SPATIAL_CSV_CACHE_VERSION = 3  # v2: adds the section 'z' column; v3: the neurotransmitter
 
 
 def _spatial_csv_cache_path(cell_metadata_path):
@@ -386,7 +386,7 @@ def load_section_spatial_coords(adata, abc_cache, progress_callback=None):
                   "GUI section picker unavailable.")
             return None
         index_col_name = header_cols[0]
-        wanted_cols = [c for c in ['x', 'y', 'z', 'class', 'subclass', 'supertype', 'cluster'] if c in header_cols]
+        wanted_cols = [c for c in ['x', 'y', 'z', 'class', 'subclass', 'supertype', 'cluster', 'neurotransmitter'] if c in header_cols]
 
         cache_path = None
         try:
@@ -429,6 +429,7 @@ def load_section_spatial_coords(adata, abc_cache, progress_callback=None):
         reader = pd.read_csv(
             cell_metadata_path, index_col=0, converters={0: str},
             usecols=[index_col_name] + wanted_cols, chunksize=SPATIAL_CSV_CHUNK_SIZE,
+            dtype={'neurotransmitter': str},          # (blank for most non-neurons: a chunk with none would otherwise be read as numbers)
         )
         chunks = []
         rows_read = 0

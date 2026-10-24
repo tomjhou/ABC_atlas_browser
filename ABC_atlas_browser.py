@@ -10974,7 +10974,8 @@ def show_interactive_umap_window(adata, abc_cache, imputed_state=None, adata_bac
             'normalize_umap_params', 'write_last_umap_params', 'ensure_umap_variant_csv', 'load_umap_variant', 'open_with_default_viewer',
             'unique_export_paths', 'prompt_deg_comparison_mode', 'materialize_subset', 'compute_de_genes', 'mean_log2_expression',
             'ensure_ccf_downloaded', 'load_ccf_for_cells', 'load_parcellation_names', 'run_with_loading_window', 'brain_outline_segments',
-            'open_3d_group_view', 'build_3d_edges', 'write_3d_group_html', 'category_rank_shape', 'visible_points_only', 'sc')
+            'open_3d_group_view', 'build_3d_edges', 'write_3d_group_html', 'category_rank_shape', 'visible_points_only', 'sc',
+            'read_nifti_volume', 'CCF_VOLUME_DIRECTORY', 'CCF_VOLUME_FILE_NAME')
         host = {name: globals()[name] for name in host_names}
         host['settings_dialog'] = prompt_viewer_settings_dialog
         host['preload_imputed'] = preload_imputed_gene_dataset

@@ -210,9 +210,10 @@ class ExportsMixin:
                     else:
                         ax.scatter(coords[m, 0], coords[m, 1], c=color, marker=marker, s=size, alpha=POINT_ALPHA, linewidths=0)
                 entries = cat
-            for text, x, y, color in getattr(self, "label_info", []):
+            by_count = self.var_label_scale.get()                 # (the Size by cell count checkbox: the saved UMAP follows it)
+            for text, x, y, color, weight in getattr(self, "label_info", []):
                 if xlim[0] <= x <= xlim[1] and ylim[0] <= y <= ylim[1]:
-                    ax.text(x, y, text, fontsize=EXPORT_FONTSIZE * 0.6, color=color, fontweight="bold", ha="center", va="center", clip_on=True)
+                    ax.text(x, y, text, fontsize=EXPORT_FONTSIZE * 0.6 * (weight if by_count else 1.0), color=color, fontweight="bold", ha="center", va="center", clip_on=True)
             if entries is not None:
                 handles = self.legend_handles(entries, sort="id")
                 ncol = max(1, math.ceil(len(handles) / EXPORT_LEGEND_MAX_ROWS))
@@ -780,4 +781,4 @@ class ExportsMixin:
         self.root.config(cursor="")
 
 
-LEVEL_LONG = {"class": "Class", "subclass": "Subclass", "supertype": "Supertype", "cluster": "Cluster", "leiden": "Leiden"}
+LEVEL_LONG = {"class": "Class", "subclass": "Subclass", "supertype": "Supertype", "cluster": "Cluster", "leiden": "Leiden", "neurotransmitter": "Neurotransmitter"}

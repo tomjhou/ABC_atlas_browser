@@ -28,6 +28,7 @@ from PIL import Image, ImageTk
 from scipy.spatial import cKDTree
 
 import abc_core as core
+import abc_tk_ccf
 from abc_tk_umap_export import ExportsMixin, hexcolor
 
 LEIDEN_KEY = "leiden"
@@ -39,7 +40,8 @@ CHANNEL_NAMES = ("red", "green", "blue", "red", "green", "blue")
 LIGHT_GREY = np.array([222, 222, 222], np.uint8)
 RING = "#ff1493"
 MAX_COLORED_CATEGORIES = 400
-LEVEL_NAMES = {"class": "Class", "subclass": "Subclass", "supertype": "Supertype", "cluster": "Cluster", "leiden": "Leiden"}
+LEVEL_NAMES = {"class": "Class", "subclass": "Subclass", "supertype": "Supertype", "cluster": "Cluster", "leiden": "Leiden", "neurotransmitter": "Neurotransmitter"}
+NOT_IN_TAXONOMY = ("leiden", "neurotransmitter")        # the levels that are not a step down from the one above (so a group's table is just its own row)
 TILE_PX = 230
 MIN_TILE_PX = 50
 TILE_COLUMNS = (6, 5, 4, 3, 2, 1)         # the Section map size slider's stops: how many panels fit across the pane (1/6 of its width ... all of it)
@@ -58,6 +60,7 @@ OPACITIES = (0.15, 0.25, 0.35, 0.5, 0.75, 1.0)      # the Opacity slider's stops
 DEFAULT_OPACITY_INDEX = 5                          # (fully opaque: the dots on top hide the ones below)
 LABEL_ZOOM_CAP = 5.0               # the group numbers grow with the zoom up to this, then stay the same size
 SHAPE_SETTLE_MS = 250              # while the view is being zoomed or panned the cells are drawn as plain discs; their shapes come back this long after it stops
+LABEL_WEIGHT_RANGE = (0.6, 2.0)    # the size factor of the smallest and the largest group's number, when sized by cell count
 LABEL_HIGHLIGHT_FACTOR = 2.0       # the number of the group being marked with '+' signs is drawn this much bigger, for as long as it is marked
 HOVER_HOLD_MS = 250                # the pointer must rest this long before the plots dim
 GROUP_HOLD_MS = 500                # ...and this long before the cell's group is marked
@@ -241,6 +244,29 @@ class GeneVar:
         self.box.set_text(text)
 
 
+def label_weights(counts):
+    """The size factor of each group's number from its cell count: 0.6 for the smallest group to 2.0 for the largest, in between by the
+    logarithm of the count (so the major groups stand out when there are many)."""
+    counts = np.maximum(np.asarray(counts, dtype=float), 1.0)
+    if len(counts) == 0 or counts.max() <= counts.min():
+        return np.ones(len(counts))
+    t = (np.log(counts) - np.log(counts.min())) / (np.log(counts.max()) - np.log(counts.min()))
+    return LABEL_WEIGHT_RANGE[0] + (LABEL_WEIGHT_RANGE[1] - LABEL_WEIGHT_RANGE[0]) * t
+
+
+def percent_below(vals, point):
+    """The percentage of the cells (the finite values) below `point`, and of those that express the gene (a value above 0) that are:
+    (all cells, expressing cells)."""
+    fin = np.isfinite(vals)
+    n = int(np.count_nonzero(fin))
+    if n == 0:
+        return 0.0, 0.0
+    below = fin & (vals < point)
+    expr = fin & (vals > 0)
+    ne = int(np.count_nonzero(expr))
+    return 100.0 * np.count_nonzero(below) / n, (100.0 * np.count_nonzero(below & expr) / ne if ne else 0.0)
+
+
 class RangeSlider(tk.Canvas):
     """A track with two handles, for the lowest and the highest end of a range (0 to 1): the black level (left, a black dot) and the white level
     (right, a white dot) of a color scale. It is as wide as the color bar above it (the track runs between the same margins), calls
@@ -344,6 +370,8 @@ class PointCanvas:
         self.rects = []                             # [item, x0, y0, x1, y1]
         self.labels = []                            # [item, x, y]
         self.label_text = {}                        # item -> its text (the group's number)
+        self.label_weight = {}                      # item -> its size factor, by the group's cell count
+        self.scale_labels = True                    # the labels' size follows their weight
         self.shape_kernels = {}                     # (marker code, diameter) -> the kernel that grows a point into that marker
         self.moving = False                         # the view is being zoomed or panned: layers with shapes are drawn as plain discs
         self.settle_job = None
@@ -367,6 +395,7 @@ class PointCanvas:
         self.plus_arm = 3                           # the '+' marks' arm length (pixels) at the whole view
         self.pluses = None                          # (x, y) of the red '+' marks of the highlighted group
         self.compose_pending = None
+        self.outlines = None                        # closed outlines (arrays of (x, y) in data units) drawn over the points: the CCF's regions
         c = self.canvas
         c.bind("<Configure>", lambda e: self.on_resize())
         c.bind("<MouseWheel>", lambda e: self.zoom_at(e.x, e.y, 1.25 if e.delta > 0 else 0.8))
@@ -559,11 +588,33 @@ class PointCanvas:
             lab = lab[d:d + h, d:d + w]
             hit = lab > 0
             img[hit] = rgb[lab[hit].astype(np.int64) - 1]
+        if self.outlines:
+            self.draw_outlines(img, w, h, hw, hh)
         self.base = img
         self.compose()
         self.reposition()
         if self.on_view:
             self.on_view()
+
+    def set_outlines(self, polygons):
+        self.outlines = polygons or None
+        self.request_draw()
+
+    def draw_outlines(self, img, w, h, hw, hh):
+        """The outlines in view, one pixel wide, dark on a light background and light on a dark one."""
+        x0, x1, y0, y1 = self.cx - hw, self.cx + hw, self.cy - hh, self.cy + hh
+        shown = []
+        for p in self.outlines:
+            lo, hi = p.min(axis=0), p.max(axis=0)
+            if hi[0] < x0 or lo[0] > x1 or hi[1] < y0 or lo[1] > y1:
+                continue
+            px = (p[:, 0] - self.cx) * self.scale + w / 2
+            dy = (p[:, 1] - self.cy) * self.scale
+            py = (-dy if self.flip_y else dy) + h / 2
+            shown.append(np.round(np.column_stack([px, py])).astype(np.int32))
+        if shown:
+            ink = (215, 215, 215) if sum(self.bgcolor) < 300 else (90, 90, 90)
+            cv2.polylines(img, shown, True, ink, 1, cv2.LINE_AA)
 
     def marker_kernel(self, code, d):
         """The kernel with which a maximum filter makes a marker of this code and diameter d out of a point (cached)."""
@@ -705,12 +756,15 @@ class PointCanvas:
             self.canvas.delete(it[0])
         self.labels = []
         self.label_text = {}
+        self.label_weight = {}
         self.boosted = None
 
-    def add_label(self, text, x, y, color="black"):
+    def add_label(self, text, x, y, color="black", weight=1.0):
+        """`weight`: times the font size when the labels are sized by their group's cell count (see set_label_scaling)."""
         item = self.canvas.create_text(0, 0, text=text, font=("Segoe UI", self.label_size, "bold"), fill=color)
         self.labels.append([item, x, y])
         self.label_text[item] = text
+        self.label_weight[item] = weight
 
     def boost_label(self, text):
         """Draw the label with this text bigger (the group being marked with '+' signs), and the others as they were; None puts it back."""
@@ -725,14 +779,23 @@ class PointCanvas:
         self.label_size = None                      # (so the next update applies the new size)
         self.update_label_size()
 
+    def set_label_scaling(self, on):
+        self.scale_labels = on
+        self.update_label_size(force=True)
+
+    def label_font_size(self, item, size):
+        if self.scale_labels:
+            size = max(int(round(size * self.label_weight.get(item, 1.0))), 1)
+        big = self.boosted is not None and self.label_text.get(item) == self.boosted
+        return max(int(round(size * LABEL_HIGHLIGHT_FACTOR)), size + 1) if big else size
+
     def update_label_size(self, force=False):
         zoom = min(self.scale / self.fit_scale(), LABEL_ZOOM_CAP)
         size = max(int(round(8 * self.label_factor * (1 + 0.75 * (zoom - 1)))), 1)
         if size != self.label_size or force:
             self.label_size = size
             for it in self.labels:
-                big = self.boosted is not None and self.label_text.get(it[0]) == self.boosted
-                self.canvas.itemconfig(it[0], font=("Segoe UI", max(int(round(size * LABEL_HIGHLIGHT_FACTOR)), size + 1) if big else size, "bold"))
+                self.canvas.itemconfig(it[0], font=("Segoe UI", self.label_font_size(it[0], size), "bold"))
 
     def reposition(self):
         if self.labels:
@@ -845,6 +908,13 @@ class UmapWindow(ExportsMixin):
         self.cy = pd.to_numeric(spatial["y"], errors="coerce").to_numpy() if ok else None
         self.sections = core.sorted_sections_descending(a.obs[sec_col].dropna().unique().tolist()) if ok else []
         self.info = {k: (a.obs[k].astype(str).to_numpy() if k in a.obs.columns else None) for k in LEVEL_NAMES}
+        if self.info["neurotransmitter"] is None:           # (runs made before it was a column: read from the atlas's table, as the taxonomy was)
+            try:
+                nt = core.load_annotations_aligned(a.obs_names, self.abc_cache)
+                if "neurotransmitter" in nt.columns:
+                    self.info["neurotransmitter"] = nt["neurotransmitter"].astype(str).to_numpy()
+            except Exception as e:
+                print(f"Could not read the neurotransmitter of the cells: {e}", flush=True)
         self.levels = [k for k in LEVEL_NAMES if self.info[k] is not None]
         # the section panels' background: every cell of each section (from the unfiltered data), when given
         self.bg = None
@@ -895,7 +965,7 @@ class UmapWindow(ExportsMixin):
         """(codes of each run cell, uniques) of a level; and for the all-cell background (codes, uniques) over the same uniques."""
         key = ("codes", level)
         if key not in self.cache:
-            codes, uniques = pd.factorize(self.info[level])
+            codes, uniques = pd.factorize(pd.Series(self.info[level]).replace("nan", np.nan))      # (a cell with no value, such as a non-neuron's neurotransmitter: code -1)
             self.cache[key] = (codes, uniques)
         return self.cache[key]
 
@@ -942,6 +1012,12 @@ class UmapWindow(ExportsMixin):
         HoverTip(shapes_box, lambda: "The cells of the section maps get the shape of their group, as in the UMAP (a new shape every 20 groups, which "
                                      "share their colors otherwise). While you zoom or pan, cells are drawn as discs until the view settles. Saved "
                                      "section maps have the same shapes.")
+        self.var_ccf = tk.BooleanVar(bars, False)
+        ccf_box = ttk.Checkbutton(bars, text="CCF atlas", variable=self.var_ccf, command=self.apply_ccf)
+        ccf_box.grid(row=2, column=4, sticky="w", padx=(12, 6))
+        HoverTip(ccf_box, lambda: "Draw the outlines of the Allen CCF (2020) regions over the section maps, fitted to each section from the CCF "
+                                  "position of its cells. The first time reads the CCF coordinates of the cells (a minute or so).")
+        self.ccf_outlines = None
         bars.columnconfigure(3, weight=1)
         self.tile_scroll = tk.Canvas(left, highlightthickness=0, bg="#f4f4f4")
         sb = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.tile_scroll.yview)
@@ -963,6 +1039,11 @@ class UmapWindow(ExportsMixin):
         self.umap_sliders = [self.add_slider(umap_bar, 0, "Label size:", self.var_label, len(LABEL_SIZES), self.apply_label_size,
                                              lambda i: LABEL_SIZE_NAMES[i], None)]
         ttk.Button(umap_bar, text="Reset to default", command=self.reset_umap_sliders).grid(row=0, column=0, sticky="w")
+        self.var_label_scale = tk.BooleanVar(umap_bar, True)
+        label_scale_box = ttk.Checkbutton(umap_bar, text="Size by cell count", variable=self.var_label_scale, command=self.apply_label_scaling)
+        label_scale_box.grid(row=0, column=4, sticky="w", padx=(12, 0))
+        HoverTip(label_scale_box, lambda: "The group numbers on the UMAP are bigger for the groups with more cells (from 0.6 to 2 times the Label size, "
+                                          "by the logarithm of the count), so that the major groups stand out. Off: all the same size. Saved UMAPs follow it.")
         umap_bar.columnconfigure(3, weight=1)
         c = self.coords
         padx = (c[:, 0].max() - c[:, 0].min()) * 0.05 or 1.0
@@ -1188,6 +1269,60 @@ class UmapWindow(ExportsMixin):
         self.tile_cols = self.tile_px = 0
         self.layout_tiles()
 
+    def apply_ccf(self):
+        """The CCF atlas checkbox: show or hide the regions' outlines on the section maps (made the first time it is ticked)."""
+        if not self.var_ccf.get():
+            for t in self.tiles:
+                t["pc"].set_outlines(None)
+            return
+        if self.ccf_outlines is None and not self.load_ccf():
+            self.var_ccf.set(False)
+            return
+        for t in self.tiles:
+            t["pc"].set_outlines(self.ccf_outlines.get(t["label"]))
+
+    def load_ccf(self):
+        """Make the outlines of every section map: the volume, the cells' CCF positions, each section's fit. True if done."""
+        h = self.host
+        if not self.tiles:
+            return False
+        if not h["ensure_ccf_downloaded"](self.abc_cache, parent=self.root):
+            self.var_status.set("The CCF coordinates were not downloaded, so there is no atlas to draw.")
+            return False
+        cells, homes = {}, {}
+        for t in self.tiles:
+            s = t["label"]
+            if self.bg is not None and s in self.bg["where"]:          # (every cell of the section: a better fit than the run's own)
+                w = self.bg["where"][s]
+                ids, x, y = np.asarray(self.bg["ids"])[w], self.bg["x"][w], self.bg["y"][w]
+            else:
+                idx = self.run_idx[s]
+                ids, x, y = np.asarray(self.adata.obs_names)[idx], self.cx[idx], self.cy[idx]
+            cells[s] = (ids, x, y)
+            homes[s] = t["pc"].home
+
+        def work():
+            path = self.abc_cache.get_data_path(directory=h["CCF_VOLUME_DIRECTORY"], file_name=h["CCF_VOLUME_FILE_NAME"])
+            volume = h["read_nifti_volume"](path)
+            all_ids = np.concatenate([c[0] for c in cells.values()])
+            aligned, _shell = h["load_ccf_for_cells"](self.abc_cache, all_ids.tolist())
+            xyz = aligned[["x_ccf", "y_ccf", "z_ccf"]].to_numpy(dtype=float)
+            at, fitted = 0, {}
+            for s, (ids, x, y) in cells.items():
+                fitted[s] = (x, y, xyz[at:at + len(ids)])
+                at += len(ids)
+            return abc_tk_ccf.section_outlines(volume, fitted, homes)
+
+        try:
+            self.ccf_outlines = h["run_with_loading_window"]("Drawing the CCF atlas on the section maps (the first read of the CCF coordinates takes about a minute).", work)
+        except Exception as e:
+            self.var_status.set(f"Could not draw the CCF atlas: {e}")
+            return False
+        empty = [core.sanitize_section_token(s) for s, p in self.ccf_outlines.items() if not p]
+        if empty:
+            self.var_status.set(f"No CCF position for section {', '.join(empty)}: no outlines there.")
+        return True
+
     def add_slider(self, parent, row, text, var, n, command, value_text, tip_text):
         """A slider with `n` stops (0 .. n-1): it jumps from stop to stop, shows `value_text(stop)` beside it, and calls `command()` when the
         stop changes. `tip_text(stop)`, if given, is shown in a tip while the pointer is over the slider. Returns the slider."""
@@ -1213,6 +1348,9 @@ class UmapWindow(ExportsMixin):
         if tip_text is not None:
             HoverTip(scale, lambda: tip_text(var.get()))
         return scale
+
+    def apply_label_scaling(self):
+        self.umap.set_label_scaling(self.var_label_scale.get())
 
     def apply_label_size(self):
         """The UMAP's Label size slider: the group numbers drawn on the UMAP, bigger or smaller."""
@@ -1347,8 +1485,8 @@ class UmapWindow(ExportsMixin):
         self.umap.set_layers([{"x": self.coords[o, 0], "y": self.coords[o, 1], "rgb": rgb_run[o], "size": 4 * self.dot_scale()}] + list(extra_umap_layers))
         self.umap.clear_labels()
         self.label_info = list(labels or [])
-        for text, x, y, color in labels or []:
-            self.umap.add_label(text, x, y, color)
+        for text, x, y, color, weight in labels or []:
+            self.umap.add_label(text, x, y, color, weight)
         self.umap.reposition()
         self.tile_queue = list(self.tiles)
         self.tile_fn = bg_rgb_fn
@@ -1510,10 +1648,11 @@ class UmapWindow(ExportsMixin):
         on = [u for u in ranked if str(uniques[u]) not in self.off_groups]
         cent = cent[cent["g"].isin(on)].groupby("g").median()
         labels = []
-        for g, row in cent.iterrows():
+        weights = label_weights(counts[cent.index.to_numpy()])
+        for (g, row), weight in zip(cent.iterrows(), weights):
             m = re.match(r"^\s*(\d+)", str(uniques[g]))
             dark = (lut[g].astype(float) * 0.55).astype(int)               # (the group's own color, darker)
-            labels.append((m.group(1) if m else str(uniques[g]), row["x"], row["y"], "#%02x%02x%02x" % tuple(dark)))
+            labels.append((m.group(1) if m else str(uniques[g]), row["x"], row["y"], "#%02x%02x%02x" % tuple(dark), float(weight)))
         self.apply(rgb, np.arange(self.n), bg_fn, labels)
         self.view_kind, self.view_token = "all", f"all_{level}"
         self.view_title = f"All {LEVEL_NAMES[level].lower()}s"
@@ -1627,6 +1766,9 @@ class UmapWindow(ExportsMixin):
         level = self.level
         if self.info.get(level) is None:
             self.var_status.set(f"No '{level}' column on this dataset.")
+            return
+        if level == "neurotransmitter":
+            self.var_status.set("Neurotransmitters have names, not numbers: use All groups to see them (click a group in the list to gray it).")
             return
         ids, bad = self.parse_ids()
         codes, uniques = self.category_codes(level)
@@ -1912,7 +2054,7 @@ class UmapWindow(ExportsMixin):
             return self.bg["x"][w][o], self.bg["y"][w][o], col[o], w[o]
 
         self.apply(rgb, order, bg_fn)
-        self.draw_colorbar(vmin, vmax, scale, dataset)
+        self.draw_colorbar(vmin, vmax, scale, dataset, readout=(percent_below(vals, vmin), percent_below(vals, vmax)) if linear else None)
         self.var_status.set(f"Showing {gene}{' [imputed]' if dataset == 'imputed' else ''} (every cell of the sections, colored on the selection's scale)."
                             if bg_vals is not None else "(cells outside this run's selection are gray).")
 
@@ -1969,16 +2111,17 @@ class UmapWindow(ExportsMixin):
 
         self.apply(rgb, order, bg_fn, extra_umap_layers=extra, dark=True)
         to_log2 = 1.0 if dataset == "imputed" or scale == "linear" else float(np.log2(np.e))
-        self.draw_multi_legend(genes, [(v[1] * to_log2, v[2] * to_log2) for v in norm], scale)
+        readouts = [(percent_below(per_gene[i][0], norm[i][1]), percent_below(per_gene[i][0], norm[i][2])) for i in range(n)] if scale == "linear" else None
+        self.draw_multi_legend(genes, [(v[1] * to_log2, v[2] * to_log2) for v in norm], scale, readouts)
         parts = " and ".join(f"'{g}' ({CHANNEL_NAMES[i]})" for i, g in enumerate(genes))
         self.var_status.set(f"Showing {parts}{' [imputed]' if dataset == 'imputed' else ''}."
                             + (f" Hidden: {', '.join(genes[i] for i in sorted(hidden))}." if hidden else ""))
 
-    def draw_multi_legend(self, genes, ranges, scale):
+    def draw_multi_legend(self, genes, ranges, scale, readouts=None):
         c = self.cbar
         self.cbar_photo = None
         linear = scale == "linear"
-        row = 68 if linear else 44                                  # (in linear scale each gene has the slider of its black and white levels below its range)
+        row = 92 if linear else 44                                  # (in linear scale each gene has the slider of its black and white levels below its range, and what is below them)
         if len(self.multi_sliders) != (len(genes) if linear else 0):
             c.delete("all")
             self.clear_multi_sliders()                              # (the sliders are kept while they are dragged: only made again for other genes)
@@ -2005,8 +2148,12 @@ class UmapWindow(ExportsMixin):
             c.create_text(34, y + 22, anchor="nw", text="hidden" if off else f"{'' if scale == 'linear' else 'log2: '}{lo:.1f}\u2013{hi:.1f}",
                           fill="#666666", font=("Segoe UI", 8), tags="legend")
             if linear:
+                if readouts is not None and not off:
+                    for (a, e), x, anchor in ((readouts[i][0], 10, "nw"), (readouts[i][1], max(c.winfo_width(), 200) - 10, "ne")):
+                        c.create_text(x, y + 36, anchor=anchor, text=f"{a:.1f}% of cells below", font=("Segoe UI", 8), fill="gray30", tags="legend")
+                        c.create_text(x, y + 48, anchor=anchor, text=f"{e:.1f}% of expressing", font=("Segoe UI", 8), fill="gray30", tags="legend")
                 self.multi_sliders[i].set(*self.multi_levels.get(i, (0.0, 1.0)))
-                c.coords(self.multi_windows[i], 0, y + 38)
+                c.coords(self.multi_windows[i], 0, y + 62)
                 c.itemconfig(self.multi_windows[i], width=max(c.winfo_width(), 200))
         c.create_text(150, 8 + row * len(genes) + 2, anchor="n",
                       text="click a gene to hide / show it" + ("; drag the handles for its black and white levels" if linear else ""),
@@ -2069,7 +2216,7 @@ class UmapWindow(ExportsMixin):
             return None
         i0 = int(np.flatnonzero(mask)[0])
         levels = list(LEVEL_NAMES)
-        chain = [level] if level == "leiden" else levels[:levels.index(level) + 1]
+        chain = [level] if level in NOT_IN_TAXONOMY else [k for k in levels[:levels.index(level) + 1] if k not in NOT_IN_TAXONOMY]
         rows = []
         for k in chain:
             v = self.info[k][i0] if self.info.get(k) is not None else None
@@ -2090,15 +2237,17 @@ class UmapWindow(ExportsMixin):
         self.cancel_hover_jobs()
         self.hover_key = None
         self.clear_highlights()
+        self.show_info(None)                         # (also puts the bold row back to normal)
         if key is None:
-            self.show_info(None)
             return
         label = key if self.mode == "all" else self.single_names.get(key)
         rows = self.group_info_rows(self.level, label) if label is not None else None
-        if rows is None:
-            self.show_info(None)
-        else:
-            self.show_info(None)
+        if rows is not None:
+            if self.mode == "all":
+                canvas, names = self.group_canvas, getattr(self, "group_rows", [])
+            else:
+                canvas, names = self.legend, (self.last_ids or {}).get("targets", [])
+            self.bold_legend_row(canvas, names.index(key) if key in names else None)
             self.show_cell_rows(rows)
             self.set_dim(True)                       # (as when the pointer rests on one of the group's cells)
             self.mark_group(label)
@@ -2146,9 +2295,11 @@ class UmapWindow(ExportsMixin):
         else:
             self.cbar_slider.pack_forget()
 
-    def draw_colorbar(self, vmin, vmax, scale, dataset):
+    def draw_colorbar(self, vmin, vmax, scale, dataset, readout=None):
+        """`readout` (linear scale): the percentages below the black and the white point, ((all, expressing), (all, expressing))."""
         c = self.cbar
         c.delete("all")
+        c.config(height=70 if readout is None else 88)
         w = max(c.winfo_width(), 200)
         ramp = viridis_rgb(np.linspace(0, 1, w - 20))[None, :, :]
         img = np.repeat(ramp, 16, axis=0)
@@ -2156,7 +2307,11 @@ class UmapWindow(ExportsMixin):
         c.create_image(10, 8, anchor="nw", image=self.cbar_photo)
         c.create_text(10, 28, anchor="nw", text=f"{vmin:.2f}", font=("Segoe UI", 9))
         c.create_text(w - 10, 28, anchor="ne", text=f"{vmax:.2f}", font=("Segoe UI", 9))
-        c.create_text(w / 2, 50, text=SCALE_UNITS[(dataset, scale)], font=("Segoe UI", 9), fill="gray30")
+        if readout is not None:
+            for (a, e), x, anchor in ((readout[0], 10, "nw"), (readout[1], w - 10, "ne")):
+                c.create_text(x, 42, anchor=anchor, text=f"{a:.1f}% of cells below", font=("Segoe UI", 8), fill="gray30")
+                c.create_text(x, 54, anchor=anchor, text=f"{e:.1f}% of expressing", font=("Segoe UI", 8), fill="gray30")
+        c.create_text(w / 2, 50 if readout is None else 76, text=SCALE_UNITS[(dataset, scale)], font=("Segoe UI", 9), fill="gray30")
 
     # ---- background work
 
