@@ -31,6 +31,15 @@ import threading
 import time
 from pathlib import Path
 
+_STARTUP_T0 = time.perf_counter()
+
+
+def startup_note(message):
+    """One line on the console while the program is starting up, with the seconds since it started (as in ABC_atlas_browser.py): the window can
+    take a while to appear, and a silent console looks like a hang."""
+    print(f"[{time.perf_counter() - _STARTUP_T0:5.1f}s] {message}", flush=True)
+
+
 
 def ensure_libraries(required):
     """Install, with pip into this Python, the libraries ({import name: pip name}) that are missing, as the other tools do: the shared .venv of
@@ -48,6 +57,7 @@ def ensure_libraries(required):
                  f"yet (use Python 3.13: see ensure_python.bat). To install them by hand:  python -m pip install {' '.join(still)}")
 
 
+startup_note("Loading the libraries (numpy, pandas, tkinter, pillow). The first start after a reboot is the slowest.")
 ensure_libraries({'numpy': 'numpy', 'pandas': 'pandas', 'PIL': 'pillow'})
 
 import numpy as np  # noqa: E402
@@ -55,6 +65,8 @@ import pandas as pd  # noqa: E402
 import tkinter as tk  # noqa: E402
 from tkinter import filedialog, messagebox, ttk  # noqa: E402
 from PIL import Image, ImageTk  # noqa: E402
+
+startup_note("Libraries loaded.")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CACHE_DIR = SCRIPT_DIR / 'cache_local'
@@ -3240,6 +3252,7 @@ class CCFBrowser:
 
 
 def main():
+    startup_note("Opening the window...")
     CCFBrowser().run()
 
 

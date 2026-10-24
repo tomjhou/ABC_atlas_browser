@@ -210,7 +210,7 @@ class ExportsMixin:
                     else:
                         ax.scatter(coords[m, 0], coords[m, 1], c=color, marker=marker, s=size, alpha=POINT_ALPHA, linewidths=0)
                 entries = cat
-            by_count = self.var_label_scale.get()                 # (the Size by cell count checkbox: the saved UMAP follows it)
+            by_count = self.var_label_scale.get()                 # (the "Label font size scales with cell count" checkbox: the saved UMAP follows it)
             for text, x, y, color, weight in getattr(self, "label_info", []):
                 if xlim[0] <= x <= xlim[1] and ylim[0] <= y <= ylim[1]:
                     ax.text(x, y, text, fontsize=EXPORT_FONTSIZE * 0.6 * (weight if by_count else 1.0), color=color, fontweight="bold", ha="center", va="center", clip_on=True)
@@ -306,7 +306,8 @@ class ExportsMixin:
             return
         ext = "." + fmt
         roi_only = "_ROI_only" if self.var_roi_only.get() else ""        # (the ROI only box above the panels: the name says what the maps show)
-        proposed = h["unique_export_paths"](target, f"{self.view_token_safe()}_section_maps{roi_only}", (ext,))[ext].name
+        ccf = "_CCF-overlay" if any(t["pc"].outlines for t in self.tiles) else ""        # (and the CCF atlas box)
+        proposed = h["unique_export_paths"](target, f"{self.view_token_safe()}_section_maps{roi_only}{ccf}", (ext,))[ext].name
         chosen = self.ask_save_path("Save the section maps", proposed, ext, fmt.upper() + " image")
         if chosen is None:
             self.var_status.set("Save section maps cancelled.")
@@ -366,6 +367,12 @@ class ExportsMixin:
                             else:
                                 ax.scatter(x[sub], y[sub], c=rgb[sub] / 255.0, marker=marker, s=(DOT_MM * pts_per_mm) ** 2, linewidths=0,
                                            rasterized=raster)
+                if pc.outlines:                                      # (the CCF atlas box: the regions' outlines, as on the screen)
+                    from matplotlib.collections import LineCollection
+                    seen = [np.vstack([p, p[:1]]) for p in pc.outlines
+                            if p[:, 0].max() >= xl[0] and p[:, 0].min() <= xl[1] and p[:, 1].max() >= yl[0] and p[:, 1].min() <= yl[1]]
+                    ink = "#d7d7d7" if sum(pc.bgcolor) < 300 else "#5a5a5a"
+                    ax.add_collection(LineCollection(seen, colors=ink, linewidths=0.4))
                 for _it, a, b, c2, d in pc.rects:
                     ax.add_patch(Rectangle((a, b), c2 - a, d - b, fill=False, edgecolor="#ff8c00", linestyle=(0, (4, 2)), linewidth=1.2))
                 if pc.scalebar:

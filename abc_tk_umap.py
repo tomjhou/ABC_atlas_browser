@@ -1040,7 +1040,7 @@ class UmapWindow(ExportsMixin):
                                              lambda i: LABEL_SIZE_NAMES[i], None)]
         ttk.Button(umap_bar, text="Reset to default", command=self.reset_umap_sliders).grid(row=0, column=0, sticky="w")
         self.var_label_scale = tk.BooleanVar(umap_bar, True)
-        label_scale_box = ttk.Checkbutton(umap_bar, text="Size by cell count", variable=self.var_label_scale, command=self.apply_label_scaling)
+        label_scale_box = ttk.Checkbutton(umap_bar, text="Label font size scales with cell count", variable=self.var_label_scale, command=self.apply_label_scaling)
         label_scale_box.grid(row=0, column=4, sticky="w", padx=(12, 0))
         HoverTip(label_scale_box, lambda: "The group numbers on the UMAP are bigger for the groups with more cells (from 0.6 to 2 times the Label size, "
                                           "by the logarithm of the count), so that the major groups stand out. Off: all the same size. Saved UMAPs follow it.")
