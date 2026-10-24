@@ -1636,4 +1636,104 @@ def section_coordinates_ready():
     return section_coords_state['table'] is not None or section_coords_state['error'] is not None
 
 
+STATISTICS_FILE_NAME = 'statistics.txt'
+
+
+def run_statistics_text(run_folder, adata, abc_cache, rois=None, whole_sections=None, cells_selected=None, note=""):
+    """The text of a run's statistics.txt: what the run covers (the cell types, the brain sections, the ROIs and whole sections picked) and how
+    many cells there are (in the run, in the ROIs, of each class), as counted from the run's own cells `adata` now. `rois` (dicts with
+    'section' and 'x_min'..'y_max') and `whole_sections` are read from the run's roi_coords.csv when not given. `cells_selected` is the number
+    of cells the selection had before a random subset was taken, when that is known. `note` goes under the title."""
+    import datetime
+    run_folder = Path(run_folder)
+    if rois is None or whole_sections is None:
+        roi_csv = run_folder / 'roi_coords.csv'
+        if roi_csv.exists():
+            file_rois, file_whole = load_rois_csv(roi_csv)
+            rois = file_rois if rois is None else rois
+            whole_sections = file_whole if whole_sections is None else whole_sections
+    rois = list(rois or [])
+    whole_sections = list(whole_sections or [])
+    obs = adata.obs
+    n = int(adata.n_obs)
+    name = run_folder.name
+    lower = name.lower()
+    subset = ("neurons only" if lower.startswith('umap_neurons_') else "non-neurons only" if lower.startswith('umap_nonneurons_')
+              else "all cells (neurons and non-neurons)" if lower.startswith('umap_all') else "not recorded")
+    sub = re.search(r'_sub(\d+)(?:_|$)', name)
+    sections = sorted_sections_descending(obs[SECTION_COL].dropna().unique().tolist()) if SECTION_COL in obs.columns else []
+
+    out = ["Statistics of this run", "=" * 22, f"Run folder:    {name}",
+           f"Written:       {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}" + (f"  ({note})" if note else ""),
+           f"Atlas dataset: {DATASET_NAME}", ""]
+    out += ["Selection", "---------", f"Cell types:       {subset}",
+            f"Brain sections:   {len(sections)}" + (f"   ({', '.join(str(s) for s in sections)})" if 0 < len(sections) <= 40 else ""),
+            f"ROIs drawn:       {len(rois)}", f"Whole sections:   {len(whole_sections) if rois else len(sections)}"
+            + ("" if rois else "   (no ROIs: every cell of the sections is in the run)"),
+            ""]
+
+    out += ["Cells", "-----", f"Cells in this run:                 {n:,}"]
+    if sub:
+        out.append(f"Random subset:                     limited to {int(sub.group(1)):,} cells (the limit set for this run)"
+                   + (f"; the selection had {cells_selected:,} cells" if cells_selected else ""))
+    elif cells_selected and cells_selected != n:
+        out.append(f"Cells in the selection:            {cells_selected:,}")
+    roi_lines = []
+    if rois:
+        spatial = load_section_spatial_coords(adata, abc_cache) if SECTION_COL in obs.columns else None
+        if spatial is None or 'x' not in spatial or 'y' not in spatial:
+            out.append("Cells inside the ROIs:             not available (the cells' positions in their sections could not be read)")
+        else:
+            x = pd.to_numeric(spatial['x'], errors='coerce').to_numpy()
+            y = pd.to_numeric(spatial['y'], errors='coerce').to_numpy()
+            section_token = obs[SECTION_COL].astype(str).map(sanitize_section_token).to_numpy()
+            inside_any = np.zeros(n, bool)
+            for k, roi in enumerate(rois, 1):
+                m = ((section_token == sanitize_section_token(str(roi['section']))) & (x >= roi['x_min']) & (x <= roi['x_max'])
+                     & (y >= roi['y_min']) & (y <= roi['y_max']))
+                inside_any |= m
+                roi_lines.append(f"  ROI {k}: section {sanitize_section_token(str(roi['section']))}, x {roi['x_min']:.2f} to {roi['x_max']:.2f} mm, "
+                                 f"y {roi['y_min']:.2f} to {roi['y_max']:.2f} mm: {int(m.sum()):,} cells")
+            out.append(f"Cells inside the ROIs:             {int(inside_any.sum()):,}"
+                       + (f"   ({100 * inside_any.sum() / n:.1f}% of the run)" if n else ""))
+            out.append(f"Cells outside them:                {n - int(inside_any.sum()):,}   (from the whole sections picked)")
+    else:
+        out.append("Cells inside the ROIs:             no ROIs (every cell of the sections is in the run)")
+    if 'class' in obs.columns:
+        ids = extract_leading_numeric_id(pd.Series(obs['class'].astype(str).to_numpy())).to_numpy()
+        non_neuron = np.isin(ids, list(NON_NEURON_CLASS_IDS))
+        out.append(f"Neurons / non-neurons:             {n - int(non_neuron.sum()):,} / {int(non_neuron.sum()):,}")
+    if roi_lines:
+        out += ["", "Per ROI (cells of the run whose position lies in it; ROIs that overlap count a cell in each)"] + roi_lines
+
+    levels = [(lvl, int(obs[lvl].nunique())) for lvl in ('class', 'subclass', 'supertype', 'cluster') if lvl in obs.columns]
+    if levels or 'leiden' in obs.columns:
+        out += ["", "Cell types in this run", "----------------------"]
+        names = {'class': 'Classes:', 'subclass': 'Subclasses:', 'supertype': 'Supertypes:', 'cluster': 'Clusters:'}
+        out += [f"{names[lvl]:<17}  {count:,} groups" for lvl, count in levels]
+        if 'leiden' in obs.columns:
+            out.append(f"{'Leiden clusters:':<17}  {int(obs['leiden'].nunique()):,}")
+    if 'class' in obs.columns:
+        counts = obs['class'].astype(str).value_counts()
+        out += ["", "Cells per class"] + [f"  {label}: {int(c):,}  ({100 * c / n:.1f}%)" for label, c in counts.items()]
+    out += ["", "Genes", "-----", f"Genes measured:   {int(adata.n_vars):,}", f"Raw counts kept:  {'yes' if 'counts' in adata.layers else 'no'}"]
+    return "\n".join(out) + "\n"
+
+
+def write_run_statistics(run_folder, adata, abc_cache, rois=None, whole_sections=None, cells_selected=None, overwrite=True, note=""):
+    """Write statistics.txt into the run's folder (see run_statistics_text). With overwrite=False an existing file is left as it is: it is only
+    made for a run that has none. Returns the file's path, or None if it was left alone. A problem is printed and does not stop the caller."""
+    path = Path(run_folder) / STATISTICS_FILE_NAME
+    if path.exists() and not overwrite:
+        return None
+    try:
+        text = run_statistics_text(run_folder, adata, abc_cache, rois, whole_sections, cells_selected, note)
+        path.write_text(text, encoding='utf-8')
+        print(f"Wrote {path}.", flush=True)
+        return path
+    except Exception as e:
+        print(f"Could not write {path} ({type(e).__name__}: {e}).", flush=True)
+        return None
+
+
 CACHE_DIR.mkdir(parents=True, exist_ok=True)

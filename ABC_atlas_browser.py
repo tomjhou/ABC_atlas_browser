@@ -418,7 +418,7 @@ from abc_core import (
     rank_gene_suggestions, render_gene_expression_array, render_group_highlight_array, render_multi_gene_expression_array,
     render_section_level_array, resolve_gene_names, sanitize_section_token, save_coordinate_settings, scatter_gray_then_colored,
     section_coordinates_ready, section_coords_lock, section_coords_state, section_level_image_cache_path, section_roi_cache_paths,
-    section_sort_key, section_z_text, sorted_sections_descending, start_section_coordinate_load,
+    section_sort_key, section_z_text, sorted_sections_descending, start_section_coordinate_load, write_run_statistics,
 )
 
 
@@ -18416,6 +18416,10 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         # Reference point for log_status()'s elapsed-time prefix, same as the
         # normal flow sets right after its own section/ROI selection step.
         selection_confirmed_at = time.perf_counter()
+        # A run saved before statistics.txt existed gets one now (a file that is there is left as it is).
+        run_with_loading_window("Writing this run's statistics.txt (it had none).",
+                                lambda: write_run_statistics(Path(load_existing_folder), adata, abc_cache, rois=rois, overwrite=False,
+                                                             note="made when this saved run was opened and had none"))
         log_status("Step 9: Opening the interactive UMAP viewer...")
         try:
             show_interactive_umap_window(
@@ -18619,6 +18623,7 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
     # ---------------------------------------------------------------------------
     # 3. Filter to the selected cell type, section(s), and ROIs (if any)
     # ---------------------------------------------------------------------------
+    cells_after_filter = None
     if early_cache_hit:
         log_status("Step 3: Skipped — the cached run found above already implies this exact "
                    "cell-type/section/ROI filter; materializing straight from its saved "
@@ -18631,6 +18636,7 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
         if rois:
             adata = filter_by_rois(adata, abc_cache, rois)
         log_status(f"Step 3: {adata.n_obs} cells remain after filtering.")
+        cells_after_filter = int(adata.n_obs)           # (before a random subset, if one is taken: it goes into statistics.txt)
 
     # ---------------------------------------------------------------------------
     # 4. Decide whether/how much to subsample
@@ -19002,6 +19008,9 @@ def run_session(abc_cache, session_state, raw_backed_cache, imputed_state=None):
     # ---------------------------------------------------------------------------
     # 9. Interactive UMAP viewer (subclass highlight / gene / imputed gene)
     # ---------------------------------------------------------------------------
+    run_with_loading_window("Writing this run's statistics.txt.",
+                            lambda: write_run_statistics(run_folder, adata, abc_cache, rois=rois, whole_sections=whole_only_sections if rois else None,
+                                                         cells_selected=cells_after_filter, overwrite=True, note="made with this run"))
     log_status("Step 9: Opening the interactive UMAP viewer...")
     try:
         show_interactive_umap_window(
