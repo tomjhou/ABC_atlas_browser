@@ -57,6 +57,8 @@ DEFAULT_LABEL_INDEX = 1
 OPACITIES = (0.15, 0.25, 0.35, 0.5, 0.75, 1.0)      # the Opacity slider's stops, low to high: how opaque one cell's dot is (overlapping dots add up)
 DEFAULT_OPACITY_INDEX = 5                          # (fully opaque: the dots on top hide the ones below)
 LABEL_ZOOM_CAP = 5.0               # the group numbers grow with the zoom up to this, then stay the same size
+SHAPE_SETTLE_MS = 250              # while the view is being zoomed or panned the cells are drawn as plain discs; their shapes come back this long after it stops
+LABEL_HIGHLIGHT_FACTOR = 2.0       # the number of the group being marked with '+' signs is drawn this much bigger, for as long as it is marked
 HOVER_HOLD_MS = 250                # the pointer must rest this long before the plots dim
 GROUP_HOLD_MS = 500                # ...and this long before the cell's group is marked
 DOT_MM = 0.04                      # a cell's dot in the section panels: 40 um across on the tissue
@@ -81,6 +83,75 @@ def viridis_rgb(t):
 
 # ---------------------------------------------------------------------------------------------------------------------- the point canvas
 
+# The browser's category markers (CATEGORY_MARKER_SHAPES): a group's rank picks a color from a cycle of 20, and every 20 ranks the shape changes (and
+# after 200, the shapes are hollow), so that groups that share a color still differ. A marker code is its shape's place in SHAPE_MARKERS, plus 10 if hollow.
+SHAPE_MARKERS = ('o', 's', '^', '<', 'v', '>', 'D', 'P', 'X', '*')
+
+
+def _plus_points(arm):
+    a, b = (1 - arm) / 2, (1 + arm) / 2
+    return [(a, 0), (b, 0), (b, a), (1, a), (1, b), (b, b), (b, 1), (a, 1), (a, b), (0, b), (0, a), (a, a)]
+
+
+def _x_points(arm):
+    pts = np.array(_plus_points(arm)) - 0.5
+    rot = pts @ np.array([[np.cos(np.pi / 4), -np.sin(np.pi / 4)], [np.sin(np.pi / 4), np.cos(np.pi / 4)]]).T
+    return (rot * (0.5 / np.abs(rot).max()) + 0.5).tolist()
+
+
+def _star_points():
+    return [(0.5 + (0.5 if k % 2 == 0 else 0.2) * np.cos(-np.pi / 2 + k * np.pi / 5), 0.5 + (0.5 if k % 2 == 0 else 0.2) * np.sin(-np.pi / 2 + k * np.pi / 5))
+            for k in range(10)]
+
+
+SHAPE_POLYGONS = {      # each marker but the circle, as a polygon in a unit square (y down)
+    's': [(0, 0), (1, 0), (1, 1), (0, 1)], '^': [(0.5, 0), (1, 1), (0, 1)], 'v': [(0, 0), (1, 0), (0.5, 1)],
+    '<': [(1, 0), (1, 1), (0, 0.5)], '>': [(0, 0), (1, 0.5), (0, 1)], 'D': [(0.5, 0), (1, 0.5), (0.5, 1), (0, 0.5)],
+    'P': _plus_points(0.34), 'X': _x_points(0.26), '*': _star_points()}
+
+
+def shape_mask(code, d):
+    """The marker of this code as a d x d mask (1 inside), the right way up. (A maximum filter writes its kernel turned half way round, so the
+    kernels made from these are turned the other way first: see PointCanvas.marker_kernel.)"""
+    marker, is_open = SHAPE_MARKERS[code % 10], code >= 10
+    S = 8 * d                                              # (drawn eight times as big and shrunk, so that small shapes keep their form)
+    big = np.zeros((S, S), np.uint8)
+    if marker == 'o':
+        cv2.circle(big, (S // 2, S // 2), S // 2, 255, -1)
+    else:
+        cv2.fillPoly(big, [np.round(np.array(SHAPE_POLYGONS[marker]) * (S - 1)).astype(np.int32)], 255)
+    mask = (cv2.resize(big, (d, d), interpolation=cv2.INTER_AREA) >= 128).astype(np.uint8)
+    if is_open and d > 2:
+        t = max(1, int(round(d / 6)))
+        mask = mask & (1 - cv2.erode(mask, np.ones((2 * t + 1, 2 * t + 1), np.uint8), borderType=cv2.BORDER_CONSTANT, borderValue=0))   # (the box's edge is not inside)
+    return mask
+
+
+def draw_big_marker(img, X, Y, c, d, code):
+    """One marker of diameter d at (X, Y) drawn straight into the image (for dots so big that few are on screen)."""
+    marker, is_open = SHAPE_MARKERS[code % 10], code >= 10
+    thick = max(1, d // 12)
+    if marker == 'o':
+        cv2.circle(img, (X, Y), d // 2, c, thick if is_open else -1)
+    else:
+        pts = np.round((np.array(SHAPE_POLYGONS[marker]) - 0.5) * d + (X, Y)).astype(np.int32)
+        if is_open:
+            cv2.polylines(img, [pts], True, c, thick)
+        else:
+            cv2.fillPoly(img, [pts], c)
+
+
+def draw_marker(canvas, cx, cy, code, color, size=12):
+    """A marker of this code, `size` pixels across, on a Tk canvas (a legend swatch)."""
+    marker, is_open = SHAPE_MARKERS[code % 10], code >= 10
+    h = size / 2
+    style = {"fill": "", "outline": color, "width": 1.5} if is_open else {"fill": color, "outline": ""}
+    if marker == 'o':
+        canvas.create_oval(cx - h, cy - h, cx + h, cy + h, **style)
+    else:
+        canvas.create_polygon(*[c for x, y in SHAPE_POLYGONS[marker] for c in (cx + (x - 0.5) * size, cy + (y - 0.5) * size)], **style)
+
+
 def stamp_plus(img, px, py, rgb, arm):
     """A '+' (two pixels thick, `arm` pixels each way) at each point, in place. `rgb`: one color (3,) or one per point (n, 3)."""
     h, w = img.shape[:2]
@@ -92,7 +163,7 @@ def stamp_plus(img, px, py, rgb, arm):
             img[yy[ok], xx[ok]] = rgb[ok] if per_point else rgb
 
 
-def blend_dots(img, px, py, rgb, d, opacity, kernel_cache):
+def blend_dots(img, px, py, rgb, d, opacity, kernel_cache, kernel=None):
     """Draw dots of diameter `d` at (px, py) (already shifted by `d`, as in PointCanvas.draw) on `img` with the given opacity, so that dots
     piled on each other show it: where n dots overlap, the pixel is their average color covering the background with 1 - (1 - opacity) ** n."""
     h, w = img.shape[:2]
@@ -104,9 +175,12 @@ def blend_dots(img, px, py, rgb, d, opacity, kernel_cache):
         st[..., c] = np.bincount(flat, weights=rgb[:, c], minlength=size).reshape(H, W)
     st[..., 3] = np.bincount(flat, minlength=size).reshape(H, W)
     if d > 1:
-        k = kernel_cache.get(d)
-        if k is None:
-            k = kernel_cache[d] = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d)).astype(np.float32)
+        if kernel is not None:                             # (a marker of some other shape than a disc)
+            k = kernel.astype(np.float32)
+        else:
+            k = kernel_cache.get(d)
+            if k is None:
+                k = kernel_cache[d] = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d)).astype(np.float32)
         st = cv2.filter2D(st, -1, k)
     st = st[d:d + h, d:d + w]
     n = st[..., 3]
@@ -269,6 +343,11 @@ class PointCanvas:
         self.markers = {}                           # name -> [item, x, y] (x None: hidden)
         self.rects = []                             # [item, x0, y0, x1, y1]
         self.labels = []                            # [item, x, y]
+        self.label_text = {}                        # item -> its text (the group's number)
+        self.shape_kernels = {}                     # (marker code, diameter) -> the kernel that grows a point into that marker
+        self.moving = False                         # the view is being zoomed or panned: layers with shapes are drawn as plain discs
+        self.settle_job = None
+        self.boosted = None                         # the text of the label drawn bigger now (the highlighted group's), or None
         self.label_factor = 1.0                     # the Label size slider
         self.label_size = 8                         # the group labels' font size: grows with the zoom up to LABEL_ZOOM_CAP, then stops
         self.scalebar = None                        # (line item, text item) once enabled: data units are mm
@@ -316,8 +395,24 @@ class PointCanvas:
         if self.on_change:
             self.on_change(self.scale / self.fit_scale(), self.cx - (self.home[0] + self.home[1]) / 2, self.cy - (self.home[2] + self.home[3]) / 2)
 
+    def note_motion(self):
+        """The view is changing (zoom, pan, fit, size): until it has been still for SHAPE_SETTLE_MS the cells with shapes are drawn as plain discs,
+        which is quicker (one pass instead of one for each shape), and then they are drawn again with their shapes."""
+        if not any(lay.get("marks") is not None for lay in self.layers):
+            return
+        self.moving = True
+        if self.settle_job is not None:
+            self.canvas.after_cancel(self.settle_job)
+        self.settle_job = self.canvas.after(SHAPE_SETTLE_MS, self.settle)
+
+    def settle(self):
+        self.settle_job = None
+        self.moving = False
+        self.request_draw()
+
     def follow(self, zoom, dx, dy):
         """Take the same view (zoom, and offset from the whole view's center) as the panel that was moved."""
+        self.note_motion()
         self.scale = self.fit_scale() * zoom
         self.cx = (self.home[0] + self.home[1]) / 2 + dx
         self.cy = (self.home[2] + self.home[3]) / 2 + dy
@@ -326,6 +421,7 @@ class PointCanvas:
         self.request_draw()
 
     def fit(self):
+        self.note_motion()
         self.at_fit = True
         self.cx, self.cy = (self.home[0] + self.home[1]) / 2, (self.home[2] + self.home[3]) / 2
         self.scale = self.fit_scale()
@@ -344,6 +440,7 @@ class PointCanvas:
         if self.at_fit:
             self.fit()
         else:
+            self.note_motion()
             self.clamp()
             self.request_draw()
 
@@ -365,6 +462,7 @@ class PointCanvas:
         self.scale = min(max(self.scale * factor, fs), fs * self.MAX_ZOOM)
         if self.scale == before:
             return
+        self.note_motion()
         self.at_fit = abs(self.scale - fs) < 1e-9 * fs
         w, h = self.size()
         self.cx = x - (px - w / 2) / self.scale
@@ -381,6 +479,7 @@ class PointCanvas:
         if self.pan_from is None:
             return
         x0, y0, cx, cy = self.pan_from
+        self.note_motion()
         self.cx = cx - (e.x - x0) / self.scale
         dy = (e.y - y0) / self.scale
         self.cy = cy + dy if self.flip_y else cy - dy
@@ -436,6 +535,9 @@ class PointCanvas:
             if lay.get("shape") == "plus":
                 stamp_plus(img, px, py, rgb, d)
                 continue
+            if lay.get("marks") is not None and not self.moving:         # (a marker code for each cell: the group's shape; plain discs while the view moves)
+                self.draw_marked(img, px, py, rgb, lay["marks"][idx], d)
+                continue
             if self.opacity < 1.0 and lay.get("shape") != "half":
                 blend_dots(img, px + d, py + d, rgb, d, self.opacity, self.kernels)
                 continue
@@ -462,6 +564,43 @@ class PointCanvas:
         self.reposition()
         if self.on_view:
             self.on_view()
+
+    def marker_kernel(self, code, d):
+        """The kernel with which a maximum filter makes a marker of this code and diameter d out of a point (cached)."""
+        key = (code, d)
+        k = self.shape_kernels.get(key)
+        if k is None:
+            k = self.shape_kernels[key] = (cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d)) if code == 0
+                                           else np.ascontiguousarray(shape_mask(code, d)[::-1, ::-1]))
+        return k
+
+    def draw_marked(self, img, px, py, rgb, marks, d):
+        """Dots of different shapes: `marks` is a marker code for each point. Later points are on top of earlier ones, whatever their shape (each
+        point writes its number at its pixel; each shape grows those numbers with its own kernel; the biggest number wins where they meet)."""
+        h, w = img.shape[:2]
+        if d > BIG_DOT_PX:                                               # (very big dots, so few on screen: one by one)
+            for X, Y, c, code in zip(px.tolist(), py.tolist(), rgb.tolist(), marks.tolist()):
+                draw_big_marker(img, X, Y, c, d, int(code))
+            return
+        codes = np.unique(marks)
+        if self.opacity < 1.0:
+            for code in codes:
+                sel = marks == code
+                blend_dots(img, px[sel] + d, py[sel] + d, rgb[sel], d, self.opacity, self.kernels, kernel=self.marker_kernel(int(code), d))
+            return
+        px, py = px + d, py + d
+        numbers = np.arange(1, len(px) + 1, dtype=np.float32)
+        best = None
+        for code in codes:
+            sel = marks == code
+            lab = np.zeros((h + 2 * d, w + 2 * d), np.float32)
+            lab[py[sel], px[sel]] = numbers[sel]
+            if d > 1:
+                lab = cv2.dilate(lab, self.marker_kernel(int(code), d))
+            best = lab if best is None else np.maximum(best, lab)
+        lab = best[d:d + h, d:d + w]
+        hit = lab > 0
+        img[hit] = rgb[lab[hit].astype(np.int64) - 1]
 
     def compose(self):
         """The picture shown: the points, veiled and with the highlighted group's '+' marks when those are on."""
@@ -565,23 +704,35 @@ class PointCanvas:
         for it in self.labels:
             self.canvas.delete(it[0])
         self.labels = []
+        self.label_text = {}
+        self.boosted = None
 
     def add_label(self, text, x, y, color="black"):
         item = self.canvas.create_text(0, 0, text=text, font=("Segoe UI", self.label_size, "bold"), fill=color)
         self.labels.append([item, x, y])
+        self.label_text[item] = text
+
+    def boost_label(self, text):
+        """Draw the label with this text bigger (the group being marked with '+' signs), and the others as they were; None puts it back."""
+        if text == self.boosted:
+            return
+        self.boosted = text
+        self.update_label_size(force=True)
+        self.reposition()
 
     def set_label_factor(self, factor):
         self.label_factor = factor
         self.label_size = None                      # (so the next update applies the new size)
         self.update_label_size()
 
-    def update_label_size(self):
+    def update_label_size(self, force=False):
         zoom = min(self.scale / self.fit_scale(), LABEL_ZOOM_CAP)
         size = max(int(round(8 * self.label_factor * (1 + 0.75 * (zoom - 1)))), 1)
-        if size != self.label_size:
+        if size != self.label_size or force:
             self.label_size = size
             for it in self.labels:
-                self.canvas.itemconfig(it[0], font=("Segoe UI", size, "bold"))
+                big = self.boosted is not None and self.label_text.get(it[0]) == self.boosted
+                self.canvas.itemconfig(it[0], font=("Segoe UI", max(int(round(size * LABEL_HIGHLIGHT_FACTOR)), size + 1) if big else size, "bold"))
 
     def reposition(self):
         if self.labels:
@@ -604,6 +755,10 @@ class PointCanvas:
                 self.canvas.tag_raise(it)
             else:
                 self.canvas.itemconfig(it, state="hidden")
+        if self.boosted is not None:                  # (the bigger number on top of the others)
+            for it, _x, _y in self.labels:
+                if self.label_text.get(it) == self.boosted:
+                    self.canvas.tag_raise(it)
 
     def nearest(self, tree, px, py):
         """Index (into the tree's points) of the point within HOVER_RADIUS_PX of the canvas position, or None."""
@@ -776,6 +931,17 @@ class UmapWindow(ExportsMixin):
                             lambda i: f"{CELL_SIZE_NAMES[i]} ({CELL_SIZES_UM[i]}\u00b5m)", None),
             self.add_slider(bars, 2, "Marker size:", self.var_marker, len(MARKER_SIZES), self.apply_marker_size, lambda i: marker_names[i], None)]
         ttk.Button(bars, text="Reset to default", command=self.reset_sliders).grid(row=0, column=0, rowspan=3, sticky="nsw")
+        self.var_roi_only = tk.BooleanVar(bars, False)
+        roi_only_box = ttk.Checkbutton(bars, text="ROI only", variable=self.var_roi_only, command=self.apply_roi_only)
+        roi_only_box.grid(row=0, column=4, sticky="w", padx=(12, 6))
+        HoverTip(roi_only_box, lambda: "The cells outside the ROIs go gray, on a white background: only the ROIs are colored. Saved section maps "
+                                       "have the same look (and, as an SVG, the gray cells are pictures, so the file stays small).")
+        self.var_shapes = tk.BooleanVar(bars, False)
+        shapes_box = ttk.Checkbutton(bars, text="Shapes", variable=self.var_shapes, command=self.apply_shapes)
+        shapes_box.grid(row=1, column=4, sticky="w", padx=(12, 6))
+        HoverTip(shapes_box, lambda: "The cells of the section maps get the shape of their group, as in the UMAP (a new shape every 20 groups, which "
+                                     "share their colors otherwise). While you zoom or pan, cells are drawn as discs until the view settles. Saved "
+                                     "section maps have the same shapes.")
         bars.columnconfigure(3, weight=1)
         self.tile_scroll = tk.Canvas(left, highlightthickness=0, bg="#f4f4f4")
         sb = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.tile_scroll.yview)
@@ -1173,9 +1339,11 @@ class UmapWindow(ExportsMixin):
         self.rgb_run = rgb_run
         o = order_run
         bgc = MULTI_BG if dark else (255, 255, 255)
+        self.run_cell_rank = self.bg_cell_rank = None   # (the mode that has groups says them: see set_cell_ranks)
+        self.tiles_dark = dark
+        self.umap_order = o                           # (the order of the UMAP's cells in its first layer: see set_umap_marks)
         self.umap.set_background(bgc)
-        for t in self.tiles:
-            t["pc"].set_background(bgc)
+        self.set_tile_background()
         self.umap.set_layers([{"x": self.coords[o, 0], "y": self.coords[o, 1], "rgb": rgb_run[o], "size": 4 * self.dot_scale()}] + list(extra_umap_layers))
         self.umap.clear_labels()
         self.label_info = list(labels or [])
@@ -1186,6 +1354,54 @@ class UmapWindow(ExportsMixin):
         self.tile_fn = bg_rgb_fn
         if not getattr(self, "tile_job", None):
             self.tile_job = self.root.after(1, self.tile_step)
+
+    def shape_codes(self, ranks):
+        """The marker code of each rank (the browser's rule: the color cycle is 20 ranks, a new shape every cycle, hollow shapes after 200); a
+        negative rank (a cell in no listed group) is a plain disc. Made from the browser's own category_rank_shape, so that the screen and the
+        saved UMAP agree."""
+        table = getattr(self, "shape_table", None)
+        if table is None:
+            fn = self.host.get("category_rank_shape")
+            table = self.shape_table = np.array(
+                [(SHAPE_MARKERS.index(m) + (10 if is_open else 0)) for m, is_open in (fn(r) for r in range(2 * 10 * 20 * 2))] if fn else [0], np.int64)
+        ranks = np.asarray(ranks)
+        return np.where(ranks >= 0, table[np.maximum(ranks, 0) % len(table)], 0)
+
+    def set_umap_marks(self, rank):
+        """Give the UMAP's cells the shape of their group (`rank`: each cell's group rank, or -1; in the cells' own order) and draw it again."""
+        lay = self.umap.layers[0] if self.umap.layers else None
+        order = getattr(self, "umap_order", None)
+        if lay is None or order is None or len(rank) != len(order):
+            return
+        lay["marks"] = self.shape_codes(rank)[order].astype(np.int64)
+        self.umap.request_draw()
+
+    def set_cell_ranks(self, run_rank, bg_rank):
+        """The group rank of each cell of the run (`run_rank`, -1 for none) and of each cell of the sections' backgrounds (`bg_rank`, or None): the
+        UMAP's cells take their group's shape now, and the section panels' too when the Shapes box is ticked."""
+        self.run_cell_rank, self.bg_cell_rank = run_rank, bg_rank
+        self.set_umap_marks(run_rank)
+        if self.var_shapes.get():
+            self.apply_shapes()
+
+    def set_tile_background(self):
+        """The section panels' background: dark in the multi-gene view, white otherwise, and white in ROI only (whose gray cells are for it)."""
+        bgc = MULTI_BG if getattr(self, "tiles_dark", False) and not self.var_roi_only.get() else (255, 255, 255)
+        for t in getattr(self, "tiles", []):
+            t["pc"].set_background(bgc)
+
+    def apply_shapes(self):
+        """The Shapes box was ticked or cleared: the panels are made again (those in view now, the others as they come into view)."""
+        for t in getattr(self, "tiles", []):
+            t["dirty"] = True
+        self.refresh_visible()
+
+    def apply_roi_only(self):
+        """The ROI only box was ticked or cleared: the panels are made again (those in view now, the others as they come into view)."""
+        self.set_tile_background()
+        for t in getattr(self, "tiles", []):
+            t["dirty"] = True
+        self.refresh_visible()
 
     def frame_visible(self, fr):
         """Whether a section panel is (at least partly) in the scrolled pane."""
@@ -1218,28 +1434,50 @@ class UmapWindow(ExportsMixin):
         idx = self.run_idx[t["label"]]
         layers = []
         bgl = self.tile_fn(t["label"])
-        sources = []                     # (x, y, rgb) of the run's kind, the section's cells first
+        roi_only = self.var_roi_only.get()
+        shapes = self.var_shapes.get()
+        sources = []                     # (x, y, rgb, marks) of the run's kind, the section's cells first (marks: a marker code for each cell, or None)
         if bgl is not None:
             x, y, rgb, w = bgl
+            bg_rank = getattr(self, "bg_cell_rank", None)
+            mk = self.shape_codes(bg_rank[w]).astype(np.int64) if shapes and bg_rank is not None and not roi_only else None
+            if roi_only:                 # (the cells of the whole section go gray: the run's own cells, drawn after them, are the ROIs)
+                rgb = np.tile(LIGHT_GREY, (len(x), 1))
             if self.bg_under is not None and self.bg["levels"].get("class") is not None:
                 # the cells of the other kind (non-neurons in a neuron run) go underneath, so they never cover the ones being looked at
                 ids = core.extract_leading_numeric_id(pd.Series(self.bg["levels"]["class"][w])).to_numpy()
                 non_neuron = np.isin(ids, list(core.NON_NEURON_CLASS_IDS))
                 other = non_neuron if self.bg_under == "nonneuron" else ~non_neuron
-                layers.append({"x": x[other], "y": y[other], "rgb": rgb[other], "size_mm": DOT_MM * OTHER_CELLS_DOT_RATIO})
+                ox, oy, orgb = x[other], y[other], rgb[other]
+                omk = mk[other] if mk is not None else None
+                ogray = (orgb == GREY).all(axis=1) | (orgb == LIGHT_GREY).all(axis=1)
+                for pick, is_gray in ((ogray, True), (~ogray, False)):
+                    layer = {"x": ox[pick], "y": oy[pick], "rgb": orgb[pick], "size_mm": DOT_MM * OTHER_CELLS_DOT_RATIO, "gray": is_gray}
+                    if omk is not None:
+                        layer["marks"] = omk[pick]
+                    layers.append(layer)
                 x, y, rgb = x[~other], y[~other], rgb[~other]
-            sources.append((x, y, rgb))
+                mk = mk[~other] if mk is not None else None
+            sources.append((x, y, rgb, mk))
         # the run's own cells of this section, in drawing order (lowest first)
         sel = idx[np.argsort(self.rank_run[idx], kind="stable")]
-        sources.append((self.cx[sel], self.cy[sel], self.rgb_run[sel]))
+        run_rank = getattr(self, "run_cell_rank", None)
+        sources.append((self.cx[sel], self.cy[sel], self.rgb_run[sel],
+                        self.shape_codes(run_rank[sel]).astype(np.int64) if shapes and run_rank is not None else None))
         grays = []
-        for x, y, rgb in sources:
+        for x, y, rgb, mk in sources:
             gray = (rgb == GREY).all(axis=1) | (rgb == LIGHT_GREY).all(axis=1)
-            grays.append((x, y, rgb, gray))
-        for x, y, rgb, gray in grays:
-            layers.append({"x": x[gray], "y": y[gray], "rgb": rgb[gray], "size_mm": DOT_MM})
-        for x, y, rgb, gray in grays:
-            layers.append({"x": x[~gray], "y": y[~gray], "rgb": rgb[~gray], "size_mm": DOT_MM})
+            grays.append((x, y, rgb, gray, mk))
+        for x, y, rgb, gray, mk in grays:
+            layer = {"x": x[gray], "y": y[gray], "rgb": rgb[gray], "size_mm": DOT_MM, "gray": True}      # ("gray": saved as pictures in an SVG)
+            if mk is not None:
+                layer["marks"] = mk[gray]
+            layers.append(layer)
+        for x, y, rgb, gray, mk in grays:
+            layer = {"x": x[~gray], "y": y[~gray], "rgb": rgb[~gray], "size_mm": DOT_MM}
+            if mk is not None:
+                layer["marks"] = mk[~gray]
+            layers.append(layer)
         t["pc"].set_layers(layers)
 
     def color_all(self):
@@ -1283,6 +1521,7 @@ class UmapWindow(ExportsMixin):
         rank_of[ranked] = np.arange(len(ranked))
         self.export_cat = {"rank": np.where(codes >= 0, rank_of[np.maximum(codes, 0)], -1), "title": LEVEL_NAMES[level],
                            "entries": [(hexcolor(GREY if str(uniques[u]) in self.off_groups else rank_color(r)), str(uniques[u]), int(counts[u])) for r, u in enumerate(ranked)]}
+        self.set_cell_ranks(self.export_cat["rank"], np.where(bgc >= 0, rank_of[np.maximum(bgc, 0)], -1) if bgc is not None else None)
         self.shown_values = None
         n_cat = int((counts > 0).sum())
         self.var_status.set(f"Showing all {n_cat} {LEVEL_NAMES[level].lower()}s" + (f"; the {len(ranked)} largest colored, the rest gray." if n_cat > len(ranked) else " (numbers at each center).") + " Click a group in the list to gray it or color it again.")
@@ -1297,10 +1536,10 @@ class UmapWindow(ExportsMixin):
         w_cnt = max((font.measure(r[2]) for r in rows), default=0)
         x_num, x_cnt, x_name = x0 + 22, x0 + 22 + w_num + 8 + w_cnt, x0 + 22 + w_num + 8 + w_cnt + 10
         self.legend_cols = (x_num, x_cnt - w_cnt, x_cnt, x_name)          # (where the number, count and name columns start; the count's right edge)
-        for k, (col, num, cnt, name, off) in enumerate(rows):
+        for k, (col, num, cnt, name, off, *more) in enumerate(rows):
             cy = 4 + 22 * k + 11
             fill = "gray55" if off else "black"
-            canvas.create_rectangle(x0, cy - 6, x0 + 12, cy + 6, fill=col, outline="")
+            draw_marker(canvas, x0 + 6, cy, more[0] if more else 0, col)                               # (the shape the group's cells have in the UMAP)
             canvas.create_text(x_num, cy, anchor="w", text=num, font=font, fill=fill)
             canvas.create_text(x_cnt, cy, anchor="e", text=cnt, font=font, fill=fill)
             canvas.create_text(x_name, cy, anchor="w", text=name, font=font, fill=fill)
@@ -1318,7 +1557,8 @@ class UmapWindow(ExportsMixin):
             off = str(uniques[u]) in self.off_groups
             name = re.sub(r"^\s*\d+\s*", "", str(uniques[u])) if m else ""
             rows.append({"id": int(m.group(1)) if m else 10 ** 9, "color": hexcolor(GREY if off else rank_color(r)),
-                         "num": m.group(1) if m else str(uniques[u]), "count": int(counts[u]), "name": name, "off": off, "key": str(uniques[u])})
+                         "num": m.group(1) if m else str(uniques[u]), "count": int(counts[u]), "name": name, "off": off, "key": str(uniques[u]),
+                         "code": int(self.shape_codes(np.array([r]))[0])})
         column, descending = self.group_sort
         rows.sort(key=lambda r: (r["id"], r["key"]))                      # (ties stay in ID order)
         if column == "count":
@@ -1328,7 +1568,7 @@ class UmapWindow(ExportsMixin):
         elif descending:
             rows.reverse()
         self.group_rows = [r["key"] for r in rows]
-        width = self.draw_legend_rows(c, [(r["color"], r["num"], f"({r['count']})", r["name"], r["off"]) for r in rows], 6)
+        width = self.draw_legend_rows(c, [(r["color"], r["num"], f"({r['count']})", r["name"], r["off"], r["code"]) for r in rows], 6)
         c.configure(scrollregion=(0, 0, max(300, width), 8 + 22 * len(rows)))
         self.draw_group_header()
         self.group_list.pack(fill=tk.BOTH, expand=True, pady=(6, 0), after=self.box)
@@ -1422,6 +1662,8 @@ class UmapWindow(ExportsMixin):
         order_of = {t: i for i, t in enumerate(ids)}
         self.export_cat = {"rank": np.where((codes >= 0) & (hit[np.maximum(codes, 0)] > 0), hit[np.maximum(codes, 0)] - 1, -1), "title": LEVEL_NAMES[level],
                            "entries": [(hexcolor(colors[t]), full[t], counts[t]) for t in ids]}
+        self.set_cell_ranks(self.export_cat["rank"], np.where((bgc >= 0) & (hit[np.maximum(bgc, 0)] > 0), hit[np.maximum(bgc, 0)] - 1, -1)
+                            if bgc is not None else None)
         self.shown_values = None
         parts = []
         if ids:
@@ -1444,7 +1686,8 @@ class UmapWindow(ExportsMixin):
         self.legend.delete("all")
         self.legend.config(height=22 * len(ids) + 8)
         rows = [("#%02x%02x%02x" % tuple(int(v) for v in colors[t]), str(t), f"({counts[t]})",
-                 re.sub(r"^\s*\d+\s*", "", (names or {}).get(t, "")), t in self.off_groups) for t in ids]
+                 re.sub(r"^\s*\d+\s*", "", (names or {}).get(t, "")), t in self.off_groups, int(self.shape_codes(np.array([i]))[0]))
+                for i, t in enumerate(ids)]
         self.draw_legend_rows(self.legend, rows, 4)
 
     # ---- genes
@@ -1747,8 +1990,12 @@ class UmapWindow(ExportsMixin):
             y = 8 + row * i
             off = i in self.hidden
             color = "#999999" if off else CHANNEL_HEX[i]
-            r = 6 if i < 3 else 3                                  # (genes 4-6 are the small dots)
-            if off:
+            half = i >= 3 and self.viewer_settings.get("gene456_shape") == "half circle"      # (genes 4-6: the Settings choice, a half circle or a small circle)
+            r = 6 if i < 3 or half else 3                          # (genes 4-6 are the small dots)
+            if half:                                               # (the right half of a disc, as the cells of that gene are drawn)
+                c.create_arc(18 - r, y + 11 - r, 18 + r, y + 11 + r, start=-90, extent=180, style=tk.CHORD, tags="legend",
+                             **({"outline": "#999999"} if off else {"fill": color, "outline": ""}))
+            elif off:
                 c.create_oval(18 - r, y + 11 - r, 18 + r, y + 11 + r, outline="#999999", tags="legend")
             else:
                 c.create_oval(18 - r, y + 11 - r, 18 + r, y + 11 + r, fill=color, outline="", tags="legend")
@@ -2093,6 +2340,7 @@ class UmapWindow(ExportsMixin):
         if not keep_dim:
             self.set_dim(False)
         self.umap.set_pluses(None)
+        self.umap.boost_label(None)
         for t in self.tiles:
             t["pc"].set_pluses(None)
 
@@ -2118,6 +2366,8 @@ class UmapWindow(ExportsMixin):
         if i is not None:
             run_mask[i] = False                      # (the hovered cell keeps its own ring)
         self.umap.set_pluses((self.coords[run_mask, 0], self.coords[run_mask, 1]))
+        number = re.match(r"^\s*(\d+)", str(label))               # (the group's number is what the UMAP shows at its center: bigger while it is marked)
+        self.umap.boost_label(number.group(1) if number else None)
         barr = self.bg["levels"].get(level) if self.bg else None
         for t in self.tiles:
             if not self.frame_visible(t["frame"]):

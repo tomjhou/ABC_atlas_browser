@@ -1,14 +1,16 @@
 """The exports and 3D views of the Tk UMAP viewer (abc_tk_umap.py): Save UMAP, Save section maps, Export DEGs, Export expression, Export
-coordinates, 3D view and 3D in browser. They are the same outputs as the matplotlib viewer's (the same file names and contents); the
-statistics, dialogs and 3D viewers are the browser's own functions, which it hands to the window as `host`.
+coordinates, 3D view and 3D in browser. They are the same outputs as the matplotlib viewer's (the same file contents, and the same file
+names as the ones proposed); the statistics, dialogs and 3D viewers are the browser's own functions, which it hands to the window as `host`.
 
-`ExportsMixin` is mixed into UmapWindow: it reads the window's state (what is colored by what, the cells, the view) and writes files to the
-run's folder.
+`ExportsMixin` is mixed into UmapWindow: it reads the window's state (what is colored by what, the cells, the view) and writes files. Each
+export first shows a Save dialog with the file name it would use (in the run's folder, or the folder of the last export), so that the name
+can be changed; cancelling the dialog cancels the export.
 """
 import math
 import re
 import threading
 from pathlib import Path
+from tkinter import filedialog, messagebox
 
 import numpy as np
 import pandas as pd
@@ -27,6 +29,12 @@ def hexcolor(rgb):
     return "#%02x%02x%02x" % tuple(int(v) for v in rgb)
 
 
+def sibling(path, tail, ext):
+    """`path`, a file name that ends in `ext`, with `tail` put before the ending. The name may have dots inside it (a UMAP's md0.5_pc100), so
+    Path.with_suffix, which takes the text after the last dot for an ending, must not be used on it."""
+    return path.with_name(path.name[:-len(ext)] + tail + ext)
+
+
 def safe_token(text, default="view"):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(text)).strip("_") or default
 
@@ -38,6 +46,76 @@ class ExportsMixin:
         d = Path(self.run_folder) if self.run_folder is not None else Path(self.host["CACHE_DIR"])
         d.mkdir(parents=True, exist_ok=True)
         return d
+
+    def ask_save_path(self, title, proposed, extension, kind):
+        """The file the user picks in a Save dialog, or None if the dialog was cancelled. The dialog offers `proposed` (a file name) in the run's
+        folder, or in the folder of the last export of this window; a name typed without the extension gets it. The dialog itself asks before
+        replacing a file."""
+        folder = getattr(self, "export_dir", None)
+        if folder is None or not Path(folder).is_dir():
+            folder = self.target_dir()
+        chosen = filedialog.asksaveasfilename(
+            parent=self.root, title=title, initialdir=str(folder), initialfile=proposed, defaultextension=extension,
+            filetypes=[(kind, "*" + extension), ("All files", "*.*")])
+        if not chosen:
+            return None
+        path = Path(chosen)
+        if path.suffix.lower() != extension:       # (a name typed with some other ending keeps it, and gets this one after it)
+            path = path.with_name(path.name + extension)
+        self.export_dir = path.parent
+        return path
+
+    def ask_image_format(self, title, svg_note):
+        """"png" or "svg", chosen in a small dialog (None if it was cancelled or closed). The last choice made in this window is offered first.
+        `svg_note` is added under the SVG choice."""
+        import tkinter as tk
+        from tkinter import ttk
+        dlg = tk.Toplevel(self.root)
+        dlg.title(title)
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        var = tk.StringVar(dlg, getattr(self, "export_format", "png"))
+        box = ttk.Frame(dlg, padding=16)
+        box.pack()
+        ttk.Label(box, text="Save as:").pack(anchor="w")
+        ttk.Radiobutton(box, text="PNG: a picture", value="png", variable=var).pack(anchor="w", pady=(6, 0))
+        ttk.Radiobutton(box, text="SVG: vector graphics, for editing in a drawing program", value="svg", variable=var).pack(anchor="w", pady=(4, 0))
+        if svg_note:
+            ttk.Label(box, text=svg_note, foreground="gray30", wraplength=320, justify=tk.LEFT).pack(anchor="w", padx=(22, 0))
+        result = []
+
+        def finish(value):
+            result.append(value)
+            dlg.destroy()
+        row = ttk.Frame(box)
+        row.pack(anchor="e", pady=(14, 0))
+        ttk.Button(row, text="OK", command=lambda: finish(var.get())).pack(side=tk.LEFT)
+        ttk.Button(row, text="Cancel", command=lambda: finish(None)).pack(side=tk.LEFT, padx=(6, 0))
+        dlg.bind("<Return>", lambda e: finish(var.get()))
+        dlg.bind("<Escape>", lambda e: finish(None))
+        dlg.protocol("WM_DELETE_WINDOW", lambda: finish(None))
+        dlg.update_idletasks()
+        try:                                        # (in the middle of the window, not in a corner of the screen)
+            x = self.root.winfo_rootx() + (self.root.winfo_width() - dlg.winfo_reqwidth()) // 2
+            y = self.root.winfo_rooty() + (self.root.winfo_height() - dlg.winfo_reqheight()) // 3
+            dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+            dlg.grab_set()
+        except tk.TclError:
+            pass
+        self.root.wait_window(dlg)
+        choice = result[0] if result else None
+        if choice:
+            self.export_format = choice
+        return choice
+
+    def confirm_replacing(self, paths):
+        """True unless some of `paths` (files the Save dialog did not ask about, saved along with the one it did) exist and the user declines
+        to replace them."""
+        existing = [p for p in paths if Path(p).exists()]
+        if not existing:
+            return True
+        return messagebox.askyesno("Replace files?", "These files exist and would be replaced:\n\n" + "\n".join(str(p) for p in existing)
+                                   + "\n\nReplace them?", icon="warning", parent=self.root)
 
     def view_token_safe(self):
         token = safe_token(getattr(self, "view_token", "view"))
@@ -163,20 +241,35 @@ class ExportsMixin:
         if self.busy:
             return
         target, token, dpi = self.target_dir(), self.view_token_safe(), self.host["UMAP_SAVE_DPI"]
+        fmt = self.ask_image_format("Save the UMAP", "")
+        if fmt is None:
+            self.var_status.set("Save UMAP cancelled.")
+            return
+        ext = "." + fmt
+        proposed = self.host["unique_export_paths"](target, f"umap_{token}", (ext,))[ext].name
+        cat = getattr(self, "export_cat", None)
+        has_legend = getattr(self, "view_kind", "all") in ("all", "single") and cat is not None
+        chosen = self.ask_save_path("Save the UMAP" + (f" (its legend is saved with it, as _legend{ext})" if has_legend else ""), proposed, ext,
+                                    fmt.upper() + " image")
+        if chosen is None:
+            self.var_status.set("Save UMAP cancelled.")
+            return
+        legend_path = sibling(chosen, "_legend", ext)
+        if has_legend and not self.confirm_replacing([legend_path]):
+            self.var_status.set("Save UMAP cancelled.")
+            return
         self.root.config(cursor="watch")
         self.var_status.set("Saving the UMAP...")
         self.root.update()
         try:
             fig = self.build_umap_figure()
             written = []
-            for suffix in (".png", ".svg"):
-                path = target / f"umap_{token}{suffix}"
-                self.var_status.set(f"Saving {suffix.lstrip('.')}...")
-                self.root.update()
-                fig.savefig(path, bbox_inches="tight", dpi=dpi if suffix == ".png" else None)
-                written.append(path)
-            cat = getattr(self, "export_cat", None)
-            if getattr(self, "view_kind", "all") in ("all", "single") and cat is not None:
+            path = chosen
+            self.var_status.set(f"Saving {fmt}...")
+            self.root.update()
+            fig.savefig(path, bbox_inches="tight", dpi=dpi if fmt == "png" else None)
+            written.append(path)
+            if has_legend:
                 from matplotlib.figure import Figure
                 from matplotlib.backends.backend_agg import FigureCanvasAgg
                 handles = self.legend_handles(cat, sort="count")
@@ -185,10 +278,9 @@ class ExportsMixin:
                 lf.legend(handles=handles, title=cat["title"], loc="center", fontsize=EXPORT_FONTSIZE * 0.85, title_fontsize=EXPORT_FONTSIZE,
                           ncol=max(1, math.ceil(len(handles) / EXPORT_LEGEND_MAX_ROWS)), frameon=True, handlelength=1.0, handleheight=1.0,
                           labelspacing=0.4, columnspacing=1.5)
-                path = target / f"umap_{token}_legend.png"
-                lf.savefig(path, bbox_inches="tight", dpi=dpi)
-                written.append(path)
-            self.var_status.set(f"Saved {', '.join(p.name for p in written)} to {target}.")
+                lf.savefig(legend_path, bbox_inches="tight", dpi=dpi if fmt == "png" else None)
+                written.append(legend_path)
+            self.var_status.set(f"Saved {', '.join(p.name for p in written)} to {chosen.parent}.")
         except Exception as e:
             self.var_status.set(f"Could not save the UMAP: {e}")
             print(f"Could not save the UMAP: {e}", flush=True)
@@ -206,6 +298,18 @@ class ExportsMixin:
         from matplotlib.patches import Rectangle
         h = self.host
         target = self.target_dir()
+        fmt = self.ask_image_format("Save the section maps", "The gray cells are pictures inside it, to keep the file small; the colored cells and the "
+                                                              "outlines stay vector graphics.")
+        if fmt is None:
+            self.var_status.set("Save section maps cancelled.")
+            return
+        ext = "." + fmt
+        roi_only = "_ROI_only" if self.var_roi_only.get() else ""        # (the ROI only box above the panels: the name says what the maps show)
+        proposed = h["unique_export_paths"](target, f"{self.view_token_safe()}_section_maps{roi_only}", (ext,))[ext].name
+        chosen = self.ask_save_path("Save the section maps", proposed, ext, fmt.upper() + " image")
+        if chosen is None:
+            self.var_status.set("Save section maps cancelled.")
+            return
         self.root.config(cursor="watch")
         self.var_status.set("Saving the section maps...")
         self.root.update()
@@ -237,10 +341,30 @@ class ExportsMixin:
                 ax.set_facecolor(tuple(v / 255 for v in pc.bgcolor))
                 ax.set_title(t["title"].get(), fontsize=9, loc="left", pad=3)
                 pts_per_mm = 72.0 * (pw_px / ppi) / (xl[1] - xl[0])
-                from abc_tk_umap import DOT_MM
+                from abc_tk_umap import DOT_MM, GREY, LIGHT_GREY, SHAPE_MARKERS
                 for lay in pc.layers:
                     m = (lay["x"] >= xl[0]) & (lay["x"] <= xl[1]) & (lay["y"] >= yl[0]) & (lay["y"] <= yl[1])
-                    ax.scatter(lay["x"][m], lay["y"][m], c=lay["rgb"][m] / 255.0, s=(DOT_MM * pts_per_mm) ** 2, linewidths=0)
+                    x, y, rgb = lay["x"][m], lay["y"][m], lay["rgb"][m]
+                    marks = lay["marks"][m] if lay.get("marks") is not None else None         # (a marker code for each cell, when the Shapes box is ticked)
+                    # (in an SVG the gray cells, many thousands of them, are pictures: a vector dot apiece would make the file huge. They are told by
+                    # their color, so that the gray ones of a layer that is mostly colored, or the other way round, are found too.)
+                    if fmt == "svg" and not lay.get("gray"):
+                        gray = (rgb == GREY).all(axis=1) | (rgb == LIGHT_GREY).all(axis=1)
+                        parts = ((gray, True), (~gray, False))
+                    else:
+                        parts = ((np.ones(len(x), bool), fmt == "svg" and bool(lay.get("gray"))),)
+                    for sel, raster in parts:
+                        if not sel.any():
+                            continue
+                        for code in (np.unique(marks[sel]) if marks is not None else [0]):
+                            sub = sel & (marks == code) if marks is not None else sel
+                            marker, is_open = SHAPE_MARKERS[int(code) % 10], int(code) >= 10
+                            if is_open:
+                                ax.scatter(x[sub], y[sub], facecolors="none", edgecolors=rgb[sub] / 255.0, marker=marker, s=(DOT_MM * pts_per_mm) ** 2,
+                                           linewidths=0.5, rasterized=raster)
+                            else:
+                                ax.scatter(x[sub], y[sub], c=rgb[sub] / 255.0, marker=marker, s=(DOT_MM * pts_per_mm) ** 2, linewidths=0,
+                                           rasterized=raster)
                 for _it, a, b, c2, d in pc.rects:
                     ax.add_patch(Rectangle((a, b), c2 - a, d - b, fill=False, edgecolor="#ff8c00", linestyle=(0, (4, 2)), linewidth=1.2))
                 if pc.scalebar:
@@ -254,14 +378,11 @@ class ExportsMixin:
                     ax.plot([bx0, bx0 + um / 1000], [by, by], color=ink, linewidth=2.5, solid_capstyle="butt")
                     ax.text(bx0 + um / 2000, by - 0.01 * view_mm, f"{um:g} µm" if um < 1000 else f"{um / 1000:g} mm", color=ink, fontsize=8,
                             ha="center", va="bottom")
-            paths = h["unique_export_paths"](target, f"{self.view_token_safe()}_section_maps", (".png", ".svg"))
-            self.var_status.set("Saving png...")
+            path = chosen
+            self.var_status.set(f"Saving {fmt}...")
             self.root.update()
-            fig.savefig(paths[".png"], dpi=h["SECTION_MAPS_SAVE_DPI"])
-            self.var_status.set("Saving svg...")
-            self.root.update()
-            fig.savefig(paths[".svg"])
-            self.var_status.set(f"Saved {', '.join(p.name for p in paths.values())} to {target}.")
+            fig.savefig(path, dpi=h["SECTION_MAPS_SAVE_DPI"])         # (for an SVG the dpi is that of the pictures in it)
+            self.var_status.set(f"Saved {path.name} to {chosen.parent}.")
         except Exception as e:
             self.var_status.set(f"Could not save section maps: {e}")
             print(f"Could not save section maps: {e}", flush=True)
@@ -274,6 +395,21 @@ class ExportsMixin:
         if self.imputed_state["adata"] is None and self.ensure_imputed:
             self.ensure_imputed(self.imputed_state, self.abc_cache)
         return self.imputed_state["adata"]
+
+    def ask_csv_paths(self, what, prefix, token, has_counts, has_imputed):
+        """{"merfish": path, "imputed": path} for the .csv files an export of `what` will write: a Save dialog for each of the two datasets that
+        has data (a file is only written if its dataset has something to put in it), each proposing `<prefix>_<token>_<dataset>.csv`. None if a
+        dialog was cancelled (nothing is exported then)."""
+        paths = {}
+        for key, present in (("merfish", has_counts), ("imputed", has_imputed)):
+            if not present:
+                continue
+            proposed = self.host["unique_export_paths"](self.target_dir(), f"{prefix}_{token}_{key}", (".csv",))[".csv"].name
+            path = self.ask_save_path(f"Save the {what} of the {'MERFISH' if key == 'merfish' else 'imputed'} dataset", proposed, ".csv", "CSV file")
+            if path is None:
+                return None
+            paths[key] = path
+        return paths
 
     def export_degs(self):
         if self.busy:
@@ -296,8 +432,11 @@ class ExportsMixin:
         ids_arr = self.level_ids(level)
         adata, sc, has_counts = self.adata, h["sc"], self.has_counts
         imputed_full = self.imputed_for_export()
-        target = self.target_dir()
         token = safe_token(f"{level}_{'-'.join(str(t) for t in eff)}" + (f"_vsRef{reference}" if mode == "reference" else ""), level)
+        paths = self.ask_csv_paths("DE genes", "DEG", token, has_counts, imputed_full is not None)
+        if paths is None:
+            self.var_status.set("DEG export cancelled.")
+            return
 
         def work():
             written, skipped = [], []
@@ -322,7 +461,7 @@ class ExportsMixin:
                     frames.append(df)
                 if frames:
                     out = pd.concat(frames, ignore_index=True)
-                    path = target / f"DEG_{token}_merfish.csv"
+                    path = paths["merfish"]
                     out.to_csv(path, index=False)
                     written.append((path, len(out), len(frames)))
                 else:
@@ -351,7 +490,7 @@ class ExportsMixin:
                         frames.append(df)
                     if frames:
                         out = pd.concat(frames, ignore_index=True)
-                        path = target / f"DEG_{token}_imputed.csv"
+                        path = paths["imputed"]
                         out.to_csv(path, index=False)
                         written.append((path, len(out), len(frames)))
                     else:
@@ -369,7 +508,8 @@ class ExportsMixin:
             written, skipped = res
             if written:
                 summary = "; ".join(f"{p.name} ({n} rows, {k} of {len(eff)} IDs)" for p, n, k in written)
-                msg = f"Exported {summary}" + (f" vs. reference {level_name.lower()} {reference}" if mode == "reference" else "") + f" to {target}."
+                msg = (f"Exported {summary}" + (f" vs. reference {level_name.lower()} {reference}" if mode == "reference" else "")
+                       + f" to {', '.join(sorted({str(p.parent) for p, _n, _k in written}))}.")
                 if skipped:
                     msg += f" Skipped: {'; '.join(skipped)}."
                 self.var_status.set(msg)
@@ -389,8 +529,11 @@ class ExportsMixin:
         ids_arr = self.level_ids(level)
         adata, sc, has_counts = self.adata, h["sc"], self.has_counts
         imputed_full = self.imputed_for_export()
-        target = self.target_dir()
         token = safe_token(f"{level}_{'-'.join(str(t) for t in targets)}", level)
+        paths = self.ask_csv_paths("expression", "EXPR", token, has_counts, imputed_full is not None)
+        if paths is None:
+            self.var_status.set("Expression export cancelled.")
+            return
 
         def work():
             written, skipped = [], []
@@ -408,7 +551,7 @@ class ExportsMixin:
                         included.append(t)
                 if included:
                     df = df.sort_values("gene_symbol", kind="stable").reset_index(drop=True)
-                    path = target / f"EXPR_{token}_merfish.csv"
+                    path = paths["merfish"]
                     df.to_csv(path, index=False)
                     written.append((path, len(df), len(included)))
                 else:
@@ -430,7 +573,7 @@ class ExportsMixin:
                             included.append(t)
                     if included:
                         df = df.sort_values("gene_symbol", kind="stable").reset_index(drop=True)
-                        path = target / f"EXPR_{token}_imputed.csv"
+                        path = paths["imputed"]
                         df.to_csv(path, index=False)
                         written.append((path, len(df), len(included)))
                     else:
@@ -447,7 +590,8 @@ class ExportsMixin:
                 return
             written, skipped = res
             if written:
-                msg = "Exported " + "; ".join(f"{p.name} ({n} rows, {k} of {len(targets)} IDs)" for p, n, k in written) + f" to {target}."
+                msg = ("Exported " + "; ".join(f"{p.name} ({n} rows, {k} of {len(targets)} IDs)" for p, n, k in written)
+                       + f" to {', '.join(sorted({str(p.parent) for p, _n, _k in written}))}.")
                 if skipped:
                     msg += f" Skipped: {'; '.join(skipped)}."
                 self.var_status.set(msg)
@@ -528,11 +672,16 @@ class ExportsMixin:
         if chosen is None:
             return
         level, targets = chosen
+        stem = f"coordinates_{level}_{'-'.join(str(t) for t in targets)}"
+        proposed = self.host["unique_export_paths"](self.target_dir(), stem, (".csv",))[".csv"].name
+        path = self.ask_save_path("Save the coordinates of the cells of those groups", proposed, ".csv", "CSV file")
+        if path is None:
+            self.var_status.set("Coordinates export cancelled.")
+            return
         self.root.config(cursor="watch")
         self.var_status.set("Gathering cells...")
         self.root.update()
         try:
-            target = self.target_dir()
             table, scope = self.selected_group_cells(level, targets)
             if table.empty:
                 self.var_status.set("None of those IDs has any cells to export.")
@@ -541,7 +690,6 @@ class ExportsMixin:
                 front = ["cell_label", "group_id", "brain_section_label", "class", "subclass", "supertype", "cluster", "section_x_mm", "section_y_mm",
                          "section_z_mm", "ccf_x_mm", "ccf_y_mm", "ccf_z_mm", "ccf_division", "ccf_structure", "ccf_substructure", "in_run", "umap1", "umap2"]
                 table = table[[c for c in front if c in table.columns]]
-                path = self.host["unique_export_paths"](target, f"coordinates_{level}_{'-'.join(str(t) for t in targets)}", (".csv",))[".csv"]
                 table.to_csv(path, index=False)
                 self.var_status.set(f"Saved {len(table):,} cells ({scope})" + ("" if have_ccf else " (no CCF columns: that download was declined)") + f" to {path}.")
         except Exception as e:
